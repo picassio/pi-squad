@@ -225,10 +225,14 @@ export class SquadPanel implements Component, Focusable {
 		const title = squad ? `squad: ${squad.goal.slice(0, width - 20)}` : "squad";
 		lines.push(...this.renderHeader(title, width));
 
-		// Content area
+		// Content area — calculate available height for task list.
+		// The overlay has maxHeight "80%", so we must fit within that.
+		// Layout: 1 header + content + 3 footer = content gets the rest.
 		const contentWidth = width - 2;
-		const totalAvailable = this.tui.terminal.rows || 24;
-		const availHeight = Math.max(5, totalAvailable - 4);
+		const termRows = this.tui.terminal.rows || 24;
+		const overlayMaxRows = Math.floor(termRows * 0.8);
+		const chromeLines = 4; // 1 header + 3 footer
+		const availHeight = Math.max(5, overlayMaxRows - chromeLines);
 
 		switch (this.state.view) {
 			case "tasks": {
