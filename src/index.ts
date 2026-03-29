@@ -31,7 +31,7 @@ let activePanel: SquadPanel | null = null;
 /** Stored ExtensionContext for widget updates from background scheduler events */
 let uiCtx: import("@mariozechner/pi-coding-agent").ExtensionContext | null = null;
 /** Interval for periodic widget refresh */
-let widgetInterval: ReturnType<typeof setInterval> | null = null;
+
 
 // ============================================================================
 // Extension Entry
@@ -392,24 +392,25 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) {
 			ctx.ui.onTerminalInput((data) => {
 				if (data === "\x11") {
-					if (!activePanel) {
-						// Auto-pick a squad if none active
-						if (!activeSquadId) {
-							const latest = store.findLatestSquad(ctx.cwd)
-								|| store.listSquads().map((id) => store.loadSquad(id)).filter((s): s is Squad => s !== null).sort((a, b) => b.created.localeCompare(a.created))[0];
-							if (latest) {
-								activateSquadView(latest.id, ctx);
-							} else {
-								ctx.ui.notify("No squads found. Use /squad or the squad tool.", "info");
-								return { consume: true };
-							}
+					// Auto-pick a squad if none active
+					if (!activeSquadId) {
+						const latest = store.findLatestSquad(ctx.cwd)
+							|| store.listSquads().map((id) => store.loadSquad(id)).filter((s): s is Squad => s !== null).sort((a, b) => b.created.localeCompare(a.created))[0];
+						if (latest) {
+							activateSquadView(latest.id, ctx);
+						} else {
+							ctx.ui.notify("No squads found. Use /squad or the squad tool.", "info");
+							return { consume: true };
 						}
-						if (activeSquadId) {
+					}
+
+					if (activeSquadId) {
+						if (activePanel) {
+							activePanel.toggleFocus();
+						} else {
 							const sched = activeScheduler || new Scheduler(activeSquadId, squadSkillPaths);
 							createPanel(ctx, sched, activeSquadId);
 						}
-					} else {
-						activePanel.toggleFocus();
 					}
 					return { consume: true };
 				}
@@ -514,7 +515,7 @@ export default function (pi: ExtensionAPI) {
 							const latest = store.findLatestSquad(ctx.cwd);
 							if (latest) activateSquadView(latest.id, ctx);
 						}
-						updateWidget();
+						forceWidgetUpdate();
 						ctx.ui.notify("Squad widget enabled", "info");
 					} else {
 						widgetEnabled = false;
@@ -610,7 +611,7 @@ export default function (pi: ExtensionAPI) {
 						});
 						ctx.ui.notify(`Logged to ${targetTaskId} (agent not running)`, "info");
 					}
-					updateWidget();
+					forceWidgetUpdate();
 					return;
 				}
 
@@ -624,7 +625,7 @@ export default function (pi: ExtensionAPI) {
 					if (squad) { squad.status = "failed"; store.saveSquad(squad); }
 					activeScheduler = null;
 					clearWidgetRefresh();
-					updateWidget();
+					forceWidgetUpdate();
 					ctx.ui.notify("Squad cancelled", "info");
 					return;
 				}
@@ -701,7 +702,7 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 
 	// Show widget for this squad
 	widgetEnabled = true;
-	updateWidget();
+	forceWidgetUpdate();
 
 	// Always start refresh — disk data could be updated by another session
 	startWidgetRefresh();
@@ -729,30 +730,20 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 // Widget — live task status above the editor
 // ============================================================================
 
+/** Cache to avoid re-rendering widget when nothing changed */
+let lastWidgetKey = "";
+
 function updateWidget(): void {
 	if (!uiCtx?.hasUI || !widgetEnabled || !activeSquadId) return;
-
-	// Hide widget when panel is visible — panel shows the same info
-	if (activePanel?.isVisible()) {
-		uiCtx.ui.setWidget("squad-tasks", undefined);
-		// Keep status bar as compact indicator
-		const squad = store.loadSquad(activeSquadId);
-		const tasks = store.loadAllTasks(activeSquadId);
-		if (squad && tasks.length > 0) {
-			const th = uiCtx.ui.theme;
-			const d = tasks.filter((t) => t.status === "done").length;
-			const c = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-			const s = squad.status === "done" ? th.fg("success", `✓ squad ${d}/${tasks.length}`)
-				: squad.status === "failed" ? th.fg("error", `✗ squad ${d}/${tasks.length}`)
-				: th.fg("accent", `⏳ squad ${d}/${tasks.length} $${c.toFixed(2)}`);
-			uiCtx.ui.setStatus("squad", s);
-		}
-		return;
-	}
 
 	const tasks = store.loadAllTasks(activeSquadId);
 	const squad = store.loadSquad(activeSquadId);
 	if (!squad || tasks.length === 0) return;
+
+	// Build a cache key from task statuses + costs — cheap to compute
+	const cacheKey = `${squad.status}:${tasks.map((t) => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}`;
+	if (cacheKey === lastWidgetKey) return; // Nothing changed, skip re-render
+	lastWidgetKey = cacheKey;
 
 	const th = uiCtx.ui.theme;
 	const lines: string[] = [];
@@ -762,19 +753,17 @@ function updateWidget(): void {
 	const elapsed = Date.now() - new Date(squad.created).getTime();
 	const elapsedStr = formatElapsedShort(elapsed);
 
-	// Header
 	const statusIcon = squad.status === "done" ? th.fg("success", "✓")
 		: squad.status === "failed" ? th.fg("error", "✗")
 		: th.fg("warning", "⏳");
 	lines.push(
-		`${statusIcon} ${th.fg("accent", "squad")} ${th.fg("dim", squad.goal.slice(0, 30))} ` +
+		`${statusIcon} ${th.fg("accent", "squad")} ${th.fg("dim", squad.goal.slice(0, 35))} ` +
 		`${th.fg("muted", `${doneCount}/${tasks.length}`)} ` +
 		`${th.fg("dim", `$${totalCost.toFixed(2)}`)} ` +
 		`${th.fg("dim", elapsedStr)} ` +
-		`${th.fg("dim", "^q panel · /squad")}`
+		`${th.fg("dim", "^q detail · /squad msg")}`
 	);
 
-	// Task lines — lightweight, NO message file reads
 	for (const task of tasks) {
 		const icon = task.status === "done" ? th.fg("success", "✓")
 			: task.status === "in_progress" ? th.fg("warning", "⏳")
@@ -784,11 +773,10 @@ function updateWidget(): void {
 
 		let line = `  ${icon} ${th.fg("muted", task.id)} ${th.fg("dim", `(${task.agent})`)}`;
 
-		// Only show static info from task.json — no message file reads
 		if (task.status === "done" && task.output) {
-			line += ` ${th.fg("dim", task.output.split("\n")[0].slice(0, 40))}`;
+			line += ` ${th.fg("dim", task.output.split("\n")[0].slice(0, 50))}`;
 		} else if (task.status === "failed" && task.error) {
-			line += ` ${th.fg("error", task.error.slice(0, 40))}`;
+			line += ` ${th.fg("error", task.error.slice(0, 50))}`;
 		} else if (task.status === "blocked") {
 			const blockers = task.depends.filter((d) => {
 				const dep = tasks.find((t) => t.id === d);
@@ -804,7 +792,6 @@ function updateWidget(): void {
 
 	uiCtx.ui.setWidget("squad-tasks", lines);
 
-	// Footer status
 	const statusText = squad.status === "done"
 		? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
 		: squad.status === "failed"
@@ -814,25 +801,26 @@ function updateWidget(): void {
 }
 
 function clearWidget(): void {
+	lastWidgetKey = "";
 	if (uiCtx?.hasUI) {
 		uiCtx.ui.setWidget("squad-tasks", undefined);
 		uiCtx.ui.setStatus("squad", undefined);
 	}
 }
 
+/** Show widget immediately — called once when squad activates */
 function startWidgetRefresh(): void {
-	if (widgetInterval) return;
-	updateWidget();
-	// 5 seconds instead of 2 — less disk I/O, still responsive enough
-	widgetInterval = setInterval(() => updateWidget(), 5000);
+	forceWidgetUpdate();
 }
 
-function clearWidgetRefresh(): void {
-	if (widgetInterval) {
-		clearInterval(widgetInterval);
-		widgetInterval = null;
-	}
+/** Update widget, bypassing cache — called on every scheduler event */
+function forceWidgetUpdate(): void {
+	lastWidgetKey = "";
+	updateWidget();
 }
+
+/** No-op — no intervals to clear, everything is event-driven */
+function clearWidgetRefresh(): void {}
 
 function formatElapsedShort(ms: number): string {
 	const s = Math.floor(ms / 1000);
@@ -866,7 +854,7 @@ function createPanel(
 			panel.onVisibilityChange = (visible: boolean) => {
 				if (!visible) {
 					// Panel hidden — restore widget
-					updateWidget();
+					forceWidgetUpdate();
 				}
 			};
 
@@ -898,21 +886,11 @@ function createPanel(
 		},
 		{
 			overlay: true,
-			overlayOptions: () => {
-				const wide = (process.stdout.columns || 80) >= 160;
-				if (wide) {
-					return {
-						anchor: "top-right" as const,
-						width: "35%" as const,
-						maxHeight: "100%" as const,
-						margin: { top: 0, right: 0, bottom: 1, left: 0 },
-					};
-				}
-				return {
-					anchor: "center" as const,
-					width: "90%" as const,
-					maxHeight: "85%" as const,
-				};
+			overlayOptions: {
+				anchor: "center" as const,
+				width: "80%" as const,
+				maxHeight: "80%" as const,
+				margin: 2,
 			},
 			onHandle: (handle) => {
 				if (activePanel) {
@@ -1038,7 +1016,7 @@ async function startSquad(
 	// Wire up completion/escalation notifications to main agent
 	scheduler.onEvent((event: SchedulerEvent) => {
 		// Update widget on every scheduler event
-		updateWidget();
+		forceWidgetUpdate();
 		switch (event.type) {
 			case "squad_completed": {
 				const tasks = store.loadAllTasks(squadId);
@@ -1063,7 +1041,7 @@ async function startSquad(
 				// Clear scheduler but keep activeSquadId so squad_status still works
 				activeScheduler = null;
 				clearWidgetRefresh();
-				updateWidget(); // Final update showing done state
+				forceWidgetUpdate(); // Final update showing done state
 				break;
 			}
 
@@ -1080,7 +1058,7 @@ async function startSquad(
 					{ deliverAs: "followUp" },
 				);
 				clearWidgetRefresh();
-				updateWidget();
+				forceWidgetUpdate();
 				break;
 			}
 

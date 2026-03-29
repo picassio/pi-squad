@@ -48,7 +48,6 @@ export class SquadPanel implements Component, Focusable {
 	private taskListView: TaskListView;
 	private messageView: MessageView;
 
-	private refreshInterval: ReturnType<typeof setInterval> | null = null;
 
 	constructor(tui: TUI, theme: Theme, scheduler: Scheduler, squadId: string) {
 		this.tui = tui;
@@ -70,11 +69,7 @@ export class SquadPanel implements Component, Focusable {
 
 		this.handle = this.tui.showOverlay(this, this.getOverlayOptions());
 		this.onVisibilityChange?.(true);
-
-		// Refresh panel periodically (5s — reads from disk)
-		this.refreshInterval = setInterval(() => {
-			if (!this.handle?.isHidden()) this.tui.requestRender();
-		}, 5000);
+		// No refresh interval — panel reads from disk on render, triggered by user input
 	}
 
 	/** Hide the panel */
@@ -83,9 +78,6 @@ export class SquadPanel implements Component, Focusable {
 			this.handle.hide();
 			this.handle = null;
 		}
-		if (this.refreshInterval) {
-			clearInterval(this.refreshInterval);
-			this.refreshInterval = null;
 		}
 	}
 
@@ -108,26 +100,12 @@ export class SquadPanel implements Component, Focusable {
 	 */
 	toggleFocus(): void {
 		if (!this.handle) {
+			// Panel destroyed or never shown — recreate
 			this.show();
-			this.onVisibilityChange?.(true);
 			return;
 		}
-		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
-
-		if (this.handle.isHidden()) {
-			this.handle.setHidden(false);
-			this.handle.focus();
-			this.onVisibilityChange?.(true);
-		} else if (this.handle.isFocused()) {
-			if (wide) {
-				this.handle.unfocus();
-			} else {
-				this.handle.setHidden(true);
-				this.onVisibilityChange?.(false);
-			}
-		} else {
-			this.handle.focus();
-		}
+		// Visible — destroy it
+		this.hidePanel();
 	}
 
 	/** Check if panel is visible */
@@ -165,7 +143,11 @@ export class SquadPanel implements Component, Focusable {
 	// =========================================================================
 
 	private hidePanel(): void {
-		this.handle?.setHidden(true);
+		if (this.handle) {
+			this.handle.hide(); // permanently remove overlay
+			this.handle = null;
+		}
+		}
 		this.onVisibilityChange?.(false);
 	}
 
