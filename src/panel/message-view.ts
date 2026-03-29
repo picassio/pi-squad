@@ -1,7 +1,7 @@
 /**
  * message-view.ts — Scrollable message log for a task.
- * Shows tool calls, agent text, @mentions, human messages.
- * All lines are truncated to width to prevent TUI crashes.
+ * All lines truncated to width. Caps rendered messages to prevent
+ * TUI corruption from large message histories.
  */
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
@@ -9,11 +9,18 @@ import { truncateToWidth } from "@mariozechner/pi-tui";
 import type { TaskMessage } from "../types.js";
 import * as store from "../store.js";
 
+/** Max messages to render (most recent). Older messages are skipped. */
+const MAX_MESSAGES = 30;
+/** Max lines per text message before truncation */
+const MAX_TEXT_LINES = 5;
+
 export class MessageView {
 	private theme: Theme;
 	private squadId: string;
 	private taskId: string | null = null;
 	private scrollOffset = 0;
+	/** Track if user has manually scrolled up */
+	private userScrolled = false;
 
 	constructor(theme: Theme, squadId: string) {
 		this.theme = theme;
@@ -23,6 +30,7 @@ export class MessageView {
 	setTaskId(taskId: string): void {
 		this.taskId = taskId;
 		this.scrollOffset = 0;
+		this.userScrolled = false;
 	}
 
 	getTaskId(): string | null {
@@ -31,10 +39,12 @@ export class MessageView {
 
 	scrollUp(): void {
 		this.scrollOffset = Math.max(0, this.scrollOffset - 1);
+		this.userScrolled = true;
 	}
 
 	scrollDown(): void {
 		this.scrollOffset++;
+		// Will be clamped in render
 	}
 
 	invalidate(): void {}
@@ -52,37 +62,57 @@ export class MessageView {
 			return pad(["", th.fg("error", "  Task not found")], maxLines);
 		}
 
-		const messages = store.loadMessages(this.squadId, this.taskId);
-		const lines: string[] = [];
+		const allMessages = store.loadMessages(this.squadId, this.taskId);
 
-		// Header
+		// Header (fixed, always visible)
+		const header: string[] = [];
 		const statusColor = task.status === "done" ? "success"
 			: task.status === "failed" ? "error"
 			: task.status === "in_progress" ? "warning"
 			: "muted";
-		lines.push(fit(` ${th.fg("accent", th.bold(task.id))} · ${th.fg("dim", task.agent)} ${th.fg(statusColor as any, task.status)}`, w));
-		lines.push(fit(` ${th.fg("dim", task.title)}`, w));
-		lines.push("");
+		header.push(fit(` ${th.fg("accent", th.bold(task.id))} · ${th.fg("dim", task.agent)} ${th.fg(statusColor as any, task.status)}`, w));
+		header.push(fit(` ${th.fg("dim", task.title)}`, w));
+		header.push("");
 
-		if (messages.length === 0) {
-			lines.push(th.fg("muted", "  No messages yet"));
-			return pad(lines, maxLines);
+		if (allMessages.length === 0) {
+			header.push(th.fg("muted", "  No messages yet"));
+			return pad(header, maxLines);
 		}
 
-		// Render messages
-		const msgLines = this.renderMessages(messages, w);
+		// Only render recent messages to prevent TUI overload
+		const messages = allMessages.slice(-MAX_MESSAGES);
+		const skipped = allMessages.length - messages.length;
 
-		// Scroll
-		const contentHeight = Math.max(1, maxLines - lines.length - 1);
+		const msgLines: string[] = [];
+		if (skipped > 0) {
+			msgLines.push(fit(th.fg("dim", ` ··· ${skipped} older messages ···`), w));
+			msgLines.push("");
+		}
+		msgLines.push(...this.renderMessages(messages, w));
+
+		// Scroll calculation
+		const contentHeight = Math.max(1, maxLines - header.length - 1); // -1 for scroll indicator
 		const maxScroll = Math.max(0, msgLines.length - contentHeight);
-		this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
-		if (this.scrollOffset >= maxScroll - 2) this.scrollOffset = maxScroll;
 
+		// Auto-scroll to bottom unless user scrolled up
+		if (!this.userScrolled) {
+			this.scrollOffset = maxScroll;
+		} else {
+			this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
+			// If user scrolled back to bottom, re-enable auto-scroll
+			if (this.scrollOffset >= maxScroll) {
+				this.userScrolled = false;
+			}
+		}
+
+		// Build output
+		const lines = [...header];
 		lines.push(...msgLines.slice(this.scrollOffset, this.scrollOffset + contentHeight));
 
+		// Scroll indicator (only if scrollable)
 		if (msgLines.length > contentHeight) {
 			const pct = maxScroll > 0 ? Math.round((this.scrollOffset / maxScroll) * 100) : 100;
-			lines.push(th.fg("dim", ` ─── ${pct}% ───`));
+			lines.push(fit(th.fg("dim", ` ─── ${pct}% (${allMessages.length} msgs) ───`), w));
 		}
 
 		return pad(lines, maxLines);
@@ -121,29 +151,25 @@ export class MessageView {
 				case "text":
 				case "message":
 				case "reply": {
-					// Split by newline, cap at 10 lines, truncate each
-					const textLines = msg.text.split("\n").slice(0, 10);
-					for (const tl of textLines) {
+					const textLines = msg.text.split("\n");
+					const show = textLines.slice(0, MAX_TEXT_LINES);
+					for (const tl of show) {
 						lines.push(fit(`   ${tl}`, width));
 					}
-					const total = msg.text.split("\n").length;
-					if (total > 10) {
-						lines.push(fit(`   ${th.fg("dim", `... +${total - 10} lines`)}`, width));
+					if (textLines.length > MAX_TEXT_LINES) {
+						lines.push(fit(`   ${th.fg("dim", `... +${textLines.length - MAX_TEXT_LINES} lines`)}`, width));
 					}
 					break;
 				}
-				case "done": {
+				case "done":
 					lines.push(fit(`   ${th.fg("success", "✓ " + msg.text)}`, width));
 					break;
-				}
-				case "error": {
+				case "error":
 					lines.push(fit(`   ${th.fg("error", "✗ " + msg.text)}`, width));
 					break;
-				}
-				case "status": {
+				case "status":
 					lines.push(fit(`   ${th.fg("dim", msg.text)}`, width));
 					break;
-				}
 			}
 		}
 
@@ -151,15 +177,13 @@ export class MessageView {
 	}
 }
 
-// Helpers
-
 function fit(line: string, width: number): string {
 	return truncateToWidth(line, width, "…");
 }
 
-function pad(lines: string[], maxLines: number): string[] {
-	while (lines.length < maxLines) lines.push("");
-	return lines.slice(0, maxLines);
+function pad(lines: string[], max: number): string[] {
+	while (lines.length < max) lines.push("");
+	return lines.slice(0, max);
 }
 
 function fmtTime(ts: string): string {
