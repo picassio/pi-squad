@@ -1,11 +1,17 @@
 {
   "name": "pi-squad",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Multi-agent collaboration extension for pi — task decomposition, dependency management, parallel execution, TUI panel",
   "type": "module",
   "pi": {
-    "extensions": ["src/index.ts"],
-    "skills": ["src/skills/squad-protocol", "src/skills/collaboration", "src/skills/verification"]
+    "extensions": [
+      "src/index.ts"
+    ],
+    "skills": [
+      "src/skills/squad-protocol",
+      "src/skills/collaboration",
+      "src/skills/verification"
+    ]
   },
   "files": [
     "src",
