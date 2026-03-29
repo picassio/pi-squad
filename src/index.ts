@@ -356,7 +356,9 @@ export default function (pi: ExtensionAPI) {
 
 				case "resume_task": {
 					if (!params.taskId) return { content: [{ type: "text" as const, text: "Provide taskId." }] };
-					await activeScheduler.resumeTask(params.taskId);
+					activeScheduler.resumeTask(params.taskId).catch((err) => {
+						console.error(`[squad] Resume task error: ${(err as Error).message}`);
+					});
 					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' resumed.` }] };
 				}
 
@@ -371,7 +373,10 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "resume": {
-					await activeScheduler.resume();
+					// Fire and forget — don't block the tool call
+					activeScheduler.resume().catch((err) => {
+						console.error(`[squad] Resume error: ${(err as Error).message}`);
+					});
 					return { content: [{ type: "text" as const, text: "Squad resumed." }] };
 				}
 
@@ -987,8 +992,13 @@ async function startSquad(
 		}
 	});
 
-	// Start scheduling
-	await scheduler.start();
+	// Start scheduling — fire and forget, don't block the tool call.
+	// scheduler.start() spawns agents which can take seconds per agent.
+	// We must return immediately so the main agent's turn completes
+	// and the user regains interactive control.
+	scheduler.start().catch((err) => {
+		console.error(`[squad] Scheduler start error: ${(err as Error).message}`);
+	});
 
 	// Build response
 	const taskSummary = plan.tasks
