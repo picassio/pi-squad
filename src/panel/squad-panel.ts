@@ -79,10 +79,11 @@ export class SquadPanel implements Component, Focusable {
 		this.taskListView = new TaskListView(theme, squadId);
 		this.messageView = new MessageView(theme, squadId);
 
-		// Auto-refresh every 3s for live task activity
+		// Auto-refresh for live activity. 5s is enough — faster causes
+		// flicker and races with agents writing to JSONL files.
 		this.refreshTimer = setInterval(() => {
 			this.tui.requestRender();
-		}, 3000);
+		}, 5000);
 	}
 
 	/** Trigger a render update (called from outside, e.g., on scheduler events) */

@@ -136,7 +136,18 @@ function readJsonl<T>(filePath: string): T[] {
 	try {
 		const content = fs.readFileSync(filePath, "utf-8").trim();
 		if (!content) return [];
-		return content.split("\n").map((line) => JSON.parse(line) as T);
+		// Parse each line individually — skip partial/corrupt lines
+		// (can happen when reading while an agent is mid-write)
+		const results: T[] = [];
+		for (const line of content.split("\n")) {
+			if (!line.trim()) continue;
+			try {
+				results.push(JSON.parse(line) as T);
+			} catch {
+				// Skip corrupt/partial line — likely mid-write
+			}
+		}
+		return results;
 	} catch {
 		return [];
 	}
