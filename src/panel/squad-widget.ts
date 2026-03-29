@@ -54,8 +54,17 @@ export function setupSquadWidget(
 
 	let tuiRef: TUI | null = null;
 	let durationTimer: ReturnType<typeof setInterval> | null = null;
+	/** Queue a render — if TUI not ready yet, it'll render on first paint anyway */
+	let pendingUpdate = false;
 
-	const requestUpdate = () => tuiRef?.requestRender();
+	const requestUpdate = () => {
+		if (tuiRef) {
+			tuiRef.requestRender();
+			pendingUpdate = false;
+		} else {
+			pendingUpdate = true;
+		}
+	};
 
 	// Start a timer to update elapsed time every 5s when squad is running
 	function manageDurationTimer() {
@@ -78,6 +87,11 @@ export function setupSquadWidget(
 		(tui: TUI, theme: Theme): Component & { dispose?(): void } => {
 			tuiRef = tui;
 			manageDurationTimer();
+			// Flush any updates that arrived before TUI was ready
+			if (pendingUpdate) {
+				pendingUpdate = false;
+				queueMicrotask(() => tuiRef?.requestRender());
+			}
 			return {
 				render(width: number): string[] {
 					if (!state.enabled || !state.squadId) return [];
