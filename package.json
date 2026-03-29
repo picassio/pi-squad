@@ -1,0 +1,30 @@
+{
+  "name": "pi-squad",
+  "version": "0.1.0",
+  "description": "Multi-agent collaboration extension for pi — task decomposition, dependency management, parallel execution, TUI panel",
+  "type": "module",
+  "pi": {
+    "extensions": ["src/index.ts"],
+    "skills": ["src/skills/squad-protocol", "src/skills/collaboration", "src/skills/verification"]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "multi-agent",
+    "agent-collaboration",
+    "task-management",
+    "tui"
+  ],
+  "author": "picassio",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/picassio/pi-squad.git"
+  },
+  "homepage": "https://github.com/picassio/pi-squad"
+}
