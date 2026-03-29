@@ -43,6 +43,9 @@ export interface SquadWidgetState {
 /**
  * Create and install the squad widget as a component factory.
  * Returns control functions for the caller.
+ *
+ * IMPORTANT: render() must be pure — no side effects like setStatus() inside render.
+ * Status bar is updated separately via updateStatusBar() called from requestUpdate().
  */
 export function setupSquadWidget(
 	ctx: { ui: { setWidget: Function; setStatus: Function }; hasUI?: boolean },
@@ -56,11 +59,37 @@ export function setupSquadWidget(
 	if (!ctx.hasUI) return { requestUpdate: () => {}, dispose: () => {} };
 
 	let tuiRef: TUI | null = null;
+	let themeRef: Theme | null = null;
 	let durationTimer: ReturnType<typeof setInterval> | null = null;
 	/** Queue a render — if TUI not ready yet, it'll render on first paint anyway */
 	let pendingUpdate = false;
 
+	/** Update status bar — called OUTSIDE of render to avoid side effects */
+	function updateStatusBar(): void {
+		if (!state.enabled || !state.squadId || !themeRef) {
+			ctx.ui.setStatus("squad", undefined);
+			return;
+		}
+		const tasks = store.loadAllTasks(state.squadId);
+		const squad = store.loadSquad(state.squadId);
+		if (!squad || tasks.length === 0) {
+			ctx.ui.setStatus("squad", undefined);
+			return;
+		}
+		const th = themeRef;
+		const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
+		const doneCount = tasks.filter((t) => t.status === "done").length;
+		const statusText = squad.status === "done"
+			? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
+			: squad.status === "failed"
+			? th.fg("error", `✗ squad ${doneCount}/${tasks.length}`)
+			: th.fg("accent", `⏳ squad ${doneCount}/${tasks.length} $${totalCost.toFixed(2)}`);
+		ctx.ui.setStatus("squad", statusText);
+	}
+
 	const requestUpdate = () => {
+		// Update status bar outside of render
+		updateStatusBar();
 		if (tuiRef) {
 			tuiRef.requestRender();
 			pendingUpdate = false;
@@ -89,11 +118,15 @@ export function setupSquadWidget(
 		"squad-tasks",
 		(tui: TUI, theme: Theme): Component & { dispose?(): void } => {
 			tuiRef = tui;
+			themeRef = theme;
 			manageDurationTimer();
 			// Flush any updates that arrived before TUI was ready
 			if (pendingUpdate) {
 				pendingUpdate = false;
-				queueMicrotask(() => tuiRef?.requestRender());
+				queueMicrotask(() => {
+					updateStatusBar();
+					tuiRef?.requestRender();
+				});
 			}
 			return {
 				render(width: number): string[] {
@@ -175,14 +208,6 @@ export function setupSquadWidget(
 
 						lines.push(line);
 					}
-
-					// Also update status bar
-					const statusText = squad.status === "done"
-						? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
-						: squad.status === "failed"
-						? th.fg("error", `✗ squad ${doneCount}/${tasks.length}`)
-						: th.fg("accent", `⏳ squad ${doneCount}/${tasks.length} $${totalCost.toFixed(2)}`);
-					ctx.ui.setStatus("squad", statusText);
 
 					return lines;
 				},
