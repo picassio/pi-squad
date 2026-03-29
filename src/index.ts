@@ -563,12 +563,13 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 
 	pi.registerCommand("squad", {
-		description: "Browse, select, and manage squads. Usage: /squad [list|all|select|msg|widget|panel|cancel|clear]",
+		description: "Browse, select, and manage squads. Usage: /squad [list|all|select|agents|msg|widget|panel|cancel|clear]",
 		getArgumentCompletions: (prefix) => {
 			const subs = [
 				{ value: "list", label: "list", description: "List squads for current project" },
 				{ value: "all", label: "all", description: "List all squads, select to activate" },
 				{ value: "select", label: "select", description: "Pick a squad to view (interactive)" },
+				{ value: "agents", label: "agents", description: "List, view, or edit agent definitions" },
 				{ value: "msg", label: "msg", description: "Send message to agent: /squad msg [agent] text" },
 				{ value: "widget", label: "widget", description: "Toggle live widget" },
 				{ value: "panel", label: "panel", description: "Toggle overlay panel" },
@@ -756,6 +757,105 @@ export default function (pi: ExtensionAPI) {
 					widgetState.squadId = null;
 					widgetControls?.dispose();
 					ctx.ui.notify("Squad view cleared", "info");
+					return;
+				}
+
+				case "agents": {
+					const agentArg = parts[1];
+					const allAgents = store.loadAllAgentDefs(ctx.cwd);
+
+					if (!agentArg) {
+						// List all agents — interactive selector
+						if (allAgents.length === 0) {
+							ctx.ui.notify("No agents found", "info");
+							return;
+						}
+						const options = allAgents.map((a) => {
+							const model = a.model ? ` [${a.model}]` : " [default]";
+							return `${a.name} — ${a.role}${model}`;
+						});
+						const choice = await ctx.ui.select("Squad Agents (select to view/edit)", options);
+						if (!choice) return;
+						const selectedName = choice.split(" — ")[0];
+						const agent = allAgents.find((a) => a.name === selectedName);
+						if (!agent) return;
+
+						// Show agent details and offer actions
+						const actions = [
+							"View details",
+							"Edit in editor",
+							"Change model",
+							"Toggle tools (restrict/unrestrict)",
+							"Cancel",
+						];
+						const action = await ctx.ui.select(`${agent.name} (${agent.role})`, actions);
+						if (!action || action === "Cancel") return;
+
+						if (action === "View details") {
+							const details = [
+								`Name: ${agent.name}`,
+								`Role: ${agent.role}`,
+								`Description: ${agent.description}`,
+								`Model: ${agent.model || "(default)"}`,
+								`Tools: ${agent.tools ? agent.tools.join(", ") : "(all)"}`,
+								`Tags: ${agent.tags.join(", ")}`,
+								``,
+								`Prompt:`,
+								`${agent.prompt.slice(0, 300)}${agent.prompt.length > 300 ? "..." : ""}`,
+								``,
+								`File: ${store.getGlobalAgentsDir()}/${agent.name}.json`,
+							].join("\n");
+							ctx.ui.notify(details, "info");
+						} else if (action === "Edit in editor") {
+							// Check for local override first, fall back to global
+							const localPath = `${store.getLocalAgentsDir(ctx.cwd)}/${agent.name}.json`;
+							const globalPath = `${store.getGlobalAgentsDir()}/${agent.name}.json`;
+							const filePath = fs.existsSync(localPath) ? localPath : globalPath;
+							pi.sendUserMessage(`Edit agent file: ${filePath}`, { deliverAs: "followUp" });
+						} else if (action === "Change model") {
+							const newModel = await ctx.ui.input(
+								`Model for ${agent.name} (empty = default)`,
+								agent.model || "",
+							);
+							if (newModel !== undefined) {
+								agent.model = newModel.trim() || null;
+								store.saveAgentDef(agent);
+								ctx.ui.notify(`${agent.name} model → ${agent.model || "(default)"}`, "info");
+							}
+						} else if (action === "Toggle tools") {
+							if (agent.tools) {
+								agent.tools = null;
+								store.saveAgentDef(agent);
+								ctx.ui.notify(`${agent.name}: all tools enabled`, "info");
+							} else {
+								const toolList = await ctx.ui.input(
+									`Tools for ${agent.name} (comma-separated)`,
+									"bash,read,write,edit",
+								);
+								if (toolList) {
+									agent.tools = toolList.split(",").map((t) => t.trim()).filter(Boolean);
+									store.saveAgentDef(agent);
+									ctx.ui.notify(`${agent.name}: tools = [${agent.tools.join(", ")}]`, "info");
+								}
+							}
+						}
+						return;
+					}
+
+					// /squad agents <name> — show specific agent
+					const agent = store.loadAgentDef(agentArg, ctx.cwd);
+					if (agent) {
+						const details = [
+							`${agent.name} — ${agent.role}`,
+							`${agent.description}`,
+							`Model: ${agent.model || "(default)"}`,
+							`Tools: ${agent.tools ? agent.tools.join(", ") : "(all)"}`,
+							`Tags: ${agent.tags.join(", ")}`,
+						].join("\n");
+						ctx.ui.notify(details, "info");
+					} else {
+						ctx.ui.notify(`Agent '${agentArg}' not found`, "warning");
+					}
 					return;
 				}
 
