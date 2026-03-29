@@ -202,7 +202,8 @@ export class TaskListView {
 		for (const msg of recent) {
 			if (msg.type === "tool") {
 				const toolStr = `→ ${msg.name || msg.text}`;
-				const argsStr = msg.args?.path || msg.args?.command || "";
+				const rawArgs = (msg.args?.path || msg.args?.command || "").toString();
+				const argsStr = rawArgs.split("\n")[0]; // first line only
 				const preview = argsStr ? `${toolStr} ${argsStr}` : toolStr;
 				lines.push(truncateToWidth(` ${th.fg("muted", preview)}`, width, "…"));
 			} else if (msg.type === "text" && msg.from !== "system") {

@@ -114,7 +114,8 @@ export function setupSquadWidget(
 				const messages = store.loadMessages(state.squadId!, task.id);
 				const lastTool = [...messages].reverse().find(m => m.type === "tool");
 				if (lastTool) {
-					const detail = lastTool.args?.path || lastTool.args?.command || "";
+					const rawDetail = (lastTool.args?.path || lastTool.args?.command || "").toString();
+					const detail = rawDetail.split("\n")[0]; // first line only
 					const toolStr = `→ ${lastTool.name || lastTool.text}`;
 					line += ` ${th.fg("dim", (detail ? `${toolStr} ${detail}` : toolStr).slice(0, 30))}`;
 				}

@@ -146,7 +146,9 @@ export class MessageView {
 			switch (msg.type) {
 				case "tool": {
 					const name = msg.name || msg.text;
-					const arg = msg.args?.path || msg.args?.command || "";
+					// Tool args can contain multi-line bash commands — take first line only
+					const rawArg = (msg.args?.path || msg.args?.command || "").toString();
+					const arg = rawArg.split("\n")[0];
 					lines.push(fit(`   ${th.fg("muted", `→ ${name}${arg ? " " + arg : ""}`)}`, width));
 					break;
 				}
@@ -157,7 +159,8 @@ export class MessageView {
 				case "text":
 				case "message":
 				case "reply": {
-					const textLines = msg.text.split("\n");
+					// Split text, strip any \r, ensure no embedded newlines survive
+					const textLines = msg.text.replace(/\r/g, "").split("\n");
 					const show = textLines.slice(0, MAX_TEXT_LINES);
 					for (const tl of show) {
 						lines.push(fit(`   ${tl}`, width));
@@ -184,7 +187,9 @@ export class MessageView {
 }
 
 function fit(line: string, width: number): string {
-	return truncateToWidth(line, width, "…");
+	// Strip any newlines that would create extra terminal lines and break layout math
+	const clean = line.replace(/[\n\r]/g, " ");
+	return truncateToWidth(clean, width, "…");
 }
 
 function pad(lines: string[], max: number): string[] {
