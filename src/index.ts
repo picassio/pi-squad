@@ -26,6 +26,8 @@ import * as store from "./store.js";
 // State
 // ============================================================================
 
+/** Master switch — when false, all squad tools, hooks, and widget are disabled */
+let squadEnabled = true;
 /** Registry of all running schedulers — supports multiple concurrent squads */
 const schedulers = new Map<string, Scheduler>();
 /** The currently viewed/focused squad (for widget, panel, status) */
@@ -67,6 +69,8 @@ export default function (pi: ExtensionAPI) {
 
 	// Inject squad awareness before each LLM call
 	pi.on("before_agent_start", async (event, _ctx) => {
+		if (!squadEnabled) return;
+
 		// When a squad is active, inject its status
 		if (activeSquadId) {
 			const squad = store.loadSquad(activeSquadId);
@@ -163,6 +167,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!squadEnabled) return { content: [{ type: "text" as const, text: "Squad is disabled. Use /squad enable to re-enable." }] };
 			if (!uiCtx) uiCtx = ctx;
 
 			// Multiple squads can run concurrently — no guard needed
@@ -579,6 +584,8 @@ export default function (pi: ExtensionAPI) {
 				{ value: "panel", label: "panel", description: "Toggle overlay panel" },
 				{ value: "cancel", label: "cancel", description: "Cancel running squad" },
 				{ value: "clear", label: "clear", description: "Dismiss widget and deactivate squad" },
+				{ value: "enable", label: "enable", description: "Enable pi-squad (tools, widget, system prompt)" },
+				{ value: "disable", label: "disable", description: "Disable pi-squad completely" },
 			];
 			return subs.filter((s) => s.value.startsWith(prefix));
 		},
@@ -759,6 +766,28 @@ export default function (pi: ExtensionAPI) {
 					widgetState.squadId = null;
 					widgetControls?.dispose();
 					ctx.ui.notify("Squad view cleared", "info");
+					return;
+				}
+
+				case "enable": {
+					squadEnabled = true;
+					widgetControls?.requestUpdate();
+					ctx.ui.notify("pi-squad enabled — tools, widget, and system prompt active", "info");
+					return;
+				}
+
+				case "disable": {
+					squadEnabled = false;
+					// Stop all running schedulers
+					for (const [id, sched] of schedulers) {
+						await sched.stop();
+					}
+					schedulers.clear();
+					activeSquadId = null;
+					widgetState.squadId = null;
+					widgetState.enabled = false;
+					widgetControls?.requestUpdate();
+					ctx.ui.notify("pi-squad disabled — all tools, widget, and system prompt injection stopped", "info");
 					return;
 				}
 
