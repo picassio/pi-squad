@@ -431,15 +431,15 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
-		// Notify about paused squads (including ones we just paused)
+		// Notify about paused squads only if they have real completed work
 		const paused = store.findActiveSquads()
 			.filter((s) => s.cwd === ctx.cwd && s.status === "paused");
 		if (paused.length > 0) {
 			const squad = paused[0];
 			const tasks = store.loadAllTasks(squad.id);
 			const done = tasks.filter(t => t.status === "done").length;
-			// Only notify if squad has meaningful progress worth resuming
-			if (done > 0 || tasks.some(t => t.status === "suspended")) {
+			// Only notify if at least 1 task completed — worth resuming
+			if (done > 0) {
 				pi.sendUserMessage(
 					`[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${done}/${tasks.length} done. ` +
 					`Use squad_modify with action "resume" to continue, or start a new squad.`,
