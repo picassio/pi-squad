@@ -53,37 +53,53 @@ export default function (pi: ExtensionAPI) {
 	// Context Injection — give main agent awareness of squad state
 	// =========================================================================
 
-	// Inject squad status before each LLM call so the main agent knows squad state
+	// Inject squad awareness before each LLM call
 	pi.on("before_agent_start", async (event, _ctx) => {
-		if (!activeSquadId) return;
-		const squad = store.loadSquad(activeSquadId);
-		if (!squad) return;
-		const tasks = store.loadAllTasks(activeSquadId);
-		if (tasks.length === 0) return;
+		// When a squad is active, inject its status
+		if (activeSquadId) {
+			const squad = store.loadSquad(activeSquadId);
+			if (!squad) return;
+			const tasks = store.loadAllTasks(activeSquadId);
+			if (tasks.length === 0) return;
 
-		const doneCount = tasks.filter((t) => t.status === "done").length;
-		const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
+			const doneCount = tasks.filter((t) => t.status === "done").length;
+			const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
-		const taskLines = tasks.map((t) => {
-			const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : "·";
-			let line = `  ${icon} ${t.id} (${t.agent}) [${t.status}]`;
-			if (t.output) line += ` — ${t.output.split("\n")[0].slice(0, 80)}`;
-			if (t.error) line += ` ERROR: ${t.error.slice(0, 60)}`;
-			return line;
-		}).join("\n");
+			const taskLines = tasks.map((t) => {
+				const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : "·";
+				let line = `  ${icon} ${t.id} (${t.agent}) [${t.status}]`;
+				if (t.output) line += ` — ${t.output.split("\n")[0].slice(0, 80)}`;
+				if (t.error) line += ` ERROR: ${t.error.slice(0, 60)}`;
+				return line;
+			}).join("\n");
 
-		const squadContext = [
-			`<squad_status>`,
-			`Squad: ${squad.id} — ${squad.goal}`,
-			`Status: ${squad.status} | ${doneCount}/${tasks.length} tasks | $${totalCost.toFixed(2)}`,
-			taskLines,
-			`</squad_status>`,
-			`You have an active squad. Use squad_message to talk to agents, squad_status for details, squad_modify to change tasks.`,
+			const squadContext = [
+				`<squad_status>`,
+				`Squad: ${squad.id} — ${squad.goal}`,
+				`Status: ${squad.status} | ${doneCount}/${tasks.length} tasks | $${totalCost.toFixed(2)}`,
+				taskLines,
+				`</squad_status>`,
+				`You have an active squad. Use squad_message to talk to agents, squad_status for details, squad_modify to change tasks.`,
+			].join("\n");
+
+			return {
+				systemPrompt: event.systemPrompt + "\n\n" + squadContext,
+			};
+		}
+
+		// When NO squad is active, nudge the agent to consider using squad for complex tasks
+		const squadNudge = [
+			`<squad_hint>`,
+			`You have the "squad" tool available for multi-agent collaboration.`,
+			`Use it when the user's request involves multiple concerns (e.g. backend + frontend + tests + docs),`,
+			`would benefit from parallel execution, or is too large for a single agent context.`,
+			`The squad tool decomposes work into tasks, assigns specialist agents, and runs them in parallel.`,
+			`When in doubt about whether a task is complex enough, prefer using squad — it handles the coordination for you.`,
+			`</squad_hint>`,
 		].join("\n");
 
-		// Append to system prompt so the agent always sees it
 		return {
-			systemPrompt: event.systemPrompt + "\n\n" + squadContext,
+			systemPrompt: event.systemPrompt + "\n\n" + squadNudge,
 		};
 	});
 
@@ -96,9 +112,12 @@ export default function (pi: ExtensionAPI) {
 		label: "Squad",
 		description: [
 			"Start a multi-agent squad for complex, multi-step tasks.",
-			"Use when a task needs multiple specialized skills (backend + frontend + testing),",
-			"has natural parallelism, or would overflow a single agent's context.",
-			"Don't use for simple single-file changes or tasks a single agent can handle.",
+			"ALWAYS use squad when a task involves 2+ of: backend, frontend, testing, docs, devops, security.",
+			"Use when a task has natural parallelism, touches multiple files/systems, or would overflow a single agent's context.",
+			"Examples that NEED squad: 'build a REST API with auth and tests', 'add a feature with frontend + backend + docs',",
+			"'refactor the auth system and update tests', 'set up CI/CD with Docker and deployment'.",
+			"Do NOT use for simple single-file changes, quick bug fixes, or tasks a single agent can handle in a few minutes.",
+			"When in doubt about complexity, use squad — it's better to parallelize than to do everything sequentially.",
 			"Non-blocking: returns immediately with the plan while agents work in background.",
 		].join(" "),
 		parameters: Type.Object({
