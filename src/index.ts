@@ -410,16 +410,42 @@ export default function (pi: ExtensionAPI) {
 			widgetControls = setupSquadWidget(ctx, widgetState);
 		}
 
-		// Check for active squads for this project
-		const active = store.findActiveSquads()
-			.filter((s) => s.cwd === ctx.cwd);
-		if (active.length > 0) {
-			const squad = active[0];
-			pi.sendUserMessage(
-				`[squad] Found suspended squad "${squad.id}" (${squad.goal}). ` +
-				`Use squad_modify with action "resume" to continue, or start a new squad.`,
-				{ deliverAs: "followUp" },
-			);
+		// Clean up orphaned squads from crashed sessions:
+		// If a squad is "running" but has no live scheduler, its parent died.
+		// Suspend in-progress tasks and mark the squad as paused so it doesn't
+		// block new squads or trigger confusing followUp messages.
+		const orphaned = store.findActiveSquads()
+			.filter((s) => s.cwd === ctx.cwd && s.status === "running");
+		for (const squad of orphaned) {
+			const tasks = store.loadAllTasks(squad.id);
+			let hadInProgress = false;
+			for (const task of tasks) {
+				if (task.status === "in_progress") {
+					store.updateTaskStatus(squad.id, task.id, "suspended");
+					hadInProgress = true;
+				}
+			}
+			if (hadInProgress) {
+				squad.status = "paused";
+				store.saveSquad(squad);
+			}
+		}
+
+		// Notify about paused squads (including ones we just paused)
+		const paused = store.findActiveSquads()
+			.filter((s) => s.cwd === ctx.cwd && s.status === "paused");
+		if (paused.length > 0) {
+			const squad = paused[0];
+			const tasks = store.loadAllTasks(squad.id);
+			const done = tasks.filter(t => t.status === "done").length;
+			// Only notify if squad has meaningful progress worth resuming
+			if (done > 0 || tasks.some(t => t.status === "suspended")) {
+				pi.sendUserMessage(
+					`[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${done}/${tasks.length} done. ` +
+					`Use squad_modify with action "resume" to continue, or start a new squad.`,
+					{ deliverAs: "followUp" },
+				);
+			}
 		}
 
 		// Register Ctrl+Q terminal input handler for panel toggle
