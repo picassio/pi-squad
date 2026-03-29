@@ -255,7 +255,8 @@ export class SquadPanel implements Component, Focusable {
 		// Footer
 		lines.push(...this.renderFooter(width));
 
-		return lines;
+		// Safety: truncate all lines to prevent pi-tui crash
+		return lines.map((line) => truncateToWidth(line, width, ""));
 	}
 
 	private renderHeader(title: string, width: number): string[] {

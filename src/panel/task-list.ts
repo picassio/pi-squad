@@ -3,6 +3,7 @@
  */
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
+import { truncateToWidth } from "@mariozechner/pi-tui";
 import type { Task, TaskStatus } from "../types.js";
 import type { Scheduler } from "../scheduler.js";
 import * as store from "../store.js";
@@ -150,7 +151,7 @@ export class TaskListView {
 			}
 
 			const line = ` ${cursor} ${icon} ${taskName} ${agentTag}${labelStr}${timeStr}`;
-			lines.push(line);
+			lines.push(truncateToWidth(line, width, "…"));
 
 			// Show blocked-by info
 			if (task.status === "blocked" && task.depends.length > 0) {
@@ -160,16 +161,17 @@ export class TaskListView {
 						return dep && dep.status !== "done";
 					});
 				if (blockers.length > 0) {
-					lines.push(
-						`     ${th.fg("dim", "└ waiting on: " + blockers.join(", "))}`,
-					);
+					lines.push(truncateToWidth(
+						`     ${th.fg("dim", "└ waiting on: " + blockers.join(", "))}`, width, "…",
+					));
 				}
 			}
 
 			// Show error for failed tasks
 			if (task.status === "failed" && task.error) {
-				const errorPreview = task.error.slice(0, width - 10);
-				lines.push(`     ${th.fg("error", "└ " + errorPreview)}`);
+				lines.push(truncateToWidth(
+					`     ${th.fg("error", "└ " + task.error)}`, width, "…",
+				));
 			}
 		}
 
@@ -184,7 +186,10 @@ export class TaskListView {
 		const th = this.theme;
 		const lines: string[] = [];
 
-		lines.push(th.fg("border", ` ── ${task.id} (live) `) + th.fg("border", "─".repeat(Math.max(0, width - task.id.length - 12))));
+		lines.push(truncateToWidth(
+			th.fg("border", ` ── ${task.id} (live) `) + th.fg("border", "─".repeat(Math.max(0, width - task.id.length - 12))),
+			width, "",
+		));
 
 		// Get recent messages for this task
 		const messages = store.loadMessages(this.squadId, task.id);
@@ -195,10 +200,10 @@ export class TaskListView {
 				const toolStr = `→ ${msg.name || msg.text}`;
 				const argsStr = msg.args?.path || msg.args?.command || "";
 				const preview = argsStr ? `${toolStr} ${argsStr}` : toolStr;
-				lines.push(` ${th.fg("muted", preview.slice(0, width - 2))}`);
+				lines.push(truncateToWidth(` ${th.fg("muted", preview)}`, width, "…"));
 			} else if (msg.type === "text" && msg.from !== "system") {
-				const preview = msg.text.split("\n")[0].slice(0, width - 4);
-				lines.push(` ${th.fg("dim", `"${preview}"`)}`);
+				const preview = msg.text.split("\n")[0];
+				lines.push(truncateToWidth(` ${th.fg("dim", `"${preview}"`)}`, width, "…"));
 			}
 		}
 
