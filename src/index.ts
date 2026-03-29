@@ -26,7 +26,9 @@ import * as store from "./store.js";
 // State
 // ============================================================================
 
-let activeScheduler: Scheduler | null = null;
+/** Registry of all running schedulers — supports multiple concurrent squads */
+const schedulers = new Map<string, Scheduler>();
+/** The currently viewed/focused squad (for widget, panel, status) */
 let activeSquadId: string | null = null;
 /** Whether an overlay panel is currently open (prevents double-open) */
 let overlayOpen = false;
@@ -35,6 +37,12 @@ let uiCtx: import("@mariozechner/pi-coding-agent").ExtensionContext | null = nul
 /** Component-based widget state + controls */
 const widgetState: SquadWidgetState = { squadId: null, enabled: true };
 let widgetControls: { requestUpdate: () => void; dispose: () => void } | null = null;
+
+/** Get the active scheduler (for the focused squad) */
+function getActiveScheduler(): Scheduler | null {
+	if (!activeSquadId) return null;
+	return schedulers.get(activeSquadId) || null;
+}
 
 
 // ============================================================================
@@ -157,16 +165,7 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!uiCtx) uiCtx = ctx;
 
-			if (activeScheduler) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `A squad is already running (${activeSquadId}). Use squad_status to check progress, or squad_modify to cancel it.`,
-						},
-					],
-				};
-			}
+			// Multiple squads can run concurrently — no guard needed
 
 			const squadId = store.makeTaskId(params.goal);
 			if (store.squadExists(squadId)) {
@@ -205,9 +204,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			// If scheduler is running, force a context refresh
-			if (activeScheduler && activeSquadId === id) {
-				activeScheduler.updateContext();
-			}
+			const sched = schedulers.get(id!);
+				if (sched) sched.updateContext();
 
 			const context = store.loadContext(id);
 			if (!context) {
@@ -257,6 +255,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			const activeScheduler = getActiveScheduler();
 			if (!activeScheduler || !activeSquadId) {
 				return { content: [{ type: "text" as const, text: "No active squad." }] };
 			}
@@ -272,7 +271,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: "Could not determine target task. Provide taskId or an agent name that is currently running." }] };
 			}
 
-			const sent = await activeScheduler.sendHumanMessage(taskId, params.message);
+			const sent = await activeScheduler!.sendHumanMessage(taskId, params.message);
 			const status = sent ? "delivered" : "queued for when the agent starts";
 
 			return { content: [{ type: "text" as const, text: `Message ${status}: "${params.message}"` }] };
@@ -326,9 +325,9 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				// Create a fresh scheduler if needed
-				if (!activeScheduler) {
+				if (!schedulers.has(squadId)) {
 					const scheduler = new Scheduler(squadId, squadSkillPaths);
-					activeScheduler = scheduler;
+					schedulers.set(squadId, scheduler);
 					activeSquadId = squadId;
 
 					// Activate widget
@@ -347,12 +346,12 @@ export default function (pi: ExtensionAPI) {
 									.map((t) => `- ${t.id} (${t.agent}): ${t.output?.slice(0, 150) || "done"}`)
 									.join("\n");
 								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-								if (activeScheduler) activeScheduler.updateContext();
+								const s = schedulers.get(squadId); if (s) s.updateContext();
 								pi.sendUserMessage(
 									`[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}`,
 									{ deliverAs: "followUp" },
 								);
-								activeScheduler = null;
+								schedulers.delete(squadId);
 								forceWidgetUpdate();
 								break;
 							}
@@ -378,7 +377,8 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				activeScheduler.resume().catch((err) => {
+				const resumeSched = schedulers.get(squadId)!;
+				resumeSched.resume().catch((err) => {
 					console.error(`[squad] Resume error: ${(err as Error).message}`);
 				});
 
@@ -457,7 +457,7 @@ export default function (pi: ExtensionAPI) {
 						squad.status = "failed";
 						store.saveSquad(squad);
 					}
-					activeScheduler = null;
+					schedulers.delete(activeSquadId);
 					activeSquadId = null;
 					return { content: [{ type: "text" as const, text: "Squad cancelled." }] };
 				}
@@ -538,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (activeSquadId) {
-						openPanel(ctx, activeScheduler || new Scheduler(activeSquadId, squadSkillPaths), activeSquadId);
+						openPanel(ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths), activeSquadId);
 					}
 					return { consume: true };
 				}
@@ -550,11 +550,11 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", async () => {
 		widgetControls?.dispose();
 		widgetControls = null;
-		if (activeScheduler) {
-			await activeScheduler.stop();
-			activeScheduler = null;
-			activeSquadId = null;
+		for (const [id, sched] of schedulers) {
+			await sched.stop();
 		}
+		schedulers.clear();
+		activeSquadId = null;
 		uiCtx = null;
 	});
 
@@ -663,7 +663,7 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 					if (activeSquadId) {
-						const sched = activeScheduler || new Scheduler(activeSquadId, squadSkillPaths);
+						const sched = schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths);
 						openPanel(ctx, sched, activeSquadId);
 					}
 					return;
@@ -721,8 +721,9 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
-					if (activeScheduler) {
-						await activeScheduler.sendHumanMessage(targetTaskId, msgText);
+					const msgSched = getActiveScheduler();
+					if (msgSched) {
+						await msgSched.sendHumanMessage(targetTaskId, msgText);
 						ctx.ui.notify(`Sent to ${targetAgent}: "${msgText.slice(0, 50)}"`, "info");
 					} else {
 						store.appendMessage(activeSquadId, targetTaskId, {
@@ -738,22 +739,23 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "cancel": {
-					if (!activeScheduler) {
+					const cancelSched = getActiveScheduler();
+					if (!cancelSched) {
 						ctx.ui.notify("No running squad to cancel", "info");
 						return;
 					}
-					await activeScheduler.stop();
+					await cancelSched.stop();
 					const squad = store.loadSquad(activeSquadId!);
 					if (squad) { squad.status = "failed"; store.saveSquad(squad); }
-					activeScheduler = null;
+					if (activeSquadId) schedulers.delete(activeSquadId);
 					forceWidgetUpdate();
 					ctx.ui.notify("Squad cancelled", "info");
 					return;
 				}
 
 				case "clear": {
+					if (activeSquadId) schedulers.delete(activeSquadId);
 					activeSquadId = null;
-					activeScheduler = null;
 					widgetState.squadId = null;
 					widgetControls?.dispose();
 					ctx.ui.notify("Squad view cleared", "info");
@@ -987,8 +989,9 @@ function openPanel(
 				const task = store.loadTask(squadId, taskId);
 				const agentName = task?.agent || taskId;
 				const input = await ctx.ui.input(`Message to ${agentName}`, "Type your message...");
-				if (input && activeScheduler) {
-					await activeScheduler.sendHumanMessage(taskId, input);
+				const panelSched = schedulers.get(squadId);
+				if (input && panelSched) {
+					await panelSched.sendHumanMessage(taskId, input);
 					ctx.ui.notify(`Sent to ${agentName}: "${input.slice(0, 50)}"`, "info");
 				} else if (input) {
 					store.appendMessage(squadId, taskId, {
@@ -1130,7 +1133,7 @@ async function startSquad(
 
 	// Start scheduler
 	const scheduler = new Scheduler(squadId, skillPaths);
-	activeScheduler = scheduler;
+	schedulers.set(squadId, scheduler);
 	activeSquadId = squadId;
 
 	// Activate widget for this squad
@@ -1152,8 +1155,9 @@ async function startSquad(
 				const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
 				// Final context update before clearing scheduler
-				if (activeScheduler) {
-					activeScheduler.updateContext();
+				const completedSched = schedulers.get(squadId);
+				if (completedSched) {
+					completedSched.updateContext();
 				}
 
 				pi.sendUserMessage(
@@ -1164,7 +1168,7 @@ async function startSquad(
 				);
 
 				// Clear scheduler but keep activeSquadId so squad_status still works
-				activeScheduler = null;
+				schedulers.delete(squadId);
 				forceWidgetUpdate(); // Final update showing done state
 				break;
 			}
