@@ -347,10 +347,11 @@ export default function (pi: ExtensionAPI) {
 									.join("\n");
 								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 								const s = schedulers.get(squadId); if (s) s.updateContext();
-								pi.sendUserMessage(
-									`[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}`,
-									{ deliverAs: "followUp" },
-								);
+								pi.sendMessage({
+									customType: "squad-completed",
+									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}`,
+									display: true,
+								});
 								schedulers.delete(squadId);
 								forceWidgetUpdate();
 								break;
@@ -359,18 +360,20 @@ export default function (pi: ExtensionAPI) {
 								const tasks = store.loadAllTasks(squadId);
 								const failed = tasks.filter((t) => t.status === "failed");
 								const done = tasks.filter((t) => t.status === "done");
-								pi.sendUserMessage(
-									`[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}`,
-									{ deliverAs: "followUp" },
-								);
+								pi.sendMessage({
+									customType: "squad-failed",
+									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}`,
+									display: true,
+								}, { triggerTurn: true });
 								forceWidgetUpdate();
 								break;
 							}
 							case "escalation": {
-								pi.sendUserMessage(
-									`[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n${event.message}`,
-									{ deliverAs: "followUp" },
-								);
+								pi.sendMessage({
+									customType: "squad-escalation",
+									content: `[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n${event.message}`,
+									display: true,
+								}, { triggerTurn: true });
 								break;
 							}
 						}
@@ -510,11 +513,12 @@ export default function (pi: ExtensionAPI) {
 			const done = tasks.filter(t => t.status === "done").length;
 			// Only notify if at least 1 task completed — worth resuming
 			if (done > 0) {
-				pi.sendUserMessage(
-					`[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${done}/${tasks.length} done. ` +
-					`Use squad_modify with action "resume" to continue, or start a new squad.`,
-					{ deliverAs: "followUp" },
-				);
+				pi.sendMessage({
+					customType: "squad-paused",
+					content: `[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${done}/${tasks.length} done. ` +
+						`Use squad_modify with action "resume" to continue, or start a new squad.`,
+					display: true,
+				});
 			}
 		}
 
@@ -816,7 +820,11 @@ export default function (pi: ExtensionAPI) {
 							const localPath = `${store.getLocalAgentsDir(ctx.cwd)}/${agent.name}.json`;
 							const globalPath = `${store.getGlobalAgentsDir()}/${agent.name}.json`;
 							const filePath = fs.existsSync(localPath) ? localPath : globalPath;
-							pi.sendUserMessage(`Edit agent file: ${filePath}`, { deliverAs: "followUp" });
+							pi.sendMessage({
+								customType: "squad-edit-agent",
+								content: `Edit agent file: ${filePath}`,
+								display: true,
+							}, { triggerTurn: true });
 						} else if (action === "Change model") {
 							const newModel = await ctx.ui.input(
 								`Model for ${agent.name} (empty = default)`,
@@ -1160,12 +1168,15 @@ async function startSquad(
 					completedSched.updateContext();
 				}
 
-				pi.sendUserMessage(
-					`[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
-					`Summary:\n${summary}\n\n` +
-					`Total cost: $${totalCost.toFixed(4)}`,
-					{ deliverAs: "followUp" },
-				);
+				// Use sendMessage with display:true — visible to user but doesn't
+				// pollute LLM message history. No triggerTurn needed for completions.
+				pi.sendMessage({
+					customType: "squad-completed",
+					content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
+						`Summary:\n${summary}\n\n` +
+						`Total cost: $${totalCost.toFixed(4)}`,
+					display: true,
+				});
 
 				// Clear scheduler but keep activeSquadId so squad_status still works
 				schedulers.delete(squadId);
@@ -1178,24 +1189,30 @@ async function startSquad(
 				const failed = tasks.filter((t) => t.status === "failed");
 				const done = tasks.filter((t) => t.status === "done");
 
-				pi.sendUserMessage(
-					`[squad] Squad "${squadId}" has stalled. ` +
-					`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
-					`Failed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}\n` +
-					`Use squad_status for details or squad_modify to adjust.`,
-					{ deliverAs: "followUp" },
-				);
+				// Squad failed — notify user. Use triggerTurn so the agent can
+				// suggest next steps (retry, modify, cancel).
+				pi.sendMessage({
+					customType: "squad-failed",
+					content: `[squad] Squad "${squadId}" has stalled. ` +
+						`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
+						`Failed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}\n` +
+						`Use squad_status for details or squad_modify to adjust.`,
+					display: true,
+				}, { triggerTurn: true });
 				forceWidgetUpdate();
 				break;
 			}
 
 			case "escalation": {
-				pi.sendUserMessage(
-					`[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n` +
-					`${event.message}\n\n` +
-					`Reply to me and I'll forward your answer, or use the squad panel.`,
-					{ deliverAs: "followUp" },
-				);
+				// Escalation — agent needs help. triggerTurn so the main agent
+				// can respond and relay help.
+				pi.sendMessage({
+					customType: "squad-escalation",
+					content: `[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n` +
+						`${event.message}\n\n` +
+						`Reply to me and I'll forward your answer, or use the squad panel.`,
+					display: true,
+				}, { triggerTurn: true });
 				break;
 			}
 		}
