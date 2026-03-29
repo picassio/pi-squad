@@ -584,6 +584,7 @@ export default function (pi: ExtensionAPI) {
 				{ value: "panel", label: "panel", description: "Toggle overlay panel" },
 				{ value: "cancel", label: "cancel", description: "Cancel running squad" },
 				{ value: "clear", label: "clear", description: "Dismiss widget and deactivate squad" },
+				{ value: "cleanup", label: "cleanup", description: "Delete squad data (select or all)" },
 				{ value: "enable", label: "enable", description: "Enable pi-squad (tools, widget, system prompt)" },
 				{ value: "disable", label: "disable", description: "Disable pi-squad completely" },
 			];
@@ -766,6 +767,92 @@ export default function (pi: ExtensionAPI) {
 					widgetState.squadId = null;
 					widgetControls?.dispose();
 					ctx.ui.notify("Squad view cleared", "info");
+					return;
+				}
+
+				case "cleanup": {
+					const cleanupArg = parts[1];
+					const allSquadIds = store.listSquads();
+
+					if (allSquadIds.length === 0) {
+						ctx.ui.notify("No squads to clean up", "info");
+						return;
+					}
+
+					if (cleanupArg === "all") {
+						// Stop any running schedulers first
+						for (const [id, sched] of schedulers) {
+							await sched.stop();
+						}
+						schedulers.clear();
+						activeSquadId = null;
+						widgetState.squadId = null;
+						widgetControls?.requestUpdate();
+
+						let count = 0;
+						for (const id of allSquadIds) {
+							fs.rmSync(store.getSquadDir(id), { recursive: true, force: true });
+							count++;
+						}
+						ctx.ui.notify(`Deleted ${count} squad(s)`, "info");
+						return;
+					}
+
+					// Interactive: pick squads to delete
+					const squads = allSquadIds
+						.map((id) => store.loadSquad(id))
+						.filter((s): s is Squad => s !== null)
+						.sort((a, b) => b.created.localeCompare(a.created));
+
+					const options = [
+						"🗑  Delete ALL squads",
+						...squads.map((s) => {
+							const tasks = store.loadAllTasks(s.id);
+							const done = tasks.filter((t) => t.status === "done").length;
+							const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
+							const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "failed" ? "✗" : "·";
+							return `${icon} ${s.id} [${s.status}] ${done}/${tasks.length} $${cost.toFixed(2)}`;
+						}),
+					];
+
+					const choice = await ctx.ui.select("Delete squad data", options);
+					if (!choice) return;
+
+					if (choice.startsWith("🗑")) {
+						// Delete all
+						for (const [id, sched] of schedulers) {
+							await sched.stop();
+						}
+						schedulers.clear();
+						activeSquadId = null;
+						widgetState.squadId = null;
+						widgetControls?.requestUpdate();
+						let count = 0;
+						for (const id of allSquadIds) {
+							fs.rmSync(store.getSquadDir(id), { recursive: true, force: true });
+							count++;
+						}
+						ctx.ui.notify(`Deleted ${count} squad(s)`, "info");
+					} else {
+						// Delete selected
+						const idx = options.indexOf(choice) - 1; // -1 for the "Delete ALL" option
+						if (idx >= 0 && idx < squads.length) {
+							const squad = squads[idx];
+							// Stop scheduler if running
+							const sched = schedulers.get(squad.id);
+							if (sched) {
+								await sched.stop();
+								schedulers.delete(squad.id);
+							}
+							if (activeSquadId === squad.id) {
+								activeSquadId = null;
+								widgetState.squadId = null;
+								widgetControls?.requestUpdate();
+							}
+							fs.rmSync(store.getSquadDir(squad.id), { recursive: true, force: true });
+							ctx.ui.notify(`Deleted: ${squad.id}`, "info");
+						}
+					}
 					return;
 				}
 
