@@ -4,6 +4,9 @@
  * Uses the component factory overload of setWidget() (like pi-interactive-shell)
  * so rendering is dynamic with access to TUI and Theme, and updates are triggered
  * via tui.requestRender() instead of polling intervals.
+ *
+ * Inspired by pi-session-hud's stale detection: shows elapsed time per
+ * running task and marks stale tasks (>3min with no new messages).
  */
 
 import type { Component, TUI } from "@mariozechner/pi-tui";
@@ -126,17 +129,39 @@ export function setupSquadWidget(
 						let line = `  ${icon} ${th.fg("muted", task.id)} ${th.fg("dim", `(${task.agent})`)}`;
 
 						if (task.status === "done" && task.output) {
-							line += ` ${th.fg("dim", task.output.split("\n")[0].slice(0, 50))}`;
+							// Show completion time if available
+							let timeStr = "";
+							if (task.started && task.completed) {
+								const dur = new Date(task.completed).getTime() - new Date(task.started).getTime();
+								timeStr = th.fg("dim", ` ${formatElapsed(dur)}`);
+							}
+							line += `${timeStr} ${th.fg("dim", task.output.split("\n")[0].slice(0, 50))}`;
 						} else if (task.status === "failed" && task.error) {
 							line += ` ${th.fg("error", task.error.slice(0, 50))}`;
 						} else if (task.status === "in_progress") {
-							// Show recent activity
+							// Show elapsed time for running task
+							const runningFor = task.started
+								? Date.now() - new Date(task.started).getTime()
+								: 0;
+							const timeColor = runningFor > 180_000 ? "warning" : "dim"; // >3min = warning
+							line += ` ${th.fg(timeColor as any, formatElapsed(runningFor))}`;
+
+							// Show recent activity (last tool call)
 							const messages = store.loadMessages(state.squadId!, task.id);
 							const lastTool = [...messages].reverse().find(m => m.type === "tool");
 							if (lastTool) {
 								const detail = lastTool.args?.path || lastTool.args?.command || "";
 								const toolStr = `→ ${lastTool.name || lastTool.text}`;
 								line += ` ${th.fg("dim", (detail ? `${toolStr} ${detail}` : toolStr).slice(0, 40))}`;
+
+								// Stale detection: if last message is >2min old, show ⏳
+								const lastMsg = messages[messages.length - 1];
+								if (lastMsg) {
+									const msgAge = Date.now() - new Date(lastMsg.ts).getTime();
+									if (msgAge > 120_000) {
+										line += ` ${th.fg("warning", `⏳ ${formatElapsed(msgAge)} idle`)}`;
+									}
+								}
 							}
 						} else if (task.status === "blocked") {
 							const blockers = task.depends.filter((d) => {
