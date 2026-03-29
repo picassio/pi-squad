@@ -26,6 +26,7 @@ export type SchedulerEventType =
 	| "task_failed"
 	| "task_blocked"
 	| "task_unblocked"
+	| "task_rework"
 	| "squad_completed"
 	| "squad_failed"
 	| "escalation"
@@ -432,9 +433,15 @@ export class Scheduler {
 			message: output,
 		});
 
-		// Auto-unblock dependents
-		console.error(`[squad-scheduler] handleTaskCompleted: ${taskId} done, auto-unblocking dependents`);
-		this.autoUnblock(taskId);
+		// Check for QA rework: if this is a QA/test task and it found failures,
+		// create a rework task for the original agent instead of proceeding
+		const reworkCreated = this.checkForRework(task, output);
+
+		if (!reworkCreated) {
+			// Normal flow: auto-unblock dependents
+			console.error(`[squad-scheduler] handleTaskCompleted: ${taskId} done, auto-unblocking dependents`);
+			this.autoUnblock(taskId);
+		}
 
 		// Schedule next ready tasks (may spawn new agents)
 		console.error(`[squad-scheduler] handleTaskCompleted: scheduling next ready tasks`);
@@ -525,6 +532,163 @@ export class Scheduler {
 				this.pool.kill(task.id);
 			}
 		}
+	}
+
+	// =========================================================================
+	// QA Rework Loop
+	// =========================================================================
+
+	/**
+	 * Check if a completed task is a QA task that found failures.
+	 * If so, create a rework task for the original agent and a retest task for QA.
+	 * Returns true if rework was created (caller should NOT auto-unblock dependents).
+	 */
+	private checkForRework(task: Task, output: string): boolean {
+		// Only trigger rework for QA/test agent tasks
+		const qaAgents = ["qa", "tester", "security"];
+		if (!qaAgents.includes(task.agent)) return false;
+
+		// Parse verdict from output
+		const verdict = this.parseQaVerdict(output);
+		if (verdict === "pass") return false;
+
+		// Find the implementation task(s) this QA task was testing
+		const allTasks = store.loadAllTasks(this.squadId);
+		const implDeps = task.depends
+			.map((depId) => allTasks.find((t) => t.id === depId))
+			.filter((t): t is Task => t !== null && !qaAgents.includes(t.agent));
+
+		if (implDeps.length === 0) return false;
+
+		const squad = store.loadSquad(this.squadId);
+		if (!squad) return false;
+
+		// Extract the failure details for feedback
+		const feedback = this.extractQaFeedback(output);
+
+		let createdAny = false;
+		for (const implTask of implDeps) {
+			// Check retry limit
+			const retryCount = store.getRetryCount(this.squadId, implTask.retryOf || implTask.id);
+			const originalId = implTask.retryOf || implTask.id;
+
+			if (retryCount >= squad.config.maxRetries) {
+				console.error(`[squad-scheduler] Retry limit reached for ${originalId} (${retryCount}/${squad.config.maxRetries})`);
+				this.emit({
+					type: "escalation",
+					squadId: this.squadId,
+					taskId: task.id,
+					agentName: task.agent,
+					message: `QA failed ${originalId} ${retryCount} times. Retry limit reached.\nLatest feedback:\n${feedback.slice(0, 500)}`,
+				});
+				continue;
+			}
+
+			const fixN = retryCount + 1;
+
+			// Create rework task for the original agent
+			const reworkId = `${originalId}-fix-${fixN}`;
+			const reworkTask: Task = {
+				id: reworkId,
+				title: `Fix: ${implTask.title} (attempt ${fixN})`,
+				description: `QA found issues in ${implTask.id}. Fix the problems described below.\n\n## QA Feedback\n${feedback}`,
+				agent: implTask.agent,
+				status: "pending",
+				depends: [],
+				created: store.now(),
+				started: null,
+				completed: null,
+				output: null,
+				error: null,
+				usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+				retryOf: originalId,
+				retryCount: fixN,
+				qaFeedback: feedback,
+			};
+			store.createTask(this.squadId, reworkTask);
+
+			// Create retest task for QA
+			const retestId = `${task.id}-retest-${fixN}`;
+			const retestTask: Task = {
+				id: retestId,
+				title: `Re-test: ${implTask.title} (after fix ${fixN})`,
+				description: `Re-test ${implTask.id} after rework. Verify the issues from the previous QA round are fixed.\n\nPrevious issues:\n${feedback}`,
+				agent: task.agent,
+				status: "blocked",
+				depends: [reworkId],
+				created: store.now(),
+				started: null,
+				completed: null,
+				output: null,
+				error: null,
+				usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+				retryOf: task.id,
+				retryCount: fixN,
+			};
+			store.createTask(this.squadId, retestTask);
+
+			store.appendMessage(this.squadId, task.id, {
+				ts: store.now(),
+				from: "system",
+				type: "status",
+				text: `QA failed — creating rework task ${reworkId} for ${implTask.agent} and retest ${retestId}`,
+			});
+
+			this.emit({
+				type: "task_rework",
+				squadId: this.squadId,
+				taskId: reworkId,
+				agentName: implTask.agent,
+				message: `QA found issues in ${implTask.id}. Rework attempt ${fixN}.`,
+			});
+
+			console.error(`[squad-scheduler] Rework: ${reworkId} (${implTask.agent}) + retest ${retestId} (${task.agent})`);
+			createdAny = true;
+		}
+
+		return createdAny;
+	}
+
+	/** Parse QA verdict from task output */
+	private parseQaVerdict(output: string): "pass" | "fail" | "pass_with_issues" {
+		const lower = output.toLowerCase();
+
+		// Look for structured verdict line: "## Verdict: FAIL" or "Verdict: PASS"
+		const verdictMatch = output.match(/##?\s*Verdict:\s*(PASS WITH ISSUES|PASS|FAIL)/i);
+		if (verdictMatch) {
+			const v = verdictMatch[1].toUpperCase();
+			if (v === "FAIL") return "fail";
+			if (v === "PASS WITH ISSUES") return "pass_with_issues";
+			return "pass";
+		}
+
+		// Fallback: look for common failure patterns
+		if (
+			lower.includes("verdict: fail") ||
+			lower.includes("status: fail") ||
+			/\d+\s+(?:tests?\s+)?fail(?:ed|ing|ure)/i.test(output) ||
+			(lower.includes("fail") && lower.includes("test") && !lower.includes("0 fail"))
+		) {
+			return "fail";
+		}
+
+		return "pass";
+	}
+
+	/** Extract actionable feedback from QA output */
+	private extractQaFeedback(output: string): string {
+		// Try to extract "## Issues" or "## Failures" section
+		const issuesMatch = output.match(/##\s*(?:Issues|Failures|Bugs|Problems|Failed Tests)[\s\S]*?(?=\n##\s|$)/i);
+		if (issuesMatch) return issuesMatch[0].trim();
+
+		// Try to extract lines containing "FAIL", "Error", "✗"
+		const failLines = output.split("\n")
+			.filter((line) => /fail|error|✗|✘|broken|bug/i.test(line))
+			.slice(0, 20);
+		if (failLines.length > 0) return failLines.join("\n");
+
+		// Fallback: last 500 chars
+		return output.slice(-500);
 	}
 
 	// =========================================================================

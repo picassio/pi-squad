@@ -235,6 +235,42 @@ ${task.description || "(no additional description)"}
 }
 
 // ============================================================================
+// Rework Context
+// ============================================================================
+
+function buildReworkContext(task: Task, squadId: string): string {
+	if (!task.retryOf) return "";
+
+	const originalTask = loadAllTasks(squadId).find((t) => t.id === task.retryOf);
+
+	const lines: string[] = [
+		"# ⚠️ REWORK — Fix Issues From Previous Attempt\n",
+		`This is attempt #${task.retryCount || 1} to fix issues in **${task.retryOf}**.\n`,
+	];
+
+	if (originalTask?.output) {
+		lines.push("## What Was Built (Previous Attempt)");
+		lines.push(originalTask.output.slice(0, 2000));
+		lines.push("");
+	}
+
+	if (task.qaFeedback) {
+		lines.push("## QA Feedback — What Needs Fixing");
+		lines.push(task.qaFeedback);
+		lines.push("");
+	}
+
+	lines.push("## Instructions");
+	lines.push("- Read the QA feedback carefully — fix ONLY the reported issues");
+	lines.push("- Do NOT rewrite everything from scratch");
+	lines.push("- Make targeted, minimal fixes");
+	lines.push("- Re-run the failing tests to verify your fixes");
+	lines.push("- Include test output as evidence in your completion message\n");
+
+	return lines.join("\n");
+}
+
+// ============================================================================
 // Full Prompt Assembly
 // ============================================================================
 
@@ -255,6 +291,7 @@ export function buildAgentSystemPrompt(options: ProtocolBuildOptions): string {
 		buildSquadProtocol(task.agent, agentDef, squad),
 		buildAgentIdentity(agentDef),
 		buildTaskSection(task),
+		buildReworkContext(task, squadId),
 		buildChainContext(task, allTasks, squadId),
 		buildSiblingAwareness(task, allTasks, modifiedFiles),
 		buildKnowledgeSection(squadId),

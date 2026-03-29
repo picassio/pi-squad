@@ -34,12 +34,15 @@ export interface SquadConfig {
 	maxConcurrency: number;
 	autoUnblock: boolean;
 	reviewOnComplete: boolean;
+	/** Max rework attempts when QA fails a task (0 = no rework, just fail) */
+	maxRetries: number;
 }
 
 export const DEFAULT_SQUAD_CONFIG: SquadConfig = {
 	maxConcurrency: 2,
 	autoUnblock: true,
 	reviewOnComplete: false,
+	maxRetries: 2,
 };
 
 export interface Squad {
@@ -79,6 +82,12 @@ export interface Task {
 	output: string | null;
 	error: string | null;
 	usage: TaskUsage;
+	/** If this is a rework task, the original task ID it's fixing */
+	retryOf?: string;
+	/** How many times this task chain has been retried */
+	retryCount?: number;
+	/** QA feedback that triggered this rework */
+	qaFeedback?: string;
 }
 
 // ============================================================================

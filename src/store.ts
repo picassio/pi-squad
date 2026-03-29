@@ -395,6 +395,23 @@ export function loadAllKnowledge(squadId: string): KnowledgeEntry[] {
 }
 
 // ============================================================================
+// Rework Helpers
+// ============================================================================
+
+/** Find all retry tasks for a given original task ID */
+export function findRetries(squadId: string, originalTaskId: string): Task[] {
+	return loadAllTasks(squadId).filter((t) => t.retryOf === originalTaskId);
+}
+
+/** Get the retry count for a task chain (original + all retries) */
+export function getRetryCount(squadId: string, taskId: string): number {
+	const task = loadTask(squadId, taskId);
+	if (!task) return 0;
+	if (task.retryCount !== undefined) return task.retryCount;
+	return findRetries(squadId, taskId).length;
+}
+
+// ============================================================================
 // Memory (cross-squad)
 // ============================================================================
 

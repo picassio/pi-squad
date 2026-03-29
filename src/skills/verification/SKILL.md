@@ -62,3 +62,35 @@ $ npm test -- test/auth.test.ts
 - Include relevant code snippets as evidence
 - State confidence level on uncertain findings
 - List what you checked AND what you didn't check
+
+## QA Verdict Format (REQUIRED for test/QA tasks)
+
+Your final message MUST end with a structured verdict that automation can parse:
+
+### If everything passes:
+```
+## Verdict: PASS
+All N tests passing. No issues found.
+```
+
+### If tests fail:
+```
+## Verdict: FAIL
+
+## Issues
+1. **[file:line]** Description of the failure
+   - Expected: X
+   - Got: Y
+2. **[file:line]** Another issue
+   - Steps to reproduce: ...
+```
+
+### If tests pass but with concerns:
+```
+## Verdict: PASS WITH ISSUES
+
+## Minor Issues
+1. Description of concern (non-blocking)
+```
+
+The verdict line (`## Verdict: PASS/FAIL/PASS WITH ISSUES`) is **machine-parsed** by the squad system. When you output `FAIL`, the squad automatically creates a rework task for the original agent with your feedback, then re-tests after the fix. Make your Issues section **specific and actionable** — the fixing agent only sees your feedback.
