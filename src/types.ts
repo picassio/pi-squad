@@ -17,6 +17,8 @@ export interface AgentDef {
 	tags: string[];
 	/** System prompt injected via --append-system-prompt */
 	prompt: string;
+	/** When true, agent is hidden from the planner and cannot be assigned tasks */
+	disabled?: boolean;
 }
 
 /** Agent entry in squad.json — just overrides, references an AgentDef by key */

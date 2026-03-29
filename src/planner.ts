@@ -31,7 +31,7 @@ export async function runPlanner(options: PlannerOptions): Promise<PlannerOutput
 	const { goal, cwd, model } = options;
 
 	const plannerDef = loadAgentDef("planner", cwd);
-	const allAgents = loadAllAgentDefs(cwd).filter((a) => a.name !== "planner");
+	const allAgents = loadAllAgentDefs(cwd).filter((a) => a.name !== "planner" && !a.disabled);
 
 	const agentList = allAgents
 		.map((a) => `- **${a.name}** (${a.role}): ${a.description} [tags: ${a.tags.join(", ")}]`)

@@ -772,7 +772,8 @@ export default function (pi: ExtensionAPI) {
 						}
 						const options = allAgents.map((a) => {
 							const model = a.model ? ` [${a.model}]` : " [default]";
-							return `${a.name} — ${a.role}${model}`;
+							const status = a.disabled ? " ✗ disabled" : "";
+							return `${a.name} — ${a.role}${model}${status}`;
 						});
 						const choice = await ctx.ui.select("Squad Agents (select to view/edit)", options);
 						if (!choice) return;
@@ -781,11 +782,13 @@ export default function (pi: ExtensionAPI) {
 						if (!agent) return;
 
 						// Show agent details and offer actions
+						const disableLabel = agent.disabled ? "Enable agent" : "Disable agent";
 						const actions = [
 							"View details",
 							"Edit in editor",
 							"Change model",
 							"Toggle tools (restrict/unrestrict)",
+							disableLabel,
 							"Cancel",
 						];
 						const action = await ctx.ui.select(`${agent.name} (${agent.role})`, actions);
@@ -822,6 +825,11 @@ export default function (pi: ExtensionAPI) {
 								store.saveAgentDef(agent);
 								ctx.ui.notify(`${agent.name} model → ${agent.model || "(default)"}`, "info");
 							}
+						} else if (action === disableLabel) {
+							agent.disabled = !agent.disabled;
+							store.saveAgentDef(agent);
+							const newState = agent.disabled ? "disabled — planner will not assign tasks to this agent" : "enabled";
+							ctx.ui.notify(`${agent.name}: ${newState}`, "info");
 						} else if (action === "Toggle tools") {
 							if (agent.tools) {
 								agent.tools = null;
@@ -845,8 +853,9 @@ export default function (pi: ExtensionAPI) {
 					// /squad agents <name> — show specific agent
 					const agent = store.loadAgentDef(agentArg, ctx.cwd);
 					if (agent) {
+						const status = agent.disabled ? " ✗ DISABLED" : "";
 						const details = [
-							`${agent.name} — ${agent.role}`,
+							`${agent.name} — ${agent.role}${status}`,
 							`${agent.description}`,
 							`Model: ${agent.model || "(default)"}`,
 							`Tools: ${agent.tools ? agent.tools.join(", ") : "(all)"}`,

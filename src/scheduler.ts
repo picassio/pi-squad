@@ -237,6 +237,11 @@ export class Scheduler {
 			return;
 		}
 
+		if (agentDef.disabled) {
+			this.handleTaskFailed(task.id, `Agent '${task.agent}' is disabled. Enable it with /squad agents or edit ${task.agent}.json`);
+			return;
+		}
+
 		// Apply squad-level model override
 		const squadAgentEntry = squad.agents[task.agent];
 		if (squadAgentEntry?.model) {
