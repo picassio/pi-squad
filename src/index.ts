@@ -937,28 +937,18 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 
 	activeSquadId = squadId;
 
-	// Show widget for this squad
+	// Update widget to show the new squad. The widget reads squadId on each
+	// render, so just updating the state and requesting a render is enough.
 	widgetState.squadId = squadId;
 	widgetState.enabled = true;
 	widgetControls?.requestUpdate();
 
+	// Compact notification — widget already shows full task details.
+	// Avoid large multi-line notifications that can break TUI layout.
 	const tasks = store.loadAllTasks(squadId);
 	const done = tasks.filter((t) => t.status === "done").length;
 	const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-	const project = squad.cwd.split("/").pop();
-
-	const taskLines = tasks.map((t) => {
-		const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : "·";
-		return `  ${icon} ${t.id} (${t.agent}) [${t.status}]`;
-	}).join("\n");
-
-	ctx.ui.notify(
-		`Viewing: ${squad.id} [${squad.status}]\n` +
-		`Project: ${project}\n` +
-		`Tasks: ${done}/${tasks.length} done · $${cost.toFixed(2)}\n` +
-		taskLines,
-		"info",
-	);
+	ctx.ui.notify(`Viewing: ${squad.id} [${squad.status}] ${done}/${tasks.length} $${cost.toFixed(2)}`, "info");
 }
 
 // ============================================================================
