@@ -11,6 +11,12 @@
 
 import type { Component, TUI } from "@mariozechner/pi-tui";
 import { visibleWidth, truncateToWidth } from "@mariozechner/pi-tui";
+
+/** Truncate a line to fit within the widget width */
+function fitLine(line: string, width: number): string {
+	if (width <= 0) return "";
+	return truncateToWidth(line, width, "…");
+}
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { Task, TaskStatus } from "../types.js";
 import * as store from "../store.js";
@@ -221,7 +227,9 @@ export function setupSquadWidget(
 						lines.push(`  ${th.fg("dim", `  +${hidden} more · ^q detail`)}`);
 					}
 
-					return lines;
+					// CRITICAL: truncate all lines to fit terminal width.
+					// pi-tui throws a hard crash if any line exceeds width.
+					return lines.map((line) => fitLine(line, width));
 				},
 				invalidate() {
 					manageDurationTimer();
