@@ -313,9 +313,82 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Resume can work without an active scheduler — it recreates one from disk
+			if (params.action === "resume") {
+				// Find a squad to resume: use activeSquadId or find the latest paused one
+				const squadId = activeSquadId || store.findActiveSquads()
+					.filter((s) => s.cwd === ctx.cwd && s.status === "paused")
+					.sort((a, b) => b.created.localeCompare(a.created))[0]?.id;
+
+				if (!squadId) {
+					return { content: [{ type: "text" as const, text: "No paused squad found to resume." }] };
+				}
+
+				// Create a fresh scheduler if needed
+				if (!activeScheduler) {
+					const scheduler = new Scheduler(squadId, squadSkillPaths);
+					activeScheduler = scheduler;
+					activeSquadId = squadId;
+
+					// Activate widget
+					widgetState.squadId = squadId;
+					widgetState.enabled = true;
+					widgetControls?.requestUpdate();
+
+					// Wire up events (same as startSquad)
+					scheduler.onEvent((event: SchedulerEvent) => {
+						forceWidgetUpdate();
+						switch (event.type) {
+							case "squad_completed": {
+								const tasks = store.loadAllTasks(squadId);
+								const summary = tasks
+									.filter((t) => t.status === "done")
+									.map((t) => `- ${t.id} (${t.agent}): ${t.output?.slice(0, 150) || "done"}`)
+									.join("\n");
+								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
+								if (activeScheduler) activeScheduler.updateContext();
+								pi.sendUserMessage(
+									`[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}`,
+									{ deliverAs: "followUp" },
+								);
+								activeScheduler = null;
+								forceWidgetUpdate();
+								break;
+							}
+							case "squad_failed": {
+								const tasks = store.loadAllTasks(squadId);
+								const failed = tasks.filter((t) => t.status === "failed");
+								const done = tasks.filter((t) => t.status === "done");
+								pi.sendUserMessage(
+									`[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}`,
+									{ deliverAs: "followUp" },
+								);
+								forceWidgetUpdate();
+								break;
+							}
+							case "escalation": {
+								pi.sendUserMessage(
+									`[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n${event.message}`,
+									{ deliverAs: "followUp" },
+								);
+								break;
+							}
+						}
+					});
+				}
+
+				activeScheduler.resume().catch((err) => {
+					console.error(`[squad] Resume error: ${(err as Error).message}`);
+				});
+
+				const tasks = store.loadAllTasks(squadId);
+				const done = tasks.filter(t => t.status === "done").length;
+				return { content: [{ type: "text" as const, text: `Squad "${squadId}" resumed (${done}/${tasks.length} done). Agents restarting in background.` }] };
+			}
+
 			if (!activeScheduler || !activeSquadId) {
-				return { content: [{ type: "text" as const, text: "No active squad." }] };
+				return { content: [{ type: "text" as const, text: "No active squad. Use squad_modify with action 'resume' to resume a paused squad, or start a new one with the squad tool." }] };
 			}
 
 			switch (params.action) {
@@ -373,10 +446,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "resume": {
-					// Fire and forget — don't block the tool call
-					activeScheduler.resume().catch((err) => {
-						console.error(`[squad] Resume error: ${(err as Error).message}`);
-					});
+					// Handled above (before the activeScheduler guard)
 					return { content: [{ type: "text" as const, text: "Squad resumed." }] };
 				}
 
