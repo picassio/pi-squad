@@ -703,10 +703,8 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 	widgetEnabled = true;
 	updateWidget();
 
-	// Start refresh if squad is still running (live updates from disk)
-	if (squad.status === "running" || squad.status === "paused") {
-		startWidgetRefresh();
-	}
+	// Always start refresh — disk data could be updated by another session
+	startWidgetRefresh();
 
 	const tasks = store.loadAllTasks(squadId);
 	const done = tasks.filter((t) => t.status === "done").length;

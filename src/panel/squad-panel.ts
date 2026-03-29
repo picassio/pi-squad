@@ -108,7 +108,7 @@ export class SquadPanel implements Component, Focusable {
 			this.show();
 			return;
 		}
-		const wide = this.tui.columns >= WIDE_THRESHOLD;
+		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
 
 		if (this.handle.isHidden()) {
 			this.handle.setHidden(false);
@@ -141,7 +141,7 @@ export class SquadPanel implements Component, Focusable {
 	// =========================================================================
 
 	private getOverlayOptions(): OverlayOptions {
-		const wide = this.tui.columns >= WIDE_THRESHOLD;
+		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
 		if (wide) {
 			return {
 				anchor: "top-right",
@@ -162,7 +162,7 @@ export class SquadPanel implements Component, Focusable {
 	// =========================================================================
 
 	handleInput(data: string): void {
-		const wide = this.tui.columns >= WIDE_THRESHOLD;
+		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
 
 		// Ctrl+Q: switch focus back to editor (wide) or hide (narrow)
 		if (data === "\x11") {
@@ -298,7 +298,7 @@ export class SquadPanel implements Component, Focusable {
 
 		// Content area: total height minus header (1 line) and footer (3 lines)
 		const contentWidth = width - 2; // Account for border chars
-		const totalAvailable = this.tui.rows || 24;
+		const totalAvailable = this.tui.terminal.rows || 24;
 		const availHeight = Math.max(5, totalAvailable - 4); // 1 header + 3 footer
 
 		switch (this.state.view) {
@@ -348,7 +348,7 @@ export class SquadPanel implements Component, Focusable {
 	private renderFooter(width: number): string[] {
 		const th = this.theme;
 		const innerW = width - 2;
-		const wide = this.tui.columns >= WIDE_THRESHOLD;
+		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
 		const switchHint = wide ? "^q switch" : "^q close";
 
 		let keys: string;
