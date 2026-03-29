@@ -53,6 +53,9 @@ export function setupSquadWidget(
 	if (!ctx.hasUI) return { requestUpdate: () => {}, dispose: () => {} };
 
 	let durationTimer: ReturnType<typeof setInterval> | null = null;
+	let renderTimer: ReturnType<typeof setTimeout> | null = null;
+	/** Cache key to skip redundant setWidget calls */
+	let lastCacheKey = "";
 
 	function render(): void {
 		if (!state.enabled || !state.squadId) {
@@ -132,7 +135,11 @@ export function setupSquadWidget(
 			lines.push(`  ${th.fg("dim", `  +${tasks.length - maxVisible} more · ^q detail`)}`);
 		}
 
-		// Set widget as string[] — pi-tui handles this reliably
+		// Skip if nothing changed (avoid redundant setWidget calls that cause flicker)
+		const cacheKey = `${squad.status}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}`;
+		if (cacheKey === lastCacheKey) return;
+		lastCacheKey = cacheKey;
+
 		ctx.ui.setWidget("squad-tasks", lines);
 
 		// Update status bar
@@ -165,11 +172,18 @@ export function setupSquadWidget(
 
 	return {
 		requestUpdate(): void {
-			render();
-			manageDurationTimer();
+			// Debounce: multiple rapid events (scheduler) coalesce into one render
+			if (renderTimer) return;
+			renderTimer = setTimeout(() => {
+				renderTimer = null;
+				render();
+				manageDurationTimer();
+			}, 50);
 		},
 		dispose(): void {
 			if (durationTimer) { clearInterval(durationTimer); durationTimer = null; }
+			if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+			lastCacheKey = "";
 			ctx.ui.setWidget("squad-tasks", undefined);
 			ctx.ui.setStatus("squad", undefined);
 		},

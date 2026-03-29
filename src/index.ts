@@ -638,20 +638,16 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "widget": {
-					if (!widgetState.enabled) {
-						widgetState.enabled = true;
-						// If no active squad, try to pick one
+					widgetState.enabled = !widgetState.enabled;
+					if (widgetState.enabled) {
 						if (!activeSquadId) {
 							const latest = store.findLatestSquad(ctx.cwd);
 							if (latest) activateSquadView(latest.id, ctx);
 						}
-						widgetControls?.requestUpdate();
-						ctx.ui.notify("Squad widget enabled", "info");
-					} else {
-						widgetState.enabled = false;
-						widgetControls?.dispose();
-						ctx.ui.notify("Squad widget disabled", "info");
 					}
+					// requestUpdate handles both enable (renders) and disable (clears)
+					widgetControls?.requestUpdate();
+					ctx.ui.notify(`Squad widget ${widgetState.enabled ? "enabled" : "disabled"}`, "info");
 					return;
 				}
 
