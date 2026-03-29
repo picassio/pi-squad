@@ -1,15 +1,13 @@
 /**
  * message-view.ts — Scrollable message log for a task.
  * Shows tool calls, agent text, @mentions, human messages.
+ * All lines are truncated to width to prevent TUI crashes.
  */
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
+import { truncateToWidth } from "@mariozechner/pi-tui";
 import type { TaskMessage } from "../types.js";
 import * as store from "../store.js";
-
-// ============================================================================
-// Message View
-// ============================================================================
 
 export class MessageView {
 	private theme: Theme;
@@ -39,66 +37,56 @@ export class MessageView {
 		this.scrollOffset++;
 	}
 
-	invalidate(): void {
-		/* stateless */
-	}
+	invalidate(): void {}
 
 	render(width: number, maxLines: number): string[] {
 		const th = this.theme;
+		const w = Math.max(10, width);
 
 		if (!this.taskId) {
-			return this.padToHeight(["", th.fg("muted", "  No task selected")], maxLines);
+			return pad(["", th.fg("muted", "  No task selected")], maxLines);
 		}
 
 		const task = store.loadTask(this.squadId, this.taskId);
 		if (!task) {
-			return this.padToHeight(["", th.fg("error", "  Task not found")], maxLines);
+			return pad(["", th.fg("error", "  Task not found")], maxLines);
 		}
 
 		const messages = store.loadMessages(this.squadId, this.taskId);
 		const lines: string[] = [];
 
-		// Header: task info
+		// Header
 		const statusColor = task.status === "done" ? "success"
 			: task.status === "failed" ? "error"
 			: task.status === "in_progress" ? "warning"
 			: "muted";
-		lines.push(` ${th.fg("accent", th.bold(task.id))} · ${th.fg("dim", task.agent)} ${th.fg(statusColor as any, task.status)}`);
-		lines.push(` ${th.fg("dim", task.title.slice(0, width - 2))}`);
+		lines.push(fit(` ${th.fg("accent", th.bold(task.id))} · ${th.fg("dim", task.agent)} ${th.fg(statusColor as any, task.status)}`, w));
+		lines.push(fit(` ${th.fg("dim", task.title)}`, w));
 		lines.push("");
 
 		if (messages.length === 0) {
 			lines.push(th.fg("muted", "  No messages yet"));
-			return this.padToHeight(lines, maxLines);
+			return pad(lines, maxLines);
 		}
 
 		// Render messages
-		const msgLines = this.renderMessages(messages, width);
+		const msgLines = this.renderMessages(messages, w);
 
-		// Apply scroll
-		const contentHeight = maxLines - lines.length - 1;
+		// Scroll
+		const contentHeight = Math.max(1, maxLines - lines.length - 1);
 		const maxScroll = Math.max(0, msgLines.length - contentHeight);
 		this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
-		// Auto-scroll to bottom if near the end
-		if (this.scrollOffset >= maxScroll - 2) {
-			this.scrollOffset = maxScroll;
-		}
+		if (this.scrollOffset >= maxScroll - 2) this.scrollOffset = maxScroll;
 
-		const visible = msgLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
-		lines.push(...visible);
+		lines.push(...msgLines.slice(this.scrollOffset, this.scrollOffset + contentHeight));
 
-		// Scroll indicator
 		if (msgLines.length > contentHeight) {
-			const pos = maxScroll > 0 ? Math.round((this.scrollOffset / maxScroll) * 100) : 100;
-			lines.push(th.fg("dim", ` ─── ${pos}% ───`));
+			const pct = maxScroll > 0 ? Math.round((this.scrollOffset / maxScroll) * 100) : 100;
+			lines.push(th.fg("dim", ` ─── ${pct}% ───`));
 		}
 
-		return this.padToHeight(lines, maxLines);
+		return pad(lines, maxLines);
 	}
-
-	// =========================================================================
-	// Message Rendering
-	// =========================================================================
 
 	private renderMessages(messages: TaskMessage[], width: number): string[] {
 		const th = this.theme;
@@ -106,70 +94,54 @@ export class MessageView {
 		let lastFrom: string | null = null;
 
 		for (const msg of messages) {
-			// Skip system status messages that are noise
-			if (msg.type === "status" && msg.from === "system" && msg.text === "Agent starting work") {
-				continue;
-			}
+			if (msg.type === "status" && msg.from === "system" && msg.text === "Agent starting work") continue;
 
-			// Group consecutive messages from the same sender
 			const showHeader = msg.from !== lastFrom;
 			lastFrom = msg.from;
 
 			if (showHeader) {
-				// Blank line between different senders
 				if (lines.length > 0) lines.push("");
-
-				// Sender header with timestamp
-				const time = this.formatTime(msg.ts);
-				const senderColor = this.getSenderColor(msg.from);
-				const senderName = msg.from === "human" ? "YOU" : msg.from;
-				lines.push(` ${th.fg("dim", time)} ${th.fg(senderColor as any, senderName)}`);
+				const time = fmtTime(msg.ts);
+				const color = msg.from === "human" ? "accent" : msg.from === "system" ? "dim" : "success";
+				const name = msg.from === "human" ? "YOU" : msg.from;
+				lines.push(fit(` ${th.fg("dim", time)} ${th.fg(color as any, name)}`, width));
 			}
 
-			// Message content
 			switch (msg.type) {
 				case "tool": {
-					const toolName = msg.name || msg.text;
-					const argsStr = msg.args?.path || msg.args?.command || "";
-					const preview = argsStr
-						? `→ ${toolName} ${argsStr}`
-						: `→ ${toolName}`;
-					lines.push(`   ${th.fg("muted", preview.slice(0, width - 4))}`);
+					const name = msg.name || msg.text;
+					const arg = msg.args?.path || msg.args?.command || "";
+					lines.push(fit(`   ${th.fg("muted", `→ ${name}${arg ? " " + arg : ""}`)}`, width));
 					break;
 				}
-
 				case "mention": {
-					const target = msg.to ? `→ ${msg.to}` : "";
-					lines.push(`   ${th.fg("accent", `@${msg.to || "?"}`)} ${th.fg("dim", msg.text.slice(0, width - 10))}`);
+					lines.push(fit(`   ${th.fg("accent", `@${msg.to || "?"}`)} ${th.fg("dim", msg.text)}`, width));
 					break;
 				}
-
 				case "text":
 				case "message":
 				case "reply": {
-					// Wrap long text
-					const textLines = this.wrapText(msg.text, width - 4);
-					for (const textLine of textLines.slice(0, 10)) {
-						lines.push(`   ${textLine}`);
+					// Split by newline, cap at 10 lines, truncate each
+					const textLines = msg.text.split("\n").slice(0, 10);
+					for (const tl of textLines) {
+						lines.push(fit(`   ${tl}`, width));
 					}
-					if (textLines.length > 10) {
-						lines.push(`   ${th.fg("dim", `... +${textLines.length - 10} lines`)}`);
+					const total = msg.text.split("\n").length;
+					if (total > 10) {
+						lines.push(fit(`   ${th.fg("dim", `... +${total - 10} lines`)}`, width));
 					}
 					break;
 				}
-
 				case "done": {
-					lines.push(`   ${th.fg("success", "✓ " + msg.text.slice(0, width - 6))}`);
+					lines.push(fit(`   ${th.fg("success", "✓ " + msg.text)}`, width));
 					break;
 				}
-
 				case "error": {
-					lines.push(`   ${th.fg("error", "✗ " + msg.text.slice(0, width - 6))}`);
+					lines.push(fit(`   ${th.fg("error", "✗ " + msg.text)}`, width));
 					break;
 				}
-
 				case "status": {
-					lines.push(`   ${th.fg("dim", msg.text.slice(0, width - 4))}`);
+					lines.push(fit(`   ${th.fg("dim", msg.text)}`, width));
 					break;
 				}
 			}
@@ -177,56 +149,24 @@ export class MessageView {
 
 		return lines;
 	}
+}
 
-	// =========================================================================
-	// Helpers
-	// =========================================================================
+// Helpers
 
-	private getSenderColor(from: string): string {
-		if (from === "human") return "accent";
-		if (from === "system") return "dim";
-		// Rotate through available colors for different agents
-		const colors = ["success", "warning", "accent", "muted"];
-		let hash = 0;
-		for (const c of from) hash = (hash * 31 + c.charCodeAt(0)) & 0x7fffffff;
-		return colors[hash % colors.length];
-	}
+function fit(line: string, width: number): string {
+	return truncateToWidth(line, width, "…");
+}
 
-	private formatTime(ts: string): string {
-		try {
-			const d = new Date(ts);
-			const h = d.getHours().toString().padStart(2, "0");
-			const m = d.getMinutes().toString().padStart(2, "0");
-			return `${h}:${m}`;
-		} catch {
-			return "??:??";
-		}
-	}
+function pad(lines: string[], maxLines: number): string[] {
+	while (lines.length < maxLines) lines.push("");
+	return lines.slice(0, maxLines);
+}
 
-	private wrapText(text: string, maxWidth: number): string[] {
-		const lines: string[] = [];
-		for (const rawLine of text.split("\n")) {
-			if (rawLine.length <= maxWidth) {
-				lines.push(rawLine);
-			} else {
-				// Simple word wrap
-				let remaining = rawLine;
-				while (remaining.length > maxWidth) {
-					const breakAt = remaining.lastIndexOf(" ", maxWidth);
-					const splitAt = breakAt > maxWidth * 0.3 ? breakAt : maxWidth;
-					lines.push(remaining.slice(0, splitAt));
-					remaining = remaining.slice(splitAt).trimStart();
-				}
-				if (remaining) lines.push(remaining);
-			}
-		}
-		return lines;
-	}
-
-	private padToHeight(lines: string[], maxLines: number): string[] {
-		while (lines.length < maxLines) {
-			lines.push("");
-		}
-		return lines.slice(0, maxLines);
+function fmtTime(ts: string): string {
+	try {
+		const d = new Date(ts);
+		return `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+	} catch {
+		return "??:??";
 	}
 }
