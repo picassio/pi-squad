@@ -78,7 +78,6 @@ export class SquadPanel implements Component, Focusable {
 			this.handle.hide();
 			this.handle = null;
 		}
-		}
 	}
 
 	/** Toggle panel visibility */
@@ -146,7 +145,6 @@ export class SquadPanel implements Component, Focusable {
 		if (this.handle) {
 			this.handle.hide(); // permanently remove overlay
 			this.handle = null;
-		}
 		}
 		this.onVisibilityChange?.(false);
 	}
