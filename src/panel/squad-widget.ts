@@ -137,6 +137,11 @@ export function setupSquadWidget(
 					const squad = store.loadSquad(state.squadId);
 					if (!squad || tasks.length === 0) return [];
 
+					// Cap widget height: header (1) + tasks + overflow note
+					// On small terminals, show max 3 tasks inline; on large, up to 8
+					const termRows = tui.terminal.rows || 24;
+					const maxTaskLines = termRows < 30 ? 3 : termRows < 50 ? 5 : 8;
+
 					const lines: string[] = [];
 
 					// Header line
@@ -156,8 +161,9 @@ export function setupSquadWidget(
 						`${th.fg("dim", "^q detail · /squad msg")}`
 					);
 
-					// Task lines
-					for (const task of tasks) {
+					// Task lines (capped to maxTaskLines)
+					const visibleTasks = tasks.slice(0, maxTaskLines);
+					for (const task of visibleTasks) {
 						const icon = statusIcon(task.status, th);
 						let line = `  ${icon} ${th.fg("muted", task.id)} ${th.fg("dim", `(${task.agent})`)}`;
 
@@ -207,6 +213,12 @@ export function setupSquadWidget(
 						}
 
 						lines.push(line);
+					}
+
+					// Show overflow indicator if tasks are hidden
+					if (tasks.length > maxTaskLines) {
+						const hidden = tasks.length - maxTaskLines;
+						lines.push(`  ${th.fg("dim", `  +${hidden} more · ^q detail`)}`);
 					}
 
 					return lines;
