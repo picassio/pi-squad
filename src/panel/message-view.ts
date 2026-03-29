@@ -90,8 +90,9 @@ export class MessageView {
 		}
 		msgLines.push(...this.renderMessages(messages, w));
 
-		// Scroll calculation
-		const contentHeight = Math.max(1, maxLines - header.length - 1); // -1 for scroll indicator
+		// Fixed layout: header + scrollable content + status line = maxLines exactly
+		const statusLines = 1; // always show status/scroll bar
+		const contentHeight = Math.max(1, maxLines - header.length - statusLines);
 		const maxScroll = Math.max(0, msgLines.length - contentHeight);
 
 		// Auto-scroll to bottom unless user scrolled up
@@ -99,23 +100,28 @@ export class MessageView {
 			this.scrollOffset = maxScroll;
 		} else {
 			this.scrollOffset = Math.min(this.scrollOffset, maxScroll);
-			// If user scrolled back to bottom, re-enable auto-scroll
 			if (this.scrollOffset >= maxScroll) {
 				this.userScrolled = false;
 			}
 		}
 
-		// Build output
+		// Build output — exact height every time
 		const lines = [...header];
-		lines.push(...msgLines.slice(this.scrollOffset, this.scrollOffset + contentHeight));
 
-		// Scroll indicator (only if scrollable)
-		if (msgLines.length > contentHeight) {
-			const pct = maxScroll > 0 ? Math.round((this.scrollOffset / maxScroll) * 100) : 100;
-			lines.push(fit(th.fg("dim", ` ─── ${pct}% (${allMessages.length} msgs) ───`), w));
-		}
+		// Content area: pad to exact contentHeight
+		const visible = msgLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
+		while (visible.length < contentHeight) visible.push("");
+		lines.push(...visible.slice(0, contentHeight));
 
-		return pad(lines, maxLines);
+		// Status bar (always present, keeps layout stable)
+		const pct = maxScroll > 0 ? Math.round((this.scrollOffset / maxScroll) * 100) : 100;
+		const scrollInfo = maxScroll > 0
+			? th.fg("dim", ` ─ ${pct}% ─ ${allMessages.length} msgs ─ ↑↓ scroll`)
+			: th.fg("dim", ` ─ ${allMessages.length} msgs`);
+		lines.push(fit(scrollInfo, w));
+
+		// Strict: return exactly maxLines
+		return lines.slice(0, maxLines);
 	}
 
 	private renderMessages(messages: TaskMessage[], width: number): string[] {

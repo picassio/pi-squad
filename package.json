@@ -1,6 +1,6 @@
 {
   "name": "pi-squad",
-  "version": "0.4.11",
+  "version": "0.4.12",
   "description": "Multi-agent collaboration extension for pi — task decomposition, dependency management, parallel execution, TUI panel",
   "type": "module",
   "pi": {
