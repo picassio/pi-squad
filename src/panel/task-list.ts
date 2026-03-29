@@ -81,29 +81,33 @@ export class TaskListView {
 			return this.padToHeight(lines, maxLines);
 		}
 
-		// Render task list
-		const taskLines = this.renderTaskTree(tasks, selectedIndex, width);
+		// Build bottom sections first so we know how much space they need
+		const bottomLines: string[] = [];
+		bottomLines.push("");
+		bottomLines.push(truncateToWidth(th.fg("border", " " + "─".repeat(width - 2)), width, ""));
 
-		// Scroll window
-		const scrollStart = Math.max(0, Math.min(selectedIndex - Math.floor(maxLines / 2), taskLines.length - maxLines + 4));
-		const visibleTasks = taskLines.slice(scrollStart, scrollStart + maxLines - 4);
-		lines.push(...visibleTasks);
-
-		// Separator
-		lines.push("");
-		lines.push(th.fg("border", " " + "─".repeat(width - 2)));
-
-		// Live activity for selected or first running task
 		const runningTask = tasks.find((t) => t.status === "in_progress");
 		if (runningTask) {
-			lines.push(...this.renderLiveActivity(runningTask, width, scheduler));
+			bottomLines.push(...this.renderLiveActivity(runningTask, width, scheduler));
 		}
 
-		// Summary line
-		lines.push("");
-		lines.push(this.renderSummary(tasks, width));
+		bottomLines.push("");
+		bottomLines.push(this.renderSummary(tasks, width));
 
-		return this.padToHeight(lines, maxLines);
+		// Task list gets remaining space
+		const taskLines = this.renderTaskTree(tasks, selectedIndex, width);
+		const taskSpace = Math.max(3, maxLines - bottomLines.length);
+		const scrollStart = Math.max(0, Math.min(selectedIndex - Math.floor(taskSpace / 2), taskLines.length - taskSpace));
+		const visibleTasks = taskLines.slice(scrollStart, scrollStart + taskSpace);
+
+		// Pad task area to exact size so bottom sticks
+		while (visibleTasks.length < taskSpace) visibleTasks.push("");
+		lines.push(...visibleTasks);
+
+		// Append bottom (always at the same position)
+		lines.push(...bottomLines);
+
+		return lines.slice(0, maxLines);
 	}
 
 	// =========================================================================
