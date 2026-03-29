@@ -1,11 +1,15 @@
 /**
  * squad-panel.ts — Main overlay component for the squad TUI panel.
  *
- * Manages view switching between task list, message view, and agent list.
- * Adapts layout: wide screen (>=160 cols) = right panel, narrow = centered overlay.
+ * Uses ctx.ui.custom() with a proper done() callback for lifecycle management.
+ * Inspired by pi-interactive-shell's overlay pattern:
+ * - Component implements Component + Focusable
+ * - handleInput for key dispatch
+ * - render(width) returns string[]
+ * - done() closes the overlay cleanly
  */
 
-import type { Component, Focusable, TUI, OverlayHandle, OverlayOptions } from "@mariozechner/pi-tui";
+import type { Component, Focusable, TUI } from "@mariozechner/pi-tui";
 import { matchesKey, visibleWidth, truncateToWidth } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { PanelState, PanelView } from "../types.js";
@@ -15,10 +19,15 @@ import { MessageView } from "./message-view.js";
 import * as store from "../store.js";
 
 // ============================================================================
-// Constants
+// Result type — what the panel returns when closed
 // ============================================================================
 
-const WIDE_THRESHOLD = 160;
+export interface SquadPanelResult {
+	/** How the panel was closed */
+	action: "close" | "send-message";
+	taskId?: string;
+	message?: string;
+}
 
 // ============================================================================
 // Squad Panel
@@ -29,13 +38,14 @@ export class SquadPanel implements Component, Focusable {
 
 	private tui: TUI;
 	private theme: Theme;
+	private done: (result: SquadPanelResult) => void;
 	private scheduler: Scheduler;
 	private squadId: string;
-	private handle: OverlayHandle | null = null;
-	/** Callback to send a human message — set by the extension */
-	onSendMessage?: (taskId: string, message: string) => void;
-	/** Callback to notify extension when panel visibility changes */
-	onVisibilityChange?: (visible: boolean) => void;
+
+	/** Callback for sending messages — set by the extension */
+	onSendMessage?: (taskId: string, message: string) => Promise<void>;
+	/** Callback when panel closes */
+	onClose?: () => void;
 
 	private state: PanelState = {
 		view: "tasks",
@@ -47,132 +57,81 @@ export class SquadPanel implements Component, Focusable {
 
 	private taskListView: TaskListView;
 	private messageView: MessageView;
+	/** Debounced render timer */
+	private renderTimeout: ReturnType<typeof setTimeout> | null = null;
+	/** Auto-refresh timer for live activity */
+	private refreshTimer: ReturnType<typeof setInterval> | null = null;
+	private finished = false;
 
-
-	constructor(tui: TUI, theme: Theme, scheduler: Scheduler, squadId: string) {
+	constructor(
+		tui: TUI,
+		theme: Theme,
+		scheduler: Scheduler,
+		squadId: string,
+		done: (result: SquadPanelResult) => void,
+	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.scheduler = scheduler;
 		this.squadId = squadId;
+		this.done = done;
 
 		this.taskListView = new TaskListView(theme, squadId);
 		this.messageView = new MessageView(theme, squadId);
+
+		// Auto-refresh every 3s for live task activity
+		this.refreshTimer = setInterval(() => {
+			this.tui.requestRender();
+		}, 3000);
 	}
 
-	// =========================================================================
-	// Overlay Lifecycle
-	// =========================================================================
-
-	/** Show the panel as an overlay */
-	show(): void {
-		if (this.handle) return;
-
-		this.handle = this.tui.showOverlay(this, this.getOverlayOptions());
-		this.onVisibilityChange?.(true);
-		// No refresh interval — panel reads from disk on render, triggered by user input
+	/** Trigger a render update (called from outside, e.g., on scheduler events) */
+	requestUpdate(): void {
+		this.debouncedRender();
 	}
 
-	/** Hide the panel */
-	hide(): void {
-		if (this.handle) {
-			this.handle.hide();
-			this.handle = null;
-		}
+	private debouncedRender(): void {
+		if (this.renderTimeout) clearTimeout(this.renderTimeout);
+		this.renderTimeout = setTimeout(() => {
+			this.renderTimeout = null;
+			this.tui.requestRender();
+		}, 16);
 	}
 
-	/** Toggle panel visibility */
-	toggle(): void {
-		if (this.handle) {
-			if (this.handle.isHidden()) {
-				this.handle.setHidden(false);
-			} else {
-				this.handle.setHidden(true);
-			}
-		} else {
-			this.show();
-		}
-	}
-
-	/** Toggle focus between panel and main editor.
-	 *  Wide screen: panel stays visible, just switch focus.
-	 *  Narrow screen: show/hide since overlay covers content.
-	 */
-	toggleFocus(): void {
-		if (!this.handle) {
-			// Panel destroyed or never shown — recreate
-			this.show();
-			return;
-		}
-		// Visible — destroy it
-		this.hidePanel();
-	}
-
-	/** Check if panel is visible */
-	isVisible(): boolean {
-		return this.handle !== null && !this.handle.isHidden();
-	}
-
-	dispose(): void {
-		this.hide();
-	}
-
-	// =========================================================================
-	// Overlay Options (adaptive layout)
-	// =========================================================================
-
-	private getOverlayOptions(): OverlayOptions {
-		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
-		if (wide) {
-			return {
-				anchor: "top-right",
-				width: "35%",
-				maxHeight: "100%",
-				margin: { top: 0, right: 0, bottom: 1, left: 0 },
-			};
-		}
-		return {
-			anchor: "center",
-			width: "90%",
-			maxHeight: "85%",
-		};
+	private finish(result: SquadPanelResult): void {
+		if (this.finished) return;
+		this.finished = true;
+		this.dispose();
+		this.onClose?.();
+		this.done(result);
 	}
 
 	// =========================================================================
 	// Input Handling
 	// =========================================================================
 
-	private hidePanel(): void {
-		if (this.handle) {
-			this.handle.hide(); // permanently remove overlay
-			this.handle = null;
-		}
-		this.onVisibilityChange?.(false);
-	}
-
 	handleInput(data: string): void {
-		// Ctrl+Q: always hide panel and return to editor
+		// Ctrl+Q or q: close panel
 		if (data === "\x11") {
-			this.hidePanel();
+			this.finish({ action: "close" });
 			return;
 		}
 
-		// Escape: back from messages, or hide panel
+		// Escape: back from messages, or close panel
 		if (matchesKey(data, "escape")) {
 			if (this.state.view === "messages") {
 				this.state.view = "tasks";
 				this.tui.requestRender();
 				return;
 			}
-			this.hidePanel();
+			this.finish({ action: "close" });
 			return;
 		}
 
-		// q: hide panel (from task list only)
-		if (matchesKey(data, "q")) {
-			if (this.state.view === "tasks") {
-				this.hidePanel();
-				return;
-			}
+		// q: close from task list
+		if (matchesKey(data, "q") && this.state.view === "tasks") {
+			this.finish({ action: "close" });
+			return;
 		}
 
 		// Delegate to current view
@@ -202,7 +161,6 @@ export class SquadPanel implements Component, Focusable {
 			}
 			this.tui.requestRender();
 		} else if (matchesKey(data, "return")) {
-			// Open message view for selected task
 			if (this.state.selectedTaskId) {
 				this.state.view = "messages";
 				this.state.scrollOffset = 0;
@@ -210,7 +168,6 @@ export class SquadPanel implements Component, Focusable {
 				this.tui.requestRender();
 			}
 		} else if (matchesKey(data, "p")) {
-			// Pause/resume selected task
 			if (this.state.selectedTaskId) {
 				const task = store.loadTask(this.squadId, this.state.selectedTaskId);
 				if (task?.status === "in_progress") {
@@ -221,7 +178,6 @@ export class SquadPanel implements Component, Focusable {
 				this.tui.requestRender();
 			}
 		} else if (matchesKey(data, "x")) {
-			// Cancel selected task
 			if (this.state.selectedTaskId) {
 				this.scheduler.cancelTask(this.state.selectedTaskId);
 				this.tui.requestRender();
@@ -244,7 +200,6 @@ export class SquadPanel implements Component, Focusable {
 			this.state.view = "tasks";
 			this.tui.requestRender();
 		} else if (matchesKey(data, "m")) {
-			// Send message to this task's agent
 			const taskId = this.messageView.getTaskId();
 			if (taskId && this.onSendMessage) {
 				this.onSendMessage(taskId, "");
@@ -270,10 +225,10 @@ export class SquadPanel implements Component, Focusable {
 		const title = squad ? `squad: ${squad.goal.slice(0, width - 20)}` : "squad";
 		lines.push(...this.renderHeader(title, width));
 
-		// Content area: total height minus header (1 line) and footer (3 lines)
-		const contentWidth = width - 2; // Account for border chars
+		// Content area
+		const contentWidth = width - 2;
 		const totalAvailable = this.tui.terminal.rows || 24;
-		const availHeight = Math.max(5, totalAvailable - 4); // 1 header + 3 footer
+		const availHeight = Math.max(5, totalAvailable - 4);
 
 		switch (this.state.view) {
 			case "tasks": {
@@ -297,7 +252,7 @@ export class SquadPanel implements Component, Focusable {
 			}
 		}
 
-		// Footer with keybindings
+		// Footer
 		lines.push(...this.renderFooter(width));
 
 		return lines;
@@ -308,33 +263,29 @@ export class SquadPanel implements Component, Focusable {
 		const innerW = width - 2;
 		const titleStr = ` ${title} `;
 		const titleVW = visibleWidth(titleStr);
-		const leftBar = "─";
 		const rightBarLen = Math.max(0, innerW - titleVW - 1);
-		const rightBar = "─".repeat(rightBarLen);
 
 		return [
-			th.fg("border", "╭" + leftBar) +
+			th.fg("border", "╭─") +
 				th.fg("accent", titleStr) +
-				th.fg("border", rightBar + "╮"),
+				th.fg("border", "─".repeat(rightBarLen) + "╮"),
 		];
 	}
 
 	private renderFooter(width: number): string[] {
 		const th = this.theme;
 		const innerW = width - 2;
-		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
-		const switchHint = wide ? "^q switch" : "^q close";
 
 		let keys: string;
 		switch (this.state.view) {
 			case "tasks":
-				keys = ` ↑↓ nav  ⏎ msgs  m send  p pause  x cancel  ${switchHint}`;
+				keys = ` ↑↓ nav  ⏎ msgs  m send  p pause  x cancel  ^q close`;
 				break;
 			case "messages":
-				keys = ` ↑↓ scroll  m send  esc back  ${switchHint}`;
+				keys = ` ↑↓ scroll  m send  esc back  ^q close`;
 				break;
 			default:
-				keys = ` ${switchHint}`;
+				keys = ` ^q close`;
 		}
 
 		return [
@@ -344,14 +295,27 @@ export class SquadPanel implements Component, Focusable {
 		];
 	}
 
-	/** Wrap a content line with border chars, padded to exact width */
 	private borderLine(content: string, width: number): string {
 		const th = this.theme;
 		const innerW = width - 2;
-		// Truncate content to fit, preserving ANSI codes
 		const truncated = truncateToWidth(content, innerW);
 		const contentVW = visibleWidth(truncated);
 		const pad = " ".repeat(Math.max(0, innerW - contentVW));
 		return th.fg("border", "│") + truncated + pad + th.fg("border", "│");
+	}
+
+	// =========================================================================
+	// Lifecycle
+	// =========================================================================
+
+	dispose(): void {
+		if (this.renderTimeout) {
+			clearTimeout(this.renderTimeout);
+			this.renderTimeout = null;
+		}
+		if (this.refreshTimer) {
+			clearInterval(this.refreshTimer);
+			this.refreshTimer = null;
+		}
 	}
 }

@@ -18,7 +18,8 @@ import type { Squad, Task, SquadConfig, PlannerOutput } from "./types.js";
 import { DEFAULT_SQUAD_CONFIG } from "./types.js";
 import { Scheduler, type SchedulerEvent } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
-import { SquadPanel } from "./panel/squad-panel.js";
+import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
+import { setupSquadWidget, type SquadWidgetState } from "./panel/squad-widget.js";
 import * as store from "./store.js";
 
 // ============================================================================
@@ -27,10 +28,13 @@ import * as store from "./store.js";
 
 let activeScheduler: Scheduler | null = null;
 let activeSquadId: string | null = null;
-let activePanel: SquadPanel | null = null;
+/** Whether an overlay panel is currently open (prevents double-open) */
+let overlayOpen = false;
 /** Stored ExtensionContext for widget updates from background scheduler events */
 let uiCtx: import("@mariozechner/pi-coding-agent").ExtensionContext | null = null;
-/** Interval for periodic widget refresh */
+/** Component-based widget state + controls */
+const widgetState: SquadWidgetState = { squadId: null, enabled: true };
+let widgetControls: { requestUpdate: () => void; dispose: () => void } | null = null;
 
 
 // ============================================================================
@@ -395,6 +399,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		uiCtx = ctx;
+
+		// Install component-based widget
+		if (ctx.hasUI) {
+			widgetControls = setupSquadWidget(ctx, widgetState);
+		}
+
 		// Check for active squads for this project
 		const active = store.findActiveSquads()
 			.filter((s) => s.cwd === ctx.cwd);
@@ -411,6 +421,9 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.hasUI) {
 			ctx.ui.onTerminalInput((data) => {
 				if (data === "\x11") {
+					// If overlay is already open, let the panel's own handler deal with it
+					if (overlayOpen) return undefined;
+
 					// Auto-pick a squad if none active
 					if (!activeSquadId) {
 						const latest = store.findLatestSquad(ctx.cwd)
@@ -424,12 +437,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (activeSquadId) {
-						if (activePanel) {
-							activePanel.toggleFocus();
-						} else {
-							const sched = activeScheduler || new Scheduler(activeSquadId, squadSkillPaths);
-							createPanel(ctx, sched, activeSquadId);
-						}
+						openPanel(ctx, activeScheduler || new Scheduler(activeSquadId, squadSkillPaths), activeSquadId);
 					}
 					return { consume: true };
 				}
@@ -439,11 +447,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
-		clearWidgetRefresh();
-		if (activePanel) {
-			activePanel.dispose();
-			activePanel = null;
-		}
+		widgetControls?.dispose();
+		widgetControls = null;
 		if (activeScheduler) {
 			await activeScheduler.stop();
 			activeScheduler = null;
@@ -527,19 +532,18 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "widget": {
-					if (!widgetEnabled) {
-						widgetEnabled = true;
+					if (!widgetState.enabled) {
+						widgetState.enabled = true;
 						// If no active squad, try to pick one
 						if (!activeSquadId) {
 							const latest = store.findLatestSquad(ctx.cwd);
 							if (latest) activateSquadView(latest.id, ctx);
 						}
-						forceWidgetUpdate();
+						widgetControls?.requestUpdate();
 						ctx.ui.notify("Squad widget enabled", "info");
 					} else {
-						widgetEnabled = false;
-						ctx.ui.setWidget("squad-tasks", undefined);
-						ctx.ui.setStatus("squad", undefined);
+						widgetState.enabled = false;
+						widgetControls?.dispose();
 						ctx.ui.notify("Squad widget disabled", "info");
 					}
 					return;
@@ -556,12 +560,9 @@ export default function (pi: ExtensionAPI) {
 							return;
 						}
 					}
-					if (!activePanel && activeSquadId) {
-						// Panel needs a scheduler — create a dummy one for view-only if none running
+					if (activeSquadId) {
 						const sched = activeScheduler || new Scheduler(activeSquadId, squadSkillPaths);
-						createPanel(ctx, sched, activeSquadId);
-					} else if (activePanel) {
-						activePanel.toggleFocus();
+						openPanel(ctx, sched, activeSquadId);
 					}
 					return;
 				}
@@ -643,7 +644,6 @@ export default function (pi: ExtensionAPI) {
 					const squad = store.loadSquad(activeSquadId!);
 					if (squad) { squad.status = "failed"; store.saveSquad(squad); }
 					activeScheduler = null;
-					clearWidgetRefresh();
 					forceWidgetUpdate();
 					ctx.ui.notify("Squad cancelled", "info");
 					return;
@@ -652,10 +652,8 @@ export default function (pi: ExtensionAPI) {
 				case "clear": {
 					activeSquadId = null;
 					activeScheduler = null;
-					clearWidgetRefresh();
-					if (activePanel) { activePanel.dispose(); activePanel = null; }
-					ctx.ui.setWidget("squad-tasks", undefined);
-					ctx.ui.setStatus("squad", undefined);
+					widgetState.squadId = null;
+					widgetControls?.dispose();
 					ctx.ui.notify("Squad view cleared", "info");
 					return;
 				}
@@ -720,11 +718,9 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 	activeSquadId = squadId;
 
 	// Show widget for this squad
-	widgetEnabled = true;
-	forceWidgetUpdate();
-
-	// Always start refresh — disk data could be updated by another session
-	startWidgetRefresh();
+	widgetState.squadId = squadId;
+	widgetState.enabled = true;
+	widgetControls?.requestUpdate();
 
 	const tasks = store.loadAllTasks(squadId);
 	const done = tasks.filter((t) => t.status === "done").length;
@@ -746,141 +742,38 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 }
 
 // ============================================================================
-// Widget — live task status above the editor
+// Widget — component-based, event-driven (inspired by pi-interactive-shell)
 // ============================================================================
 
-/** Cache to avoid re-rendering widget when nothing changed */
-let lastWidgetKey = "";
-
-function updateWidget(): void {
-	if (!uiCtx?.hasUI || !widgetEnabled || !activeSquadId) return;
-
-	const tasks = store.loadAllTasks(activeSquadId);
-	const squad = store.loadSquad(activeSquadId);
-	if (!squad || tasks.length === 0) return;
-
-	// Build a cache key from task statuses + costs — cheap to compute
-	const cacheKey = `${squad.status}:${tasks.map((t) => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}`;
-	if (cacheKey === lastWidgetKey) return; // Nothing changed, skip re-render
-	lastWidgetKey = cacheKey;
-
-	const th = uiCtx.ui.theme;
-	const lines: string[] = [];
-
-	const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-	const doneCount = tasks.filter((t) => t.status === "done").length;
-	const elapsed = Date.now() - new Date(squad.created).getTime();
-	const elapsedStr = formatElapsedShort(elapsed);
-
-	const statusIcon = squad.status === "done" ? th.fg("success", "✓")
-		: squad.status === "failed" ? th.fg("error", "✗")
-		: th.fg("warning", "⏳");
-	lines.push(
-		`${statusIcon} ${th.fg("accent", "squad")} ${th.fg("dim", squad.goal.slice(0, 35))} ` +
-		`${th.fg("muted", `${doneCount}/${tasks.length}`)} ` +
-		`${th.fg("dim", `$${totalCost.toFixed(2)}`)} ` +
-		`${th.fg("dim", elapsedStr)} ` +
-		`${th.fg("dim", "^q detail · /squad msg")}`
-	);
-
-	for (const task of tasks) {
-		const icon = task.status === "done" ? th.fg("success", "✓")
-			: task.status === "in_progress" ? th.fg("warning", "⏳")
-			: task.status === "failed" ? th.fg("error", "✗")
-			: task.status === "blocked" ? th.fg("muted", "◻")
-			: th.fg("dim", "·");
-
-		let line = `  ${icon} ${th.fg("muted", task.id)} ${th.fg("dim", `(${task.agent})`)}`;
-
-		if (task.status === "done" && task.output) {
-			line += ` ${th.fg("dim", task.output.split("\n")[0].slice(0, 50))}`;
-		} else if (task.status === "failed" && task.error) {
-			line += ` ${th.fg("error", task.error.slice(0, 50))}`;
-		} else if (task.status === "blocked") {
-			const blockers = task.depends.filter((d) => {
-				const dep = tasks.find((t) => t.id === d);
-				return dep && dep.status !== "done";
-			});
-			if (blockers.length > 0) {
-				line += ` ${th.fg("dim", "← " + blockers.join(", "))}`;
-			}
-		}
-
-		lines.push(line);
-	}
-
-	uiCtx.ui.setWidget("squad-tasks", lines);
-
-	const statusText = squad.status === "done"
-		? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
-		: squad.status === "failed"
-		? th.fg("error", `✗ squad ${doneCount}/${tasks.length}`)
-		: th.fg("accent", `⏳ squad ${doneCount}/${tasks.length} $${totalCost.toFixed(2)}`);
-	uiCtx.ui.setStatus("squad", statusText);
-}
-
-function clearWidget(): void {
-	lastWidgetKey = "";
-	if (uiCtx?.hasUI) {
-		uiCtx.ui.setWidget("squad-tasks", undefined);
-		uiCtx.ui.setStatus("squad", undefined);
-	}
-}
-
-/** Show widget immediately — called once when squad activates */
-function startWidgetRefresh(): void {
-	forceWidgetUpdate();
-}
-
-/** Update widget, bypassing cache — called on every scheduler event */
+/** Trigger widget re-render from scheduler events */
 function forceWidgetUpdate(): void {
-	lastWidgetKey = "";
-	updateWidget();
+	widgetControls?.requestUpdate();
 }
 
-/** No-op — no intervals to clear, everything is event-driven */
-function clearWidgetRefresh(): void {}
-
-function formatElapsedShort(ms: number): string {
-	const s = Math.floor(ms / 1000);
-	const m = Math.floor(s / 60);
-	const h = Math.floor(m / 60);
-	if (h > 0) return `${h}h${m % 60}m`;
-	if (m > 0) return `${m}m${s % 60}s`;
-	return `${s}s`;
-}
-
-/** Shared widget-enabled flag — declared in the extension body, referenced here */
-let widgetEnabled = true;
-
 // ============================================================================
-// Panel Creation
+// Panel — overlay via ctx.ui.custom() with proper done() lifecycle
 // ============================================================================
 
-function createPanel(
+/**
+ * Open the squad panel overlay.
+ * Uses the pi-interactive-shell pattern: ctx.ui.custom() returns a Promise
+ * that resolves when done() is called. The panel calls done() on close.
+ */
+function openPanel(
 	ctx: import("@mariozechner/pi-coding-agent").ExtensionContext,
 	scheduler: Scheduler,
 	squadId: string,
 ): void {
-	// Fire and forget — never awaited. The custom() Promise resolves when done() is called,
-	// but we never call done() because the panel is persistent.
-	ctx.ui.custom(
-		(tui, theme, _kb, _done) => {
-			const panel = new SquadPanel(tui, theme, scheduler, squadId);
-			activePanel = panel;
+	if (overlayOpen) return;
+	overlayOpen = true;
 
-			// Restore widget when panel hides
-			panel.onVisibilityChange = (visible: boolean) => {
-				if (!visible) {
-					// Panel hidden — restore widget
-					forceWidgetUpdate();
-				}
-			};
+	// The promise resolves when the panel calls done()
+	const panelPromise = ctx.ui.custom<SquadPanelResult>(
+		(tui, theme, _kb, done) => {
+			const panel = new SquadPanel(tui, theme, scheduler, squadId, done);
 
 			// Wire up message sending from panel
 			panel.onSendMessage = async (taskId: string, _prefill: string) => {
-				// Temporarily release panel focus so input dialog works
-				(panel as any).handle?.unfocus();
 				const task = store.loadTask(squadId, taskId);
 				const agentName = task?.agent || taskId;
 				const input = await ctx.ui.input(`Message to ${agentName}`, "Type your message...");
@@ -896,8 +789,6 @@ function createPanel(
 					});
 					ctx.ui.notify(`Logged to ${taskId}`, "info");
 				}
-				// Re-focus panel after input
-				(panel as any).handle?.focus();
 				tui.requestRender();
 			};
 
@@ -911,13 +802,16 @@ function createPanel(
 				maxHeight: "80%" as const,
 				margin: 2,
 			},
-			onHandle: (handle) => {
-				if (activePanel) {
-					(activePanel as any).handle = handle;
-				}
-			},
 		},
 	);
+
+	// When panel closes (done() called), clean up
+	panelPromise.then(() => {
+		overlayOpen = false;
+		forceWidgetUpdate();
+	}).catch(() => {
+		overlayOpen = false;
+	});
 }
 
 // ============================================================================
@@ -1029,8 +923,10 @@ async function startSquad(
 	activeScheduler = scheduler;
 	activeSquadId = squadId;
 
-	// Start live widget updates
-	startWidgetRefresh();
+	// Activate widget for this squad
+	widgetState.squadId = squadId;
+	widgetState.enabled = true;
+	widgetControls?.requestUpdate();
 
 	// Wire up completion/escalation notifications to main agent
 	scheduler.onEvent((event: SchedulerEvent) => {
@@ -1059,7 +955,6 @@ async function startSquad(
 
 				// Clear scheduler but keep activeSquadId so squad_status still works
 				activeScheduler = null;
-				clearWidgetRefresh();
 				forceWidgetUpdate(); // Final update showing done state
 				break;
 			}
@@ -1076,7 +971,6 @@ async function startSquad(
 					`Use squad_status for details or squad_modify to adjust.`,
 					{ deliverAs: "followUp" },
 				);
-				clearWidgetRefresh();
 				forceWidgetUpdate();
 				break;
 			}
