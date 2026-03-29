@@ -260,8 +260,10 @@ export class SquadPanel implements Component, Focusable {
 		// Footer
 		lines.push(...this.renderFooter(width));
 
-		// Safety: truncate all lines to prevent pi-tui crash
-		return lines.map((line) => truncateToWidth(line, width, ""));
+		// Strict height: cap to overlayMaxRows so the overlay never overflows.
+		// Also truncate all lines to width to prevent pi-tui crash.
+		const maxTotalLines = overlayMaxRows;
+		return lines.slice(0, maxTotalLines).map((line) => truncateToWidth(line, width, ""));
 	}
 
 	private renderHeader(title: string, width: number): string[] {
