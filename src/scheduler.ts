@@ -441,6 +441,22 @@ export class Scheduler {
 			// Normal flow: auto-unblock dependents
 			console.error(`[squad-scheduler] handleTaskCompleted: ${taskId} done, auto-unblocking dependents`);
 			this.autoUnblock(taskId);
+
+			// If this is a passing retest, also unblock dependents of the ORIGINAL
+			// QA task. When qa-auth failed, its dependents weren't unblocked.
+			// Now that the retest passes, those dependents should proceed.
+			if (task.retryOf) {
+				// Walk up the retry chain to find the root task
+				let rootId = task.retryOf;
+				const allTasks = store.loadAllTasks(this.squadId);
+				let root = allTasks.find((t) => t.id === rootId);
+				while (root?.retryOf) {
+					rootId = root.retryOf;
+					root = allTasks.find((t) => t.id === rootId);
+				}
+				console.error(`[squad-scheduler] Retest passed — also unblocking dependents of original: ${rootId}`);
+				this.autoUnblock(rootId);
+			}
 		}
 
 		// Schedule next ready tasks (may spawn new agents)
