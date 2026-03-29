@@ -732,13 +732,29 @@ function activateSquadView(squadId: string, ctx: import("@mariozechner/pi-coding
 function updateWidget(): void {
 	if (!uiCtx?.hasUI || !widgetEnabled || !activeSquadId) return;
 
+	// Hide widget when panel is visible — panel shows the same info
+	if (activePanel?.isVisible()) {
+		uiCtx.ui.setWidget("squad-tasks", undefined);
+		// Keep status bar as compact indicator
+		const squad = store.loadSquad(activeSquadId);
+		const tasks = store.loadAllTasks(activeSquadId);
+		if (squad && tasks.length > 0) {
+			const th = uiCtx.ui.theme;
+			const d = tasks.filter((t) => t.status === "done").length;
+			const c = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
+			const s = squad.status === "done" ? th.fg("success", `✓ squad ${d}/${tasks.length}`)
+				: squad.status === "failed" ? th.fg("error", `✗ squad ${d}/${tasks.length}`)
+				: th.fg("accent", `⏳ squad ${d}/${tasks.length} $${c.toFixed(2)}`);
+			uiCtx.ui.setStatus("squad", s);
+		}
+		return;
+	}
+
 	const tasks = store.loadAllTasks(activeSquadId);
 	const squad = store.loadSquad(activeSquadId);
 	if (!squad || tasks.length === 0) return;
 
 	const th = uiCtx.ui.theme;
-
-	// Build widget lines
 	const lines: string[] = [];
 
 	const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
@@ -746,20 +762,19 @@ function updateWidget(): void {
 	const elapsed = Date.now() - new Date(squad.created).getTime();
 	const elapsedStr = formatElapsedShort(elapsed);
 
-	// Header line with shortcut hint
+	// Header
 	const statusIcon = squad.status === "done" ? th.fg("success", "✓")
 		: squad.status === "failed" ? th.fg("error", "✗")
 		: th.fg("warning", "⏳");
-	const hint = th.fg("dim", "ctrl+q panel · /squad");
 	lines.push(
 		`${statusIcon} ${th.fg("accent", "squad")} ${th.fg("dim", squad.goal.slice(0, 30))} ` +
 		`${th.fg("muted", `${doneCount}/${tasks.length}`)} ` +
 		`${th.fg("dim", `$${totalCost.toFixed(2)}`)} ` +
 		`${th.fg("dim", elapsedStr)} ` +
-		`${hint}`
+		`${th.fg("dim", "^q panel · /squad")}`
 	);
 
-	// Task lines
+	// Task lines — lightweight, NO message file reads
 	for (const task of tasks) {
 		const icon = task.status === "done" ? th.fg("success", "✓")
 			: task.status === "in_progress" ? th.fg("warning", "⏳")
@@ -769,20 +784,8 @@ function updateWidget(): void {
 
 		let line = `  ${icon} ${th.fg("muted", task.id)} ${th.fg("dim", `(${task.agent})`)}`;
 
-		// Show live activity for in_progress tasks
-		if (task.status === "in_progress") {
-			const messages = store.loadMessages(activeSquadId, task.id);
-			const lastTool = [...messages].reverse().find((m) => m.type === "tool");
-			const lastText = [...messages].reverse().find((m) => m.type === "text" && m.from !== "system");
-			if (lastTool) {
-				const toolPreview = lastTool.name || lastTool.text;
-				const argPreview = lastTool.args?.path || lastTool.args?.command || "";
-				const preview = argPreview ? `${toolPreview} ${argPreview}` : toolPreview;
-				line += ` ${th.fg("dim", "→ " + preview.slice(0, 40))}`;
-			} else if (lastText) {
-				line += ` ${th.fg("dim", lastText.text.split("\n")[0].slice(0, 40))}`;
-			}
-		} else if (task.status === "done" && task.output) {
+		// Only show static info from task.json — no message file reads
+		if (task.status === "done" && task.output) {
 			line += ` ${th.fg("dim", task.output.split("\n")[0].slice(0, 40))}`;
 		} else if (task.status === "failed" && task.error) {
 			line += ` ${th.fg("error", task.error.slice(0, 40))}`;
@@ -820,7 +823,8 @@ function clearWidget(): void {
 function startWidgetRefresh(): void {
 	if (widgetInterval) return;
 	updateWidget();
-	widgetInterval = setInterval(() => updateWidget(), 2000);
+	// 5 seconds instead of 2 — less disk I/O, still responsive enough
+	widgetInterval = setInterval(() => updateWidget(), 5000);
 }
 
 function clearWidgetRefresh(): void {
@@ -857,6 +861,14 @@ function createPanel(
 		(tui, theme, _kb, _done) => {
 			const panel = new SquadPanel(tui, theme, scheduler, squadId);
 			activePanel = panel;
+
+			// Restore widget when panel hides
+			panel.onVisibilityChange = (visible: boolean) => {
+				if (!visible) {
+					// Panel hidden — restore widget
+					updateWidget();
+				}
+			};
 
 			// Wire up message sending from panel
 			panel.onSendMessage = async (taskId: string, _prefill: string) => {

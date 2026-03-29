@@ -34,6 +34,8 @@ export class SquadPanel implements Component, Focusable {
 	private handle: OverlayHandle | null = null;
 	/** Callback to send a human message — set by the extension */
 	onSendMessage?: (taskId: string, message: string) => void;
+	/** Callback to notify extension when panel visibility changes */
+	onVisibilityChange?: (visible: boolean) => void;
 
 	private state: PanelState = {
 		view: "tasks",
@@ -67,11 +69,12 @@ export class SquadPanel implements Component, Focusable {
 		if (this.handle) return;
 
 		this.handle = this.tui.showOverlay(this, this.getOverlayOptions());
+		this.onVisibilityChange?.(true);
 
-		// Refresh panel periodically
+		// Refresh panel periodically (5s — reads from disk)
 		this.refreshInterval = setInterval(() => {
-			this.tui.requestRender();
-		}, 2000);
+			if (!this.handle?.isHidden()) this.tui.requestRender();
+		}, 5000);
 	}
 
 	/** Hide the panel */
@@ -106,6 +109,7 @@ export class SquadPanel implements Component, Focusable {
 	toggleFocus(): void {
 		if (!this.handle) {
 			this.show();
+			this.onVisibilityChange?.(true);
 			return;
 		}
 		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
@@ -113,16 +117,15 @@ export class SquadPanel implements Component, Focusable {
 		if (this.handle.isHidden()) {
 			this.handle.setHidden(false);
 			this.handle.focus();
+			this.onVisibilityChange?.(true);
 		} else if (this.handle.isFocused()) {
 			if (wide) {
-				// Wide: release focus back to editor, panel stays visible
 				this.handle.unfocus();
 			} else {
-				// Narrow: hide overlay entirely
 				this.handle.setHidden(true);
+				this.onVisibilityChange?.(false);
 			}
 		} else {
-			// Visible but not focused — take focus
 			this.handle.focus();
 		}
 	}
@@ -161,42 +164,33 @@ export class SquadPanel implements Component, Focusable {
 	// Input Handling
 	// =========================================================================
 
-	handleInput(data: string): void {
-		const wide = this.tui.terminal.columns >= WIDE_THRESHOLD;
+	private hidePanel(): void {
+		this.handle?.setHidden(true);
+		this.onVisibilityChange?.(false);
+	}
 
-		// Ctrl+Q: switch focus back to editor (wide) or hide (narrow)
+	handleInput(data: string): void {
+		// Ctrl+Q: always hide panel and return to editor
 		if (data === "\x11") {
-			if (wide) {
-				this.handle?.unfocus();
-			} else {
-				this.handle?.setHidden(true);
-			}
+			this.hidePanel();
 			return;
 		}
 
-		// Escape: back from messages to tasks, or release focus
+		// Escape: back from messages, or hide panel
 		if (matchesKey(data, "escape")) {
 			if (this.state.view === "messages") {
 				this.state.view = "tasks";
 				this.tui.requestRender();
 				return;
 			}
-			if (wide) {
-				this.handle?.unfocus();
-			} else {
-				this.handle?.setHidden(true);
-			}
+			this.hidePanel();
 			return;
 		}
 
-		// q: release focus (task list only, not from message view)
+		// q: hide panel (from task list only)
 		if (matchesKey(data, "q")) {
 			if (this.state.view === "tasks") {
-				if (wide) {
-					this.handle?.unfocus();
-				} else {
-					this.handle?.setHidden(true);
-				}
+				this.hidePanel();
 				return;
 			}
 		}
