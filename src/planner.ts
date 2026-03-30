@@ -33,6 +33,14 @@ export async function runPlanner(options: PlannerOptions): Promise<PlannerOutput
 	const plannerDef = loadAgentDef("planner", cwd);
 	const allAgents = loadAllAgentDefs(cwd).filter((a) => a.name !== "planner" && !a.disabled);
 
+	if (allAgents.length === 0) {
+		throw new Error(
+			"No squad agents found. Agent definitions should be in ~/.pi/squad/agents/. " +
+			"This usually means the extension failed to load on first run (check /reload for errors). " +
+			"Try: /reload, then run the squad command again."
+		);
+	}
+
 	const agentList = allAgents
 		.map((a) => `- **${a.name}** (${a.role}): ${a.description} [tags: ${a.tags.join(", ")}]`)
 		.join("\n");
@@ -250,6 +258,13 @@ Respond with a JSON object (and nothing else outside the JSON):
 - Include a final QA/verification task if there are user-facing changes
 - Keep descriptions actionable — agent should know exactly what to build
 - Don't over-decompose — 3-7 tasks is usually right for most goals
+
+## Shared Contracts
+- When tasks share an interface (e.g., API endpoints, database schema, data formats), create a design/architecture task first that defines the contract, and make consuming tasks depend on it
+- If tasks run in parallel, they MUST depend on a shared spec task that defines the interface between them
+- Frontend tasks should depend on backend API tasks — the frontend agent needs a running API to test against
+- In each task description, specify the exact API paths, data schemas, and conventions that the agent should follow or create
+
 `;
 }
 

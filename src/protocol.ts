@@ -11,7 +11,7 @@
  */
 
 import type { AgentDef, KnowledgeEntry, Squad, Task, TaskMessage } from "./types.js";
-import { loadAllKnowledge, loadAllTasks, loadMessages } from "./store.js";
+import { loadAllKnowledge, loadAllTasks, loadMessages, loadOverview } from "./store.js";
 
 // ============================================================================
 // Squad Protocol (injected into every agent)
@@ -54,7 +54,9 @@ The squad system will detect this and route help.
 ## Rules
 - Stay focused on YOUR task — don't do work assigned to other agents
 - Read the dependency outputs below — don't redo completed work
+- **Follow the Design Contract in the Squad Progress Document** — use the exact API paths, ports, schemas, and file names specified. Do NOT invent alternatives
 - Check the modified files list — coordinate before editing shared files
+- When creating APIs, clearly document all endpoints, request/response shapes, and status codes in your completion output
 - Ask for help if stuck — don't spin for more than a few minutes
 - Verify your work before claiming done
 `;
@@ -111,6 +113,20 @@ function buildChainContext(task: Task, allTasks: Task[], squadId: string): strin
 	return `# Completed Dependencies
 
 ${sections.join("\n---\n\n")}
+`;
+}
+
+// ============================================================================
+// Squad Progress Overview
+// ============================================================================
+
+export function buildOverviewSection(squadId: string): string {
+	const content = loadOverview(squadId);
+	if (!content.trim()) return "";
+
+	return `# Squad Progress Document
+
+${content.trim()}
 `;
 }
 
@@ -293,6 +309,7 @@ export function buildAgentSystemPrompt(options: ProtocolBuildOptions): string {
 		buildTaskSection(task),
 		buildReworkContext(task, squadId),
 		buildChainContext(task, allTasks, squadId),
+		buildOverviewSection(squadId),
 		buildSiblingAwareness(task, allTasks, modifiedFiles),
 		buildKnowledgeSection(squadId),
 		buildQueuedMessages(queuedMessages),

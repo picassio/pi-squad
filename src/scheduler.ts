@@ -14,6 +14,7 @@ import { AgentPool, type AgentEvent } from "./agent-pool.js";
 import { Monitor } from "./monitor.js";
 import { Router } from "./router.js";
 import * as store from "./store.js";
+import { debug, logError } from "./logger.js";
 import { buildAgentSystemPrompt } from "./protocol.js";
 
 // ============================================================================
@@ -183,13 +184,13 @@ export class Scheduler {
 	/** Find and spawn ready tasks up to concurrency limit */
 	private async scheduleReadyTasks(): Promise<void> {
 		if (!this.running) {
-			console.error("[squad-scheduler] scheduleReadyTasks: not running, skipping");
+			debug("squad-scheduler", "scheduleReadyTasks: not running, skipping");
 			return;
 		}
 
 		const squad = store.loadSquad(this.squadId);
 		if (!squad || squad.status !== "running") {
-			console.error(`[squad-scheduler] scheduleReadyTasks: squad status=${squad?.status}, skipping`);
+			debug("squad-scheduler", `scheduleReadyTasks: squad status=${squad?.status}, skipping`);
 			return;
 		}
 
@@ -197,22 +198,22 @@ export class Scheduler {
 		const runningCount = this.pool.getRunningAgents().length;
 		const available = squad.config.maxConcurrency - runningCount;
 
-		console.error(`[squad-scheduler] scheduleReadyTasks: ${tasks.length} tasks, ${runningCount} running, ${available} slots`);
+		debug("squad-scheduler", `scheduleReadyTasks: ${tasks.length} tasks, ${runningCount} running, ${available} slots`);
 
 		if (available <= 0) {
-			console.error("[squad-scheduler] scheduleReadyTasks: no available slots");
+			debug("squad-scheduler", "scheduleReadyTasks: no available slots");
 			return;
 		}
 
 		const ready = this.getReadyTasks(tasks);
-		console.error(`[squad-scheduler] scheduleReadyTasks: ${ready.length} ready tasks: ${ready.map(t => t.id).join(", ")}`);
+		debug("squad-scheduler", `scheduleReadyTasks: ${ready.length} ready tasks: ${ready.map(t => t.id).join(", ")}`);
 		const toSpawn = ready.slice(0, available);
 
 		for (const task of toSpawn) {
 			try {
 				await this.spawnAgentForTask(task, squad);
 			} catch (error) {
-				console.error(`[squad-scheduler] Failed to spawn ${task.id}: ${(error as Error).message}`);
+				logError("squad-scheduler", `Failed to spawn ${task.id}: ${(error as Error).message}`);
 				// MUST fail the task — otherwise it stays in_progress forever
 				// with no process (zombie state)
 				this.handleTaskFailed(task.id, `Spawn failed: ${(error as Error).message}`);
@@ -393,7 +394,7 @@ export class Scheduler {
 					if (!this.spawnRetries.has(retryKey)) {
 						this.spawnRetries.add(retryKey);
 						const stderr = event.data?.stderr || "";
-						console.error(`[squad-scheduler] Agent ${event.agentName} died instantly (code ${exitCode}). Retrying in 2s... stderr: ${stderr.slice(0, 200)}`);
+						logError("squad-scheduler", `Agent ${event.agentName} died instantly (code ${exitCode}). Retrying in 2s... stderr: ${stderr.slice(0, 200)}`);
 						store.updateTaskStatus(this.squadId, event.taskId, "pending");
 						store.appendMessage(this.squadId, event.taskId, {
 							ts: store.now(),
@@ -456,6 +457,10 @@ export class Scheduler {
 			text: "Task completed",
 		});
 
+		// Reload task after status update so overview has output, completed time, etc.
+		const updatedTask = store.loadTask(this.squadId, taskId) || task;
+		this.appendTaskOverview(updatedTask, taskId, messages);
+
 		this.emit({
 			type: "task_completed",
 			squadId: this.squadId,
@@ -470,7 +475,7 @@ export class Scheduler {
 
 		if (!reworkCreated) {
 			// Normal flow: auto-unblock dependents
-			console.error(`[squad-scheduler] handleTaskCompleted: ${taskId} done, auto-unblocking dependents`);
+			debug("squad-scheduler", `handleTaskCompleted: ${taskId} done, auto-unblocking dependents`);
 			this.autoUnblock(taskId);
 
 			// If this is a passing retest, also unblock dependents of the ORIGINAL
@@ -485,19 +490,19 @@ export class Scheduler {
 					rootId = root.retryOf;
 					root = allTasks.find((t) => t.id === rootId);
 				}
-				console.error(`[squad-scheduler] Retest passed — also unblocking dependents of original: ${rootId}`);
+				debug("squad-scheduler", `Retest passed — also unblocking dependents of original: ${rootId}`);
 				this.autoUnblock(rootId);
 			}
 		}
 
 		// Schedule next ready tasks (may spawn new agents)
-		console.error(`[squad-scheduler] handleTaskCompleted: scheduling next ready tasks`);
+		debug("squad-scheduler", `handleTaskCompleted: scheduling next ready tasks`);
 		await this.scheduleReadyTasks();
 
 		// Re-check squad completion with fresh data AFTER scheduling
 		const freshTasks = store.loadAllTasks(this.squadId);
 		const freshSquad = store.loadSquad(this.squadId);
-		console.error(`[squad-scheduler] handleTaskCompleted: final check — tasks: ${freshTasks.map(t => `${t.id}:${t.status}`).join(", ")}`);
+		debug("squad-scheduler", `handleTaskCompleted: final check — tasks: ${freshTasks.map(t => `${t.id}:${t.status}`).join(", ")}`);
 		if (freshSquad) {
 			this.checkSquadCompletion(freshTasks, freshSquad);
 		}
@@ -620,7 +625,7 @@ export class Scheduler {
 			const originalId = implTask.retryOf || implTask.id;
 
 			if (retryCount >= squad.config.maxRetries) {
-				console.error(`[squad-scheduler] Retry limit reached for ${originalId} (${retryCount}/${squad.config.maxRetries})`);
+				debug("squad-scheduler", `Retry limit reached for ${originalId} (${retryCount}/${squad.config.maxRetries})`);
 				this.emit({
 					type: "escalation",
 					squadId: this.squadId,
@@ -689,7 +694,7 @@ export class Scheduler {
 				message: `QA found issues in ${implTask.id}. Rework attempt ${fixN}.`,
 			});
 
-			console.error(`[squad-scheduler] Rework: ${reworkId} (${implTask.agent}) + retest ${retestId} (${task.agent})`);
+			debug("squad-scheduler", `Rework: ${reworkId} (${implTask.agent}) + retest ${retestId} (${task.agent})`);
 			createdAny = true;
 		}
 
@@ -930,6 +935,89 @@ export class Scheduler {
 			.filter((p: any) => p.type === "text")
 			.map((p: any) => p.text);
 		return textParts.length > 0 ? textParts.join("\n") : null;
+	}
+
+	// =========================================================================
+	// Overview Document — append task summary after completion
+	// =========================================================================
+
+	/**
+	 * Build a concise markdown summary of a completed task and append it
+	 * to the squad's OVERVIEW.md. This gives subsequent agents a narrative
+	 * understanding of what was accomplished, issues hit, and decisions made.
+	 */
+	private appendTaskOverview(
+		task: Task,
+		taskId: string,
+		messages: import("./types.js").TaskMessage[],
+	): void {
+		try {
+			const lines: string[] = [];
+
+			// Header
+			lines.push(`## ${task.id}: ${task.title}`);
+			lines.push(``);
+			lines.push(`**Agent:** ${task.agent} | **Status:** ${task.status}`);
+			if (task.started && task.completed) {
+				const dur = new Date(task.completed).getTime() - new Date(task.started).getTime();
+				lines.push(`**Duration:** ${formatElapsed(dur)}`);
+			}
+			lines.push(``);
+
+			// Output
+			if (task.output) {
+				lines.push(`### Output`);
+				lines.push(task.output.slice(0, 800));
+				if (task.output.length > 800) lines.push(`... (truncated)`);
+				lines.push(``);
+			}
+
+			// Issues / errors encountered
+			const errors = messages.filter((m) => m.type === "error" && m.from !== "system");
+			if (errors.length > 0) {
+				lines.push(`### Issues Encountered`);
+				for (const err of errors.slice(-5)) {
+					lines.push(`- ${err.text.split("\n")[0].slice(0, 200)}`);
+				}
+				lines.push(``);
+			}
+
+			// Decisions — scan agent text for decision-like language
+			const decisionPatterns = /\b(decided|chose|approach|instead of|trade-?off|opted|going with|switched to|using .+ because)\b/i;
+			const agentTexts = messages.filter((m) => m.from === task.agent && m.type === "text");
+			const decisions: string[] = [];
+			for (const msg of agentTexts) {
+				for (const line of msg.text.split("\n")) {
+					if (decisionPatterns.test(line) && line.trim().length > 10) {
+						decisions.push(line.trim().slice(0, 200));
+					}
+				}
+			}
+			if (decisions.length > 0) {
+				lines.push(`### Decisions`);
+				for (const d of decisions.slice(-5)) {
+					lines.push(`- ${d}`);
+				}
+				lines.push(``);
+			}
+
+			// Files modified
+			const activity = this.pool.getActivity(taskId);
+			if (activity && activity.modifiedFiles.size > 0) {
+				lines.push(`### Files Modified`);
+				for (const f of Array.from(activity.modifiedFiles).slice(0, 15)) {
+					lines.push(`- ${f}`);
+				}
+				if (activity.modifiedFiles.size > 15) {
+					lines.push(`- ... and ${activity.modifiedFiles.size - 15} more`);
+				}
+				lines.push(``);
+			}
+
+			store.appendOverview(this.squadId, lines.join("\n"));
+		} catch (err) {
+			logError("squad-scheduler", `Failed to append overview for ${taskId}: ${(err as Error).message}`);
+		}
 	}
 }
 

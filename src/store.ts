@@ -406,6 +406,32 @@ export function loadAllKnowledge(squadId: string): KnowledgeEntry[] {
 }
 
 // ============================================================================
+// Overview Document (shared squad summary)
+// ============================================================================
+
+export function getOverviewPath(squadId: string): string {
+	return path.join(getSquadDir(squadId), "OVERVIEW.md");
+}
+
+export function loadOverview(squadId: string): string {
+	try {
+		return fs.readFileSync(getOverviewPath(squadId), "utf-8");
+	} catch {
+		return "";
+	}
+}
+
+export function appendOverview(squadId: string, section: string): void {
+	const filePath = getOverviewPath(squadId);
+	ensureDir(path.dirname(filePath));
+	const existing = loadOverview(squadId);
+	const content = existing
+		? existing.trimEnd() + "\n\n---\n\n" + section.trim() + "\n"
+		: section.trim() + "\n";
+	fs.writeFileSync(filePath, content, "utf-8");
+}
+
+// ============================================================================
 // Rework Helpers
 // ============================================================================
 

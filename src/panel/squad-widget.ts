@@ -1,15 +1,17 @@
 /**
- * squad-widget.ts — Simple string[] widget for squad status.
+ * squad-widget.ts — Compact widget for squad status above the editor.
  *
- * Uses the simple setWidget(key, string[]) API which pi-tui handles
- * reliably. Component-based widgets with variable height cause TUI
- * layout corruption.
+ * Uses a component factory for setWidget so it can access terminal width
+ * and truncate every line to prevent Text wrapping. Without truncation,
+ * long lines wrap inside the Text component, causing unpredictable
+ * widget height changes that corrupt the TUI diff renderer.
  *
  * Updates are pushed by calling requestUpdate() which rebuilds the
- * string[] and calls setWidget() again.
+ * lines and calls setWidget() again.
  */
 
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import type { Component, TUI } from "@mariozechner/pi-tui";
 import type { Theme } from "@mariozechner/pi-coding-agent";
 import type { TaskStatus } from "../types.js";
 import * as store from "../store.js";
@@ -41,7 +43,10 @@ export interface SquadWidgetState {
 
 /**
  * Set up the squad widget. Returns control functions.
- * Uses simple string[] setWidget — no component factory.
+ *
+ * Uses a component factory so we can access TUI.terminal.columns and
+ * truncate every line, preventing Text word-wrapping that would cause
+ * unpredictable widget height changes.
  */
 export function setupSquadWidget(
 	ctx: { ui: { setWidget: Function; setStatus: Function; [key: string]: any }; hasUI?: boolean },
@@ -56,22 +61,16 @@ export function setupSquadWidget(
 	let renderTimer: ReturnType<typeof setTimeout> | null = null;
 	/** Cache key to skip redundant setWidget calls */
 	let lastCacheKey = "";
+	/** Last built lines — the factory re-uses these on each TUI render */
+	let currentLines: string[] = [];
 
-	function render(): void {
-		if (!state.enabled || !state.squadId) {
-			ctx.ui.setWidget("squad-tasks", undefined);
-			ctx.ui.setStatus("squad", undefined);
-			return;
-		}
+	function buildLines(): { lines: string[]; cacheKey: string; statusText: string } | null {
+		if (!state.enabled || !state.squadId) return null;
 
 		const th = ctx.ui.theme;
 		const tasks = store.loadAllTasks(state.squadId);
 		const squad = store.loadSquad(state.squadId);
-		if (!squad || tasks.length === 0) {
-			ctx.ui.setWidget("squad-tasks", undefined);
-			ctx.ui.setStatus("squad", undefined);
-			return;
-		}
+		if (!squad || tasks.length === 0) return null;
 
 		const lines: string[] = [];
 		const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
@@ -136,19 +135,77 @@ export function setupSquadWidget(
 			lines.push(`  ${th.fg("dim", `  +${tasks.length - maxVisible} more · ^q detail`)}`);
 		}
 
-		// Skip if nothing changed (avoid redundant setWidget calls that cause flicker)
 		const cacheKey = `${squad.status}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}`;
-		if (cacheKey === lastCacheKey) return;
-		lastCacheKey = cacheKey;
 
-		ctx.ui.setWidget("squad-tasks", lines);
-
-		// Update status bar
 		const statusText = squad.status === "done"
 			? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
 			: squad.status === "failed"
 			? th.fg("error", `✗ squad ${doneCount}/${tasks.length}`)
 			: th.fg("accent", `⏳ squad ${doneCount}/${tasks.length} $${totalCost.toFixed(2)}`);
+
+		return { lines, cacheKey, statusText };
+	}
+
+	/**
+	 * Widget component that renders pre-built lines truncated to terminal width.
+	 * Each line is guaranteed to fit on exactly one terminal row — no wrapping.
+	 * This keeps the widget height deterministic (= lines.length) so the TUI
+	 * diff renderer never sees unexpected height changes.
+	 */
+	class SquadWidgetComponent implements Component {
+		lines: string[] = [];
+
+		invalidate(): void { /* stateless — lines are rebuilt externally */ }
+
+		render(width: number): string[] {
+			// Truncate every line to terminal width so Text wrapping cannot
+			// add extra rows. One input line → exactly one output line.
+			return this.lines.map(line => {
+				const truncated = truncateToWidth(line, width);
+				// Pad to full width to prevent leftover characters from previous renders
+				const vw = visibleWidth(truncated);
+				const pad = Math.max(0, width - vw);
+				return truncated + " ".repeat(pad);
+			});
+		}
+	}
+
+	/** Persistent widget component instance — survives across setWidget calls */
+	let widgetComponent: SquadWidgetComponent | null = null;
+	let widgetInstalled = false;
+
+	function render(): void {
+		const result = buildLines();
+		if (!result) {
+			ctx.ui.setWidget("squad-tasks", undefined);
+			ctx.ui.setStatus("squad", undefined);
+			widgetInstalled = false;
+			return;
+		}
+
+		const { lines, cacheKey, statusText } = result;
+
+		// Skip if nothing changed (avoid redundant setWidget calls)
+		if (cacheKey === lastCacheKey) return;
+		lastCacheKey = cacheKey;
+
+		currentLines = lines;
+
+		if (!widgetInstalled) {
+			// Install the component factory once. On subsequent updates we just
+			// mutate widgetComponent.lines and requestRender — no setWidget churn.
+			widgetComponent = new SquadWidgetComponent();
+			widgetComponent.lines = lines;
+
+			const comp = widgetComponent;
+			ctx.ui.setWidget("squad-tasks", (_tui: TUI, _theme: Theme) => comp);
+			widgetInstalled = true;
+		} else if (widgetComponent) {
+			// Update lines in-place — the next TUI render picks them up.
+			// No setWidget call needed, avoiding component tree rebuild.
+			widgetComponent.lines = lines;
+		}
+
 		ctx.ui.setStatus("squad", statusText);
 	}
 

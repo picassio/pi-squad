@@ -11,6 +11,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentDef, AgentActivity, Task, TaskMessage } from "./types.js";
 import { buildAgentSystemPrompt, type ProtocolBuildOptions } from "./protocol.js";
+import { debug, logError } from "./logger.js";
 
 // ============================================================================
 // Types
@@ -165,7 +166,7 @@ export class AgentPool {
 
 		// Spawn pi process — set env var to prevent recursive squad extension loading
 		const invocation = getPiInvocation(["--mode", "rpc", ...args]);
-		console.error(`[squad-pool] spawn ${agentDef.name}: ${invocation.command} ${invocation.args.slice(0, 3).join(" ")} ...`);
+		debug("squad-pool", `spawn ${agentDef.name}: ${invocation.command} ${invocation.args.slice(0, 3).join(" ")} ...`);
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -214,7 +215,7 @@ export class AgentPool {
 		proc.on("exit", (code, signal) => {
 			// Log diagnostic info for debugging spawn failures
 			if (code !== 0 && code !== null) {
-				console.error(`[squad-pool] ${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr.slice(0, 300) || "(empty)"}`);
+				logError("squad-pool", `${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr.slice(0, 300) || "(empty)"}`);
 			}
 			// Clean up agents map so getRunningAgents() doesn't count dead processes
 			this.agents.delete(taskId);
@@ -377,7 +378,7 @@ export class AgentPool {
 			// Pi RPC mode emits agent_end when the agent loop finishes.
 			// The RPC process stays alive waiting for more commands,
 			// so we need to explicitly kill it and emit our own agent_end.
-			console.error(`[squad-pool] agent_end from RPC: ${agent.agentName} (task: ${agent.taskId})`);
+			debug("squad-pool", `agent_end from RPC: ${agent.agentName} (task: ${agent.taskId})`);
 			// Mark the guard to prevent double-emit from proc.on("exit")
 			const guardFn = (agent as any)._agentEndEmitted;
 			if (guardFn) guardFn();
