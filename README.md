@@ -413,7 +413,7 @@ src/
 
 ## Requirements
 
-- [pi](https://github.com/badlogic/pi-mono) coding agent
+- [pi](https://github.com/badlogic/pi-mono) coding agent (v0.63.0+, recommended v0.64.0+)
 - An API key configured in pi (Anthropic, OpenRouter, etc.)
 - Node.js 18+
 

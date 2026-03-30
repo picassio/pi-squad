@@ -166,15 +166,17 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!squadEnabled) return { content: [{ type: "text" as const, text: "Squad is disabled. Use /squad enable to re-enable." }] };
 			if (!uiCtx) uiCtx = ctx;
+
+			// Check if the user cancelled before we start
+			if (signal?.aborted) return { content: [{ type: "text" as const, text: "Cancelled." }] };
 
 			// Multiple squads can run concurrently — no guard needed
 
 			const squadId = store.makeTaskId(params.goal);
 			if (store.squadExists(squadId)) {
-				// Append timestamp to make unique
 				const uniqueId = `${squadId}-${Date.now().toString(36)}`;
 				return await startSquad(uniqueId, params, ctx.cwd, squadSkillPaths, pi);
 			}
