@@ -165,6 +165,7 @@ export class AgentPool {
 
 		// Spawn pi process — set env var to prevent recursive squad extension loading
 		const invocation = getPiInvocation(["--mode", "rpc", ...args]);
+		console.error(`[squad-pool] spawn ${agentDef.name}: ${invocation.command} ${invocation.args.slice(0, 3).join(" ")} ...`);
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -199,6 +200,7 @@ export class AgentPool {
 		});
 
 		attachLineReader(proc.stdout!, (line) => {
+			stdoutLines++;
 			try {
 				const event = JSON.parse(line);
 				this.handleRpcEvent(agentProc, event);
@@ -208,7 +210,12 @@ export class AgentPool {
 		});
 
 		let agentEndEmitted = false;
-		proc.on("exit", (code) => {
+		let stdoutLines = 0;
+		proc.on("exit", (code, signal) => {
+			// Log diagnostic info for debugging spawn failures
+			if (code !== 0 && code !== null) {
+				console.error(`[squad-pool] ${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr.slice(0, 300) || "(empty)"}`);
+			}
 			// Only emit if we haven't already emitted via RPC agent_end event
 			if (!agentEndEmitted) {
 				agentEndEmitted = true;
