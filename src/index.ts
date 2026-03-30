@@ -105,6 +105,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		// When NO squad is active, nudge the agent to consider using squad for complex tasks
+		const allAgents = store.loadAllAgentDefs(ctx.cwd).filter((a) => a.name !== "planner" && !a.disabled);
+		const agentList = allAgents.map((a) => `${a.name} (${a.role})`).join(", ");
 		const squadNudge = [
 			`<squad_hint>`,
 			`You have the "squad" tool available for multi-agent collaboration.`,
@@ -112,8 +114,9 @@ export default function (pi: ExtensionAPI) {
 			`would benefit from parallel execution, or is too large for a single agent context.`,
 			`The squad tool decomposes work into tasks, assigns specialist agents, and runs them in parallel.`,
 			`When in doubt about whether a task is complex enough, prefer using squad — it handles the coordination for you.`,
+			allAgents.length > 0 ? `Available agents: ${agentList}. When providing tasks, the "agent" field must be one of these names.` : ``,
 			`</squad_hint>`,
-		].join("\n");
+		].filter(Boolean).join("\n");
 
 		return {
 			systemPrompt: event.systemPrompt + "\n\n" + squadNudge,
