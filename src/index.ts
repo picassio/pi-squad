@@ -69,7 +69,7 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 
 	// Inject squad awareness before each LLM call
-	pi.on("before_agent_start", async (event, _ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!squadEnabled) return;
 
 		// When a squad is active, inject its status
