@@ -120,13 +120,23 @@ ${sections.join("\n---\n\n")}
 // Squad Progress Overview
 // ============================================================================
 
+/**
+ * Only inject the Design Contract from OVERVIEW.md into agent prompts.
+ * Task summaries are NOT injected — chain context already provides
+ * dependency outputs, and the full overview just adds noise that
+ * confuses agents (especially later ones with long dependency chains).
+ */
 export function buildOverviewSection(squadId: string): string {
 	const content = loadOverview(squadId);
 	if (!content.trim()) return "";
 
-	return `# Squad Progress Document
+	// Extract only the Design Contract section
+	const contractMatch = content.match(/## Design Contract[\s\S]*?(?=\n---\n|\n## (?!Design)|$)/);
+	if (!contractMatch) return "";
 
-${content.trim()}
+	return `# Shared Design Contract
+
+${contractMatch[0].trim()}
 `;
 }
 
