@@ -5,7 +5,7 @@
  */
 
 import type { Theme } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import { truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { TaskMessage } from "../types.js";
 import * as store from "../store.js";
 
@@ -159,11 +159,12 @@ export class MessageView {
 				case "text":
 				case "message":
 				case "reply": {
-					// Split text, strip any \r, ensure no embedded newlines survive
 					const textLines = msg.text.replace(/\r/g, "").split("\n");
 					const show = textLines.slice(0, MAX_TEXT_LINES);
 					for (const tl of show) {
-						lines.push(fit(`   ${tl}`, width));
+						// Wrap long lines instead of truncating
+						const wrapped = wrap(`   ${tl}`, width, "      ");
+						lines.push(...wrapped);
 					}
 					if (textLines.length > MAX_TEXT_LINES) {
 						lines.push(fit(`   ${th.fg("dim", `... +${textLines.length - MAX_TEXT_LINES} lines`)}`, width));
@@ -171,10 +172,10 @@ export class MessageView {
 					break;
 				}
 				case "done":
-					lines.push(fit(`   ${th.fg("success", "✓ " + msg.text)}`, width));
+					lines.push(...wrap(`   ✓ ${msg.text}`, width, "      "));
 					break;
 				case "error":
-					lines.push(fit(`   ${th.fg("error", "✗ " + msg.text)}`, width));
+					lines.push(...wrap(`   ✗ ${msg.text}`, width, "      "));
 					break;
 				case "status":
 					lines.push(fit(`   ${th.fg("dim", msg.text)}`, width));
@@ -186,10 +187,52 @@ export class MessageView {
 	}
 }
 
+/** Truncate a single line (for headers, tool calls, status — not text content) */
 function fit(line: string, width: number): string {
-	// Strip any newlines that would create extra terminal lines and break layout math
 	const clean = line.replace(/[\n\r]/g, " ");
 	return truncateToWidth(clean, width, "…");
+}
+
+/** Wrap a text line into multiple lines that fit within width.
+ *  Uses ANSI-aware visibleWidth for correct wrapping with styled text.
+ *  Returns array of lines, each guaranteed to fit within width. */
+function wrap(line: string, width: number, indent: string = "   "): string[] {
+	const clean = line.replace(/[\n\r]/g, " ");
+	// Fast path: already fits
+	if (visibleWidth(clean) <= width) return [clean];
+
+	// For styled text, we can't word-wrap by chars (ANSI codes break).
+	// Instead, strip to plain text, wrap that, then truncate styled lines.
+	const plain = stripAnsi(clean);
+	const indentW = visibleWidth(indent);
+	const firstW = width;
+	const contW = width - indentW;
+
+	const results: string[] = [];
+	let remaining = plain;
+	let isFirst = true;
+
+	while (remaining.length > 0) {
+		const maxW = isFirst ? firstW : contW;
+		if (remaining.length <= maxW) {
+			results.push(isFirst ? remaining : indent + remaining);
+			break;
+		}
+		// Find word break point
+		let breakAt = remaining.lastIndexOf(" ", maxW);
+		if (breakAt <= maxW * 0.3) breakAt = maxW; // No good break, hard cut
+		const chunk = remaining.slice(0, breakAt);
+		results.push(isFirst ? chunk : indent + chunk);
+		remaining = remaining.slice(breakAt).trimStart();
+		isFirst = false;
+	}
+
+	// Truncate each to be safe (handles edge cases)
+	return results.map(r => truncateToWidth(r, width, ""));
+}
+
+function stripAnsi(str: string): string {
+	return str.replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function pad(lines: string[], max: number): string[] {
