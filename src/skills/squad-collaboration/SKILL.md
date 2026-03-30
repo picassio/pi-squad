@@ -1,5 +1,5 @@
 ---
-name: collaboration
+name: squad-collaboration
 description: Multi-agent collaboration patterns — how to build on others' work, ask questions, share knowledge, and work as a team.
 ---
 

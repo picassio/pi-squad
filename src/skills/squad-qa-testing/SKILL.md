@@ -1,5 +1,5 @@
 ---
-name: qa-testing
+name: squad-qa-testing
 description: >
   QA and testing practices — test strategy, checklist, evidence requirements,
   verdict format, and rework flow. Use when verifying, testing, or reviewing

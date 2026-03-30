@@ -1,5 +1,5 @@
 ---
-name: backend-dev
+name: squad-backend-dev
 description: >
   Backend engineering practices — API design, database patterns, auth implementation,
   input validation, error handling, and security. Use when building APIs, servers,

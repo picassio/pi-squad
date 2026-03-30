@@ -1,5 +1,5 @@
 ---
-name: verification
+name: squad-verification
 description: Verify work before claiming completion — evidence-based discipline for multi-agent handoffs.
 ---
 

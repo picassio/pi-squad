@@ -1,5 +1,5 @@
 ---
-name: architecture
+name: squad-architecture
 description: >
   System architecture practices — project structure, API contracts, shared types,
   monorepo setup, and technical decision documentation. Use when designing system

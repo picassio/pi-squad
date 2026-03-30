@@ -1,5 +1,5 @@
 ---
-name: frontend-dev
+name: squad-frontend-dev
 description: >
   Frontend engineering practices — React patterns, CSS/Tailwind, accessibility,
   state management, API integration, and responsive design. Use when building

@@ -1,5 +1,5 @@
 ---
-name: security-audit
+name: squad-security-audit
 description: >
   Security audit checklist, vulnerability patterns, and remediation guidance.
   Use when reviewing code for security issues, hardening an application,
