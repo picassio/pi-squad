@@ -1176,6 +1176,16 @@ async function startSquad(
 				depends: t.depends || [],
 			})),
 		};
+
+		// Validate agent names — remap unknown agents to fullstack
+		for (const task of plan.tasks) {
+			const agentDef = store.loadAgentDef(task.agent, cwd);
+			if (!agentDef) {
+				const original = task.agent;
+				task.agent = "fullstack";
+				task.description = `[Note: agent "${original}" not found, remapped to fullstack]\n\n${task.description}`;
+			}
+		}
 	} else {
 		// Run planner to generate task breakdown
 		try {

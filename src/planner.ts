@@ -65,7 +65,8 @@ export async function runPlanner(options: PlannerOptions): Promise<PlannerOutput
 			model: model || plannerDef?.model || undefined,
 		});
 
-		return parsePlannerOutput(output);
+		const agentNames = new Set(allAgents.map((a) => a.name));
+		return parsePlannerOutput(output, agentNames);
 	} finally {
 		try {
 			fs.unlinkSync(promptFile);
@@ -172,7 +173,7 @@ async function runPiJson(options: PiJsonOptions): Promise<string> {
 // Output Parsing
 // ============================================================================
 
-function parsePlannerOutput(text: string): PlannerOutput {
+function parsePlannerOutput(text: string, validAgents?: Set<string>): PlannerOutput {
 	// Try to extract JSON from the text (might be wrapped in markdown code blocks)
 	const jsonMatch = text.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/) || text.match(/(\{[\s\S]*\})/);
 
@@ -194,6 +195,13 @@ function parsePlannerOutput(text: string): PlannerOutput {
 			}
 			if (!task.depends) task.depends = [];
 			if (!task.description) task.description = "";
+
+			// Remap unknown agent names to fullstack (the generalist)
+			if (validAgents && !validAgents.has(task.agent)) {
+				const original = task.agent;
+				task.agent = "fullstack";
+				task.description = `[Note: planner assigned "${original}" which doesn't exist, remapped to fullstack]\n\n${task.description}`;
+			}
 		}
 
 		if (!parsed.agents) parsed.agents = {};
