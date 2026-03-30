@@ -378,29 +378,35 @@ export class Scheduler {
 				break;
 			}
 
-			case "agent_end": {
+				case "agent_end": {
 				const exitCode = event.data?.exitCode ?? 1;
-				const activity = this.pool.getActivity(event.taskId);
-				// Treat as success if agent did meaningful work (had turns),
-				// even if exit code is non-zero (common with EPIPE on parent exit)
-				const hadMeaningfulWork = activity && activity.turnCount > 0;
-				if (exitCode === 0 || hadMeaningfulWork) {
+				const turnCount = event.data?.turnCount ?? 0;
+				const toolCallCount = event.data?.toolCallCount ?? 0;
+
+				// Agent must have done real work: at least 1 turn AND at least 1 tool call.
+				// An agent that exits cleanly but with 0 turns/tools did nothing —
+				// likely hit a rate limit or API error. Treat as crash, not success.
+				const hadMeaningfulWork = turnCount > 0 && toolCallCount > 0;
+				if (hadMeaningfulWork) {
 					this.handleTaskCompleted(event.taskId).then(() => this.updateContext());
 				} else {
-					// Agent died with no work done — retry once before failing.
-					// Transient failures (resource pressure, startup race) are common
-					// when multiple agents spawn simultaneously.
+					// Agent exited without doing real work (0 turns or 0 tool calls).
+					// Common causes: rate limit, API error, resource pressure, crash.
+					// Retry once before failing.
 					const retryKey = `spawn-retry:${event.taskId}`;
 					if (!this.spawnRetries.has(retryKey)) {
 						this.spawnRetries.add(retryKey);
 						const stderr = event.data?.stderr || "";
-						logError("squad-scheduler", `Agent ${event.agentName} died instantly (code ${exitCode}). Retrying in 2s... stderr: ${stderr.slice(0, 200)}`);
+						const reason = turnCount === 0
+							? `exited with 0 turns (likely rate limit or API error)`
+							: `exited with ${turnCount} turns but 0 tool calls (no work done)`;
+						logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr.slice(0, 200)}`);
 						store.updateTaskStatus(this.squadId, event.taskId, "pending");
 						store.appendMessage(this.squadId, event.taskId, {
 							ts: store.now(),
 							from: "system",
 							type: "status",
-							text: `Agent crashed on startup (code ${exitCode}). Retrying...`,
+							text: `Agent ${reason}. Retrying...`,
 						});
 						// Delay retry to let resources settle
 						setTimeout(() => {

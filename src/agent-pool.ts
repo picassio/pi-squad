@@ -217,6 +217,8 @@ export class AgentPool {
 			if (code !== 0 && code !== null) {
 				logError("squad-pool", `${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr.slice(0, 300) || "(empty)"}`);
 			}
+			// Capture activity stats BEFORE deleting the agent
+			const finalActivity = agentProc.activity;
 			// Clean up agents map so getRunningAgents() doesn't count dead processes
 			this.agents.delete(taskId);
 			// Only emit if we haven't already emitted via RPC agent_end event
@@ -226,7 +228,13 @@ export class AgentPool {
 					type: "agent_end",
 					taskId,
 					agentName: agentDef.name,
-					data: { exitCode: code, stderr: stderr.slice(-2000) },
+					data: {
+						exitCode: code,
+						stderr: stderr.slice(-2000),
+						turnCount: finalActivity.turnCount,
+						toolCallCount: finalActivity.recentToolCalls.length,
+						filesModified: finalActivity.modifiedFiles.size,
+					},
 				});
 			}
 			// Cleanup temp files — delay to avoid race with last stdout reads
@@ -382,13 +390,21 @@ export class AgentPool {
 			// Mark the guard to prevent double-emit from proc.on("exit")
 			const guardFn = (agent as any)._agentEndEmitted;
 			if (guardFn) guardFn();
+			// Capture activity stats BEFORE deleting
+			const endActivity = agent.activity;
 			// Remove from agents map BEFORE emitting so getRunningAgents() doesn't count it
 			this.agents.delete(agent.taskId);
 			this.emit({
 				type: "agent_end",
 				taskId: agent.taskId,
 				agentName: agent.agentName,
-				data: { exitCode: 0, stderr: "" },
+				data: {
+					exitCode: 0,
+					stderr: "",
+					turnCount: endActivity.turnCount,
+					toolCallCount: endActivity.recentToolCalls.length,
+					filesModified: endActivity.modifiedFiles.size,
+				},
 			});
 			// Kill the RPC process since the agent's work is done
 			agent.process.kill("SIGTERM");
