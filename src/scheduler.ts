@@ -55,6 +55,8 @@ export class Scheduler {
 	private listeners: SchedulerEventListener[] = [];
 	private skillPaths: string[] = [];
 	private running = false;
+	/** Track spawn retries to allow one retry per task */
+	private spawnRetries = new Set<string>();
 
 	/** Get the project cwd for this squad (from squad.json) */
 	getProjectCwd(): string | undefined {
@@ -381,8 +383,29 @@ export class Scheduler {
 				if (exitCode === 0 || hadMeaningfulWork) {
 					this.handleTaskCompleted(event.taskId).then(() => this.updateContext());
 				} else {
-					const stderr = event.data?.stderr || "";
-					this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode}. ${stderr.slice(0, 500)}`);
+					// Agent died with no work done — retry once before failing.
+					// Transient failures (resource pressure, startup race) are common
+					// when multiple agents spawn simultaneously.
+					const retryKey = `spawn-retry:${event.taskId}`;
+					if (!this.spawnRetries.has(retryKey)) {
+						this.spawnRetries.add(retryKey);
+						const stderr = event.data?.stderr || "";
+						console.error(`[squad-scheduler] Agent ${event.agentName} died instantly (code ${exitCode}). Retrying in 2s... stderr: ${stderr.slice(0, 200)}`);
+						store.updateTaskStatus(this.squadId, event.taskId, "pending");
+						store.appendMessage(this.squadId, event.taskId, {
+							ts: store.now(),
+							from: "system",
+							type: "status",
+							text: `Agent crashed on startup (code ${exitCode}). Retrying...`,
+						});
+						// Delay retry to let resources settle
+						setTimeout(() => {
+							if (this.running) this.scheduleReadyTasks();
+						}, 2000);
+					} else {
+						const stderr = event.data?.stderr || "";
+						this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode} (retry exhausted). ${stderr.slice(0, 500)}`);
+					}
 					this.updateContext();
 				}
 				// Skip the updateContext() below — handled in the branches above
