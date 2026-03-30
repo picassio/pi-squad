@@ -8,7 +8,7 @@
       "src/index.ts"
     ],
     "skills": [
-      "src/skills/supervisor"
+      "src/skills/squad-supervisor"
     ]
   },
   "files": [
