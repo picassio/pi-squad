@@ -22,7 +22,7 @@ Ask pi to do something complex. It calls the `squad` tool automatically:
 > Build a REST API with authentication, tests, and documentation
 ```
 
-Or be explicit with predefined tasks:
+The planner agent reads your codebase and creates a task breakdown automatically. Or be explicit:
 
 ```
 > Use squad: goal="Build task API", tasks=[
@@ -34,17 +34,18 @@ Or be explicit with predefined tasks:
 
 ### What Happens
 
-1. Extension creates tasks and starts the scheduler
+1. Planner analyzes the codebase and creates tasks (or uses your predefined tasks)
 2. A **live widget** appears above the editor showing task status
 3. Agents spawn as separate pi processes, work in parallel where dependencies allow
 4. QA agents can trigger **automatic rework loops** when they find bugs
-5. When complete, pi reports the summary with costs
+5. When complete, pi reports the summary — notifications don't pollute message history
+6. Multiple squads can run concurrently across different projects
 
 ## User Interface
 
 ### Widget (above editor)
 
-Always visible when a squad is active. Component-based, event-driven rendering — updates on every scheduler event with no polling.
+Always visible when a squad is active. Debounced updates with cache key to avoid flicker.
 
 ```
 ⏳ squad Build task API 2/3 $0.58 3m12s  ^q detail · /squad msg
@@ -57,7 +58,7 @@ Features:
 - Per-task elapsed time (warning color after 3 minutes)
 - Live tool call preview for running tasks
 - Stale detection — shows `⏳ idle` when agent has no output for 2+ minutes
-- Responsive — caps visible tasks based on terminal height
+- Responsive — caps visible tasks on small terminals, shows `+N more` overflow
 - Completion duration for finished tasks
 
 ### Status Bar (footer)
@@ -68,9 +69,9 @@ Features:
 
 ### Panel (Ctrl+Q)
 
-Centered overlay panel. Press `Ctrl+Q` to open/close.
+Centered overlay panel with proper lifecycle management. Press `Ctrl+Q` to open/close.
 
-**Task list:**
+**Task list** with sticky summary at bottom:
 ```
 ╭─ squad: Build task API ─────────────────────╮
 │ ▸ ✓ api (backend) 2m12s                     │
@@ -86,15 +87,18 @@ Centered overlay panel. Press `Ctrl+Q` to open/close.
 ╰──────────────────────────────────────────────╯
 ```
 
-**Message view** (Enter on a task):
+**Message view** (Enter on a task) — long text wraps instead of truncating:
 ```
 ╭─ tests · qa ⏳ ─────────────────────────────╮
 │ 10:03 qa                                     │
-│   Starting test implementation               │
+│   Starting test implementation. Will cover   │
+│      all CRUD endpoints, validation, and     │
+│      edge cases for empty input.             │
 │ 10:04 qa                                     │
 │   → write src/tasks.test.js                  │
 │ 10:05 YOU                                    │
 │   Also test edge cases for empty input       │
+│ ─ 65% ─ 24 msgs ─ ↑↓ scroll                │
 ├──────────────────────────────────────────────┤
 │ ↑↓ scroll  m send  esc back  ^q close       │
 ╰──────────────────────────────────────────────╯
@@ -110,10 +114,14 @@ Centered overlay panel. Press `Ctrl+Q` to open/close.
 | `/squad agents` | List, view, edit, enable/disable agents |
 | `/squad agents <name>` | Quick view of a specific agent |
 | `/squad msg [agent] text` | Send message to a running agent |
-| `/squad widget` | Toggle live widget |
+| `/squad widget` | Toggle live widget on/off |
 | `/squad panel` | Toggle overlay panel |
 | `/squad cancel` | Cancel running squad |
 | `/squad clear` | Dismiss widget, deactivate view |
+| `/squad cleanup` | Delete squad data (select one or all) |
+| `/squad cleanup all` | Delete all squad data |
+| `/squad enable` | Enable pi-squad (tools, widget, system prompt) |
+| `/squad disable` | Disable pi-squad completely |
 
 ## Keyboard Shortcuts
 
@@ -137,7 +145,21 @@ Centered overlay panel. Press `Ctrl+Q` to open/close.
 | `squad_message` | Send message to a running agent via `steer()` |
 | `squad_modify` | Add/cancel/pause/resume tasks, or cancel/resume entire squad |
 
-The main pi agent sees squad state in its system prompt automatically (`<squad_status>` block) and can relay messages, add tasks, or check status on your behalf.
+The main pi agent sees squad state in its system prompt automatically (`<squad_status>` block) and can relay messages, add tasks, or check status on your behalf. Squad notifications use `sendMessage({ display: true })` so they don't pollute the LLM's message history.
+
+## Multiple Concurrent Squads
+
+Multiple squads can run in parallel from the same pi session. Each squad has its own scheduler, agent pool, and disk state.
+
+```
+> Build the auth API          → starts squad-1
+> Build the dashboard UI      → starts squad-2 (runs in parallel)
+
+/squad list                   → see both, select which to view
+/squad select                 → switch widget/panel focus
+```
+
+All squads run independently in the background. The widget/panel shows whichever squad you're focused on.
 
 ## QA Rework Loop
 
@@ -190,7 +212,7 @@ All 42 tests passing. No issues found.
 
 ```
 config: {
-  maxConcurrency: 3,  // parallel agents
+  maxConcurrency: 3,  // parallel agents (default: 2)
   maxRetries: 2,      // rework attempts before escalation (default: 2)
 }
 ```
@@ -269,7 +291,7 @@ Create a JSON file in `~/.pi/squad/agents/` (global) or `{project}/.pi/squad/age
 
 - `model`: `null` = pi default. Override with any model ID your provider supports.
 - `tools`: `null` = all tools. Array like `["bash", "read", "write", "edit"]` to restrict.
-- `tags`: Used by the planner to match agents to tasks.
+- `tags`: Used by the planner to match agents to tasks automatically.
 - `disabled`: `true` = hidden from planner, tasks assigned to this agent will fail.
 - Project-local agents override global agents with the same name.
 
@@ -277,7 +299,7 @@ Create a JSON file in `~/.pi/squad/agents/` (global) or `{project}/.pi/squad/age
 
 ### Chain Context (primary)
 
-When task A completes, its **full output** is injected into task B's system prompt as a `# Completed Dependencies` section. Downstream agents read what was built and extend it.
+When task A completes, its **full output** is injected into task B's system prompt as a `# Completed Dependencies` section. Downstream agents read what was built and extend it — no need for explicit communication.
 
 ### Shared Filesystem
 
@@ -290,7 +312,7 @@ When agents run in parallel, each sees the other's status and modified files in 
 ```
 # Sibling Tasks
 - template-engine [in_progress] — fullstack — Create HTML templates
-  
+
 ## Files Modified by Other Agents
 **fullstack:** src/templateEngine.js, templates/post.html
 ⚠️ Coordinate with the owning agent before editing files listed above.
@@ -319,6 +341,7 @@ When a pi session crashes (tmux dies, SIGKILL, etc.):
 - In-progress tasks are automatically **suspended** on next startup
 - Squad is marked as **paused**
 - Only squads with completed tasks trigger a notification
+- Squads with zero progress are silently paused (no noise)
 
 ### Resume
 
@@ -331,9 +354,14 @@ Resume a paused squad across sessions:
 The agent calls `squad_modify({ action: "resume" })`, which:
 1. Finds the latest paused squad for the project
 2. Creates a fresh scheduler from disk state
-3. Restarts suspended tasks
+3. Wires up event handlers for completion/failure/escalation
+4. Restarts suspended tasks
 
-All state lives on disk — squads are fully reconstructable.
+All state lives on disk — squads are fully reconstructable from JSON files.
+
+### Spawn Resilience
+
+Child agent processes occasionally fail during startup (transient resource pressure). The scheduler automatically retries once after a 2-second delay. If the retry also fails, the task is marked failed with a diagnostic log including PID, exit code, stderr, and stdout line count.
 
 ## Governance
 
@@ -343,13 +371,15 @@ All state lives on disk — squads are fully reconstructable.
 | **Concurrency control** | `maxConcurrency` limits parallel agents (default: 2) |
 | **Health monitoring** | Idle warning (3m), stuck intervention (5m), loop detection (same tool 5x), 30m hard ceiling |
 | **QA rework loop** | Auto-creates fix + retest tasks when QA fails (up to `maxRetries`) |
+| **Spawn retry** | Retries once on transient startup failures, then fails with diagnostics |
 | **File tracking** | Warns agents about files modified by other agents |
 | **@mention routing** | Parsed from output, delivered via RPC `steer()` |
-| **Escalation** | Blocked agents, stuck agents, and retry limit → notify main agent |
+| **Escalation** | Blocked agents, stuck agents, retry limit, spawn failure → notify main agent |
+| **Clean notifications** | Uses `sendMessage({ display: true })` — visible to user, not in LLM history |
 
 ## Data Layout
 
-All state lives in `~/.pi/squad/`. No database, no daemon, no external services. Writes are atomic (temp file + rename).
+All state lives in `~/.pi/squad/`. No database, no daemon, no external services. Writes are atomic (temp file + rename). JSONL reads are fault-tolerant (skip corrupt lines from concurrent writes).
 
 ```
 ~/.pi/squad/
@@ -364,7 +394,7 @@ All state lives in `~/.pi/squad/`. No database, no daemon, no external services.
     │   ├── decisions.jsonl
     │   └── findings.jsonl
     └── {task-id}/             — one directory per task
-        ├── task.json          — status, agent, output, usage
+        ├── task.json          — status, agent, output, usage, retryOf, qaFeedback
         └── messages.jsonl     — full conversation log
 ```
 
@@ -374,42 +404,47 @@ All state lives in `~/.pi/squad/`. No database, no daemon, no external services.
 src/
 ├── index.ts              — extension entry: tools, commands, widget, panel, lifecycle
 ├── types.ts              — Squad, Task, Agent, Message types
-├── store.ts              — JSON/JSONL file I/O with atomic writes
-├── scheduler.ts          — dependency DAG, concurrency, rework loop, task lifecycle
-├── agent-pool.ts         — pi RPC process spawn/steer/kill
-├── protocol.ts           — system prompt builder (7 sections)
+├── store.ts              — JSON/JSONL file I/O with atomic writes, fault-tolerant reads
+├── scheduler.ts          — dependency DAG, concurrency, rework loop, spawn retry, task lifecycle
+├── agent-pool.ts         — pi RPC process spawn/steer/kill, diagnostic logging
+├── protocol.ts           — system prompt builder (7 sections + rework context)
 ├── router.ts             — @mention parsing, cross-agent messaging
 ├── monitor.ts            — health checks: idle/stuck/loop/ceiling
 ├── supervisor.ts         — quality review, block analysis
 ├── planner.ts            — one-shot goal decomposition via LLM
 ├── panel/
 │   ├── squad-panel.ts    — overlay component (ctx.ui.custom with done())
-│   ├── squad-widget.ts   — component-based widget (setWidget factory)
-│   ├── task-list.ts      — task tree with status icons, elapsed time
-│   └── message-view.ts   — scrollable message log per task
+│   ├── squad-widget.ts   — string[] widget with debounce and cache
+│   ├── task-list.ts      — task tree with status icons, elapsed time, sticky summary
+│   └── message-view.ts   — scrollable message log with word wrap, fixed-height layout
 ├── skills/
 │   ├── supervisor/       — teaches main agent to supervise squads
 │   ├── squad-protocol/   — communication rules for child agents
 │   ├── collaboration/    — team interaction patterns
-│   └── verification/     — verify-before-done + structured verdicts
+│   └── verification/     — verify-before-done + structured QA verdicts
 └── agents/_defaults/     — 11 bundled agent definitions
 ```
 
 ## Test Results
 
 ### Simple (3 tasks, linear chain)
-- URL shortener API: 3 tasks, $0.83, 4.5 minutes
+- URL shortener API: 3 tasks, 30 turns, $0.83, 4.5 minutes
 - Backend → QA → Docs, all passing
 
-### Medium (6 tasks, diamond dependency)
-- Static blog engine: 6 tasks, $4.56, 24 minutes
-- Markdown parser → HTML converter → site generator → Express server → QA + Docs
-- 87+ tests passing
+### Medium (5 tasks, planner-decomposed)
+- Quiz API: 5 tasks, 82 turns, $3.11, 14 minutes
+- Planner auto-created: architect → backend → fullstack → QA + docs
+- 111 vitest tests passing, 3,637 lines of code
 
-### Complex (5 original + 4 auto-rework = 9 tasks)
-- Chat API with auth + rooms: 9 tasks, $4.60, 26 minutes
+### Complex with rework (5 original + 4 auto-rework = 9 tasks)
+- Chat API with auth + rooms: 9 tasks, 176 turns, $4.60, 26 minutes
 - QA found 2 bugs → 2 automatic rework cycles → both fixed and verified
-- 176 turns across 5 specialist agents
+- Dependency chain with parallel QA and rework loop
+
+### Parallel squads (2 squads running simultaneously)
+- Bookmarks API (2/2, $0.83) + Notes CLI (6/6 with 2 rework cycles, $1.17)
+- Both ran concurrently from the same pi session
+- Combined: 12 tasks, 101 turns, $2.00
 
 ## Requirements
 
