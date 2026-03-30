@@ -216,6 +216,8 @@ export class AgentPool {
 			if (code !== 0 && code !== null) {
 				console.error(`[squad-pool] ${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr.slice(0, 300) || "(empty)"}`);
 			}
+			// Clean up agents map so getRunningAgents() doesn't count dead processes
+			this.agents.delete(taskId);
 			// Only emit if we haven't already emitted via RPC agent_end event
 			if (!agentEndEmitted) {
 				agentEndEmitted = true;

@@ -213,6 +213,9 @@ export class Scheduler {
 				await this.spawnAgentForTask(task, squad);
 			} catch (error) {
 				console.error(`[squad-scheduler] Failed to spawn ${task.id}: ${(error as Error).message}`);
+				// MUST fail the task — otherwise it stays in_progress forever
+				// with no process (zombie state)
+				this.handleTaskFailed(task.id, `Spawn failed: ${(error as Error).message}`);
 			}
 		}
 
