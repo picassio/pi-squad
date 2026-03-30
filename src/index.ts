@@ -352,14 +352,15 @@ export default function (pi: ExtensionAPI) {
 						switch (event.type) {
 							case "squad_completed": {
 								const tasks = store.loadAllTasks(squadId);
+								const summary = tasks
+									.filter((t) => t.status === "done")
+									.map((t) => `- ${t.id} (${t.agent}): ${t.output?.slice(0, 150) || "done"}`)
+									.join("\n");
 								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 								const s = schedulers.get(squadId); if (s) s.updateContext();
-								const overview = store.loadOverview(squadId);
 								pi.sendMessage({
 									customType: "squad-completed",
-									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
-										(overview ? `## Squad Overview\n\n${overview}\n\n` : "") +
-										`Total cost: $${totalCost.toFixed(4)}`,
+									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}`,
 									display: true,
 								});
 								schedulers.delete(squadId);
@@ -370,12 +371,9 @@ export default function (pi: ExtensionAPI) {
 								const tasks = store.loadAllTasks(squadId);
 								const failed = tasks.filter((t) => t.status === "failed");
 								const done = tasks.filter((t) => t.status === "done");
-								const overview = store.loadOverview(squadId);
 								pi.sendMessage({
 									customType: "squad-failed",
-									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\n` +
-										`Failed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}` +
-										(overview ? `\n\n## Squad Overview\n\n${overview}` : ""),
+									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}`,
 									display: true,
 								}, { triggerTurn: true });
 								forceWidgetUpdate();
@@ -1229,31 +1227,6 @@ async function startSquad(
 
 	store.saveSquad(squad);
 
-	// Create initial OVERVIEW.md with squad goal, task plan, and design contract
-	const planLines = [
-		`# Squad: ${params.goal}`,
-		``,
-		`**Created:** ${squad.created}`,
-		`**Tasks:** ${plan.tasks.length}`,
-		``,
-		`## Task Plan`,
-		``,
-		...plan.tasks.map((t) => {
-			const deps = t.depends.length > 0 ? ` (after: ${t.depends.join(", ")})` : "";
-			return `- **${t.id}** → ${t.agent}: ${t.title}${deps}`;
-		}),
-		``,
-	];
-
-	// Extract design contract from task descriptions — API paths, schemas,
-	// ports, file conventions — so parallel agents share a single source of truth.
-	const contractLines = buildDesignContract(plan.tasks, params.goal);
-	if (contractLines.length > 0) {
-		planLines.push(...contractLines);
-	}
-
-	store.appendOverview(squadId, planLines.join("\n"));
-
 	// Create task files
 	for (const taskDef of plan.tasks) {
 		const task: Task = {
@@ -1301,6 +1274,10 @@ async function startSquad(
 		switch (event.type) {
 				case "squad_completed": {
 				const tasks = store.loadAllTasks(squadId);
+				const summary = tasks
+					.filter((t) => t.status === "done")
+					.map((t) => `- ${t.id} (${t.agent}): ${t.output?.slice(0, 150) || "done"}`)
+					.join("\n");
 				const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
 				// Final context update before clearing scheduler
@@ -1309,17 +1286,10 @@ async function startSquad(
 					completedSched.updateContext();
 				}
 
-				// Load the full overview document — contains the narrative of
-				// each task's output, decisions, issues, and files modified.
-				const overview = store.loadOverview(squadId);
-
-				// Send into LLM context (not display-only) so the main agent
-				// knows exactly what happened. No triggerTurn — user decides
-				// what to do next.
 				pi.sendMessage({
 					customType: "squad-completed",
 					content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
-						(overview ? `## Squad Overview\n\n${overview}\n\n` : "") +
+						`Summary:\n${summary}\n\n` +
 						`Total cost: $${totalCost.toFixed(4)}`,
 					display: true,
 				});
@@ -1334,14 +1304,12 @@ async function startSquad(
 				const tasks = store.loadAllTasks(squadId);
 				const failed = tasks.filter((t) => t.status === "failed");
 				const done = tasks.filter((t) => t.status === "done");
-				const overview = store.loadOverview(squadId);
 
 				pi.sendMessage({
 					customType: "squad-failed",
 					content: `[squad] Squad "${squadId}" has stalled. ` +
 						`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
 						`Failed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}\n` +
-						(overview ? `\n## Squad Overview\n\n${overview}\n\n` : "\n") +
 						`Use squad_status for details or squad_modify to adjust.`,
 					display: true,
 				}, { triggerTurn: true });
@@ -1403,98 +1371,4 @@ function getSquadSkillPaths(skillsDir: string): string[] {
 		.filter((dir) => fs.existsSync(path.join(dir, "SKILL.md")));
 }
 
-/**
- * Extract a design contract from task descriptions.
- *
- * Scans all tasks for API paths, ports, file names, data schemas, and
- * shared conventions. Produces a "## Design Contract" section in the
- * OVERVIEW.md so that ALL agents (including parallel ones) share a
- * single source of truth before they start working.
- */
-function buildDesignContract(
-	tasks: Array<{ id: string; title: string; description: string; agent: string; depends: string[] }>,
-	goal: string,
-): string[] {
-	const lines: string[] = [];
 
-	// Collect API routes mentioned in any task description
-	const apiRoutes: string[] = [];
-	const ports: string[] = [];
-	const files: string[] = [];
-	const schemas: string[] = [];
-
-	const allText = tasks.map((t) => `${t.title}\n${t.description}`).join("\n") + "\n" + goal;
-
-	// Extract API paths like GET /foo, POST /bar/:id
-	const routePattern = /\b(GET|POST|PUT|PATCH|DELETE|HEAD)\s+(\/[\w\/:]+)/gi;
-	for (const match of allText.matchAll(routePattern)) {
-		const route = `${match[1].toUpperCase()} ${match[2]}`;
-		if (!apiRoutes.includes(route)) apiRoutes.push(route);
-	}
-
-	// Extract port numbers
-	const portPattern = /\b(?:port|PORT|Port)\s*[=:]?\s*(\d{4,5})\b/gi;
-	for (const match of allText.matchAll(portPattern)) {
-		if (!ports.includes(match[1])) ports.push(match[1]);
-	}
-
-	// Extract key file names mentioned (e.g., server.js, index.html)
-	const filePattern = /\b([\w-]+\.(js|ts|json|html|css|sh|mjs|cjs))\b/gi;
-	for (const match of allText.matchAll(filePattern)) {
-		const f = match[1];
-		if (!files.includes(f) && !['package.json'].includes(f)) files.push(f);
-	}
-
-	// Extract data schemas like {field, field, field}
-	const schemaPattern = /\{([a-zA-Z_][\w,\s\[\]?]+)\}/g;
-	for (const match of allText.matchAll(schemaPattern)) {
-		const fields = match[1].trim();
-		if (fields.includes(',') && fields.length > 5 && fields.length < 200) {
-			if (!schemas.includes(fields)) schemas.push(fields);
-		}
-	}
-
-	// Only emit a contract section if we found shared design elements
-	if (apiRoutes.length === 0 && ports.length === 0 && schemas.length === 0) {
-		return [];
-	}
-
-	lines.push(`## Design Contract`);
-	lines.push(``);
-	lines.push(`> **All agents MUST follow these specifications.** Do not invent`);
-	lines.push(`> alternative paths, ports, or schemas. If you need to deviate,`);
-	lines.push(`> document the reason in your output.`);
-	lines.push(``);
-
-	if (ports.length > 0) {
-		lines.push(`### Server`);
-		lines.push(`- Port: **${ports.join(", ")}**`);
-		lines.push(``);
-	}
-
-	if (apiRoutes.length > 0) {
-		lines.push(`### API Endpoints`);
-		for (const r of apiRoutes) {
-			lines.push(`- \`${r}\``);
-		}
-		lines.push(``);
-	}
-
-	if (schemas.length > 0) {
-		lines.push(`### Data Schemas`);
-		for (const s of schemas) {
-			lines.push(`- \`{ ${s} }\``);
-		}
-		lines.push(``);
-	}
-
-	if (files.length > 0) {
-		lines.push(`### Key Files`);
-		for (const f of files) {
-			lines.push(`- \`${f}\``);
-		}
-		lines.push(``);
-	}
-
-	return lines;
-}

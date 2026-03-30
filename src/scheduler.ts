@@ -463,10 +463,6 @@ export class Scheduler {
 			text: "Task completed",
 		});
 
-		// Reload task after status update so overview has output, completed time, etc.
-		const updatedTask = store.loadTask(this.squadId, taskId) || task;
-		this.appendTaskOverview(updatedTask, taskId, messages);
-
 		this.emit({
 			type: "task_completed",
 			squadId: this.squadId,
@@ -943,88 +939,6 @@ export class Scheduler {
 		return textParts.length > 0 ? textParts.join("\n") : null;
 	}
 
-	// =========================================================================
-	// Overview Document — append task summary after completion
-	// =========================================================================
-
-	/**
-	 * Build a concise markdown summary of a completed task and append it
-	 * to the squad's OVERVIEW.md. This gives subsequent agents a narrative
-	 * understanding of what was accomplished, issues hit, and decisions made.
-	 */
-	private appendTaskOverview(
-		task: Task,
-		taskId: string,
-		messages: import("./types.js").TaskMessage[],
-	): void {
-		try {
-			const lines: string[] = [];
-
-			// Header
-			lines.push(`## ${task.id}: ${task.title}`);
-			lines.push(``);
-			lines.push(`**Agent:** ${task.agent} | **Status:** ${task.status}`);
-			if (task.started && task.completed) {
-				const dur = new Date(task.completed).getTime() - new Date(task.started).getTime();
-				lines.push(`**Duration:** ${formatElapsed(dur)}`);
-			}
-			lines.push(``);
-
-			// Output
-			if (task.output) {
-				lines.push(`### Output`);
-				lines.push(task.output.slice(0, 800));
-				if (task.output.length > 800) lines.push(`... (truncated)`);
-				lines.push(``);
-			}
-
-			// Issues / errors encountered
-			const errors = messages.filter((m) => m.type === "error" && m.from !== "system");
-			if (errors.length > 0) {
-				lines.push(`### Issues Encountered`);
-				for (const err of errors.slice(-5)) {
-					lines.push(`- ${err.text.split("\n")[0].slice(0, 200)}`);
-				}
-				lines.push(``);
-			}
-
-			// Decisions — scan agent text for decision-like language
-			const decisionPatterns = /\b(decided|chose|approach|instead of|trade-?off|opted|going with|switched to|using .+ because)\b/i;
-			const agentTexts = messages.filter((m) => m.from === task.agent && m.type === "text");
-			const decisions: string[] = [];
-			for (const msg of agentTexts) {
-				for (const line of msg.text.split("\n")) {
-					if (decisionPatterns.test(line) && line.trim().length > 10) {
-						decisions.push(line.trim().slice(0, 200));
-					}
-				}
-			}
-			if (decisions.length > 0) {
-				lines.push(`### Decisions`);
-				for (const d of decisions.slice(-5)) {
-					lines.push(`- ${d}`);
-				}
-				lines.push(``);
-			}
-
-			// Files modified
-			const activity = this.pool.getActivity(taskId);
-			if (activity && activity.modifiedFiles.size > 0) {
-				lines.push(`### Files Modified`);
-				for (const f of Array.from(activity.modifiedFiles).slice(0, 15)) {
-					lines.push(`- ${f}`);
-				}
-				if (activity.modifiedFiles.size > 15) {
-					lines.push(`- ... and ${activity.modifiedFiles.size - 15} more`);
-				}
-				lines.push(``);
-			}
-
-			store.appendOverview(this.squadId, lines.join("\n"));
-		} catch (err) {
-			logError("squad-scheduler", `Failed to append overview for ${taskId}: ${(err as Error).message}`);
-		}
-	}
 }
 
 function formatElapsed(ms: number): string {
