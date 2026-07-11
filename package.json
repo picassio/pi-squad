@@ -1,6 +1,6 @@
 {
   "name": "pi-squad",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "Multi-agent collaboration extension for pi — task decomposition, dependency management, parallel execution, TUI panel",
   "type": "module",
   "pi": {
@@ -22,6 +22,7 @@
     "LICENSE"
   ],
   "keywords": [
+    "pi-package",
     "pi",
     "pi-extension",
     "multi-agent",
@@ -35,5 +36,12 @@
     "type": "git",
     "url": "https://github.com/picassio/pi-squad.git"
   },
-  "homepage": "https://github.com/picassio/pi-squad"
+  "homepage": "https://github.com/picassio/pi-squad#readme",
+  "bugs": {
+    "url": "https://github.com/picassio/pi-squad/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  }
 }
