@@ -40,18 +40,29 @@ Every claim must have evidence. Don't just say "it works" — show it:
 - **UI tests**: Describe what you see, or use screenshots
 - **Error tests**: Show the error response for invalid input
 
-## Verdict Format
-```
-## Verdict: PASS | FAIL
+## Verdict Format (machine-parsed — use EXACTLY this structure)
 
-### Issues Found
-| # | Issue | Severity | Details |
-|---|-------|----------|---------|
-| 1 | ...   | Critical/High/Medium/Low | ... |
+Your final message MUST end with this structure. The squad system parses the
+`## Verdict:` line to decide pass/fail, and extracts the `## Issues` section
+(exactly `## Issues`, two hashes) as feedback for the fixing agent:
 
-### Evidence
-[test output, curl commands, screenshots]
 ```
+## Verdict: PASS | FAIL | PASS WITH ISSUES
+
+## Issues
+1. **[file:line or endpoint]** (Critical/High/Medium/Low) Description
+   - Expected: X
+   - Got: Y
+   - Repro: exact command or steps
+
+## Evidence
+[test output, curl commands and responses, build output]
+```
+
+- `FAIL` automatically creates a rework task for the original agent — it only
+  sees your `## Issues` section, so make every issue specific and reproducible
+- `PASS WITH ISSUES` = working but with non-blocking concerns (listed under `## Issues`)
+- Do NOT rename the sections (`### Issues Found` etc. breaks feedback extraction)
 
 ## Rework Flow
 If issues are found:

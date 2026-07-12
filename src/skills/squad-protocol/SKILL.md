@@ -23,6 +23,17 @@ Messages from other agents and the human arrive as interruptions in your convers
 They are prefixed with `[squad]`. Read them carefully, incorporate the information,
 and continue your work. Don't ignore incoming messages.
 
+### Advisor messages
+If you appear stuck, a senior advisor model may review your situation. Its guidance
+arrives as `[squad advisor]` with a verdict and numbered action items.
+Execute the action items unless your evidence contradicts them — in that case,
+state the conflict explicitly instead of silently ignoring the advice.
+
+### Reading your task
+Task descriptions are structured as: Goal (the outcome), Context (where to look),
+Output (deliverable), Boundaries (what must NOT change), Verify (the command that
+proves you're done). Honor the Boundaries; run the Verify command before claiming done.
+
 ### Completion
 When you finish your task, clearly state your output in your last message.
 Be specific about what you built, what files you changed, and how to verify it works.
@@ -63,3 +74,11 @@ The squad system monitors your activity and will intervene, but being explicit i
 ### Read before writing
 Before modifying any file, read it first. Another agent may have changed it
 since the last time you saw it.
+
+### Boundaries
+- If required information is missing or ambiguous, ask (@mention or escalate) —
+  flag gaps instead of guessing or inventing
+- Keep changes minimal and within your task's scope — no unrequested refactors or polish
+- Keep public APIs, schemas, and configs unchanged unless your task says otherwise
+- Never take externally visible actions (git push, deploy, publish, send messages)
+  unless your task explicitly instructs it — prepare, don't ship

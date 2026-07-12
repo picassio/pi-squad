@@ -272,7 +272,8 @@ function buildReworkContext(task: Task, squadId: string): string {
 	lines.push("- Do NOT rewrite everything from scratch");
 	lines.push("- Make targeted, minimal fixes");
 	lines.push("- Re-run the failing tests to verify your fixes");
-	lines.push("- Include test output as evidence in your completion message\n");
+	lines.push("- Include test output as evidence in your completion message");
+	lines.push("- Follow the squad-debugging skill for the full repro-first rework discipline\n");
 
 	return lines.join("\n");
 }
