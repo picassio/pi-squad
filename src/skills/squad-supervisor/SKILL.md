@@ -69,6 +69,23 @@ Agents normally start fresh with only their task description + dependency output
 - Simple questions or explanations
 - Tasks a single agent can finish in a few minutes
 
+### Squad vs Fleet (when pi-fleet tools are available)
+
+If `remote_spawn` / `remote_prompt` / `fleet_status` tools exist in your session, you also have **pi-fleet** (cross-device workers). Division of labor:
+
+| Situation | Use |
+|---|---|
+| Parallel work inside THIS repo (agents share the working tree, coordinate on files) | **squad** |
+| Work on another machine, OS, dev-env VM, or different repo; cost/blast-radius isolation | **fleet** (`remote_spawn` + `remote_prompt`) |
+| Big feature locally + validation/deployment on a remote box | **both side by side** — each reports back to you push-based; review each with evidence |
+| Repeated tasks on a remote repo | fleet with `fromBaseline` (warm context) |
+
+Rules when combining:
+- Both systems wake you automatically (squad events and `fleet-task-done`) — never poll either
+- Remote work cannot share this repo's working tree: have fleet workers deliver branches/patches, and never assume squad agents can see remote files
+- Review fleet results with `remote_diff`/`remote_read` (costs zero worker tokens) before `remote_accept`
+- If pi-fleet is NOT installed, none of this applies — squad works fully standalone
+
 ## Monitoring a Running Squad
 
 ### Never poll — the squad reports to you
