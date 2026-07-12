@@ -18,6 +18,7 @@ import type { Squad, Task, SquadConfig, PlannerOutput } from "./types.js";
 import { DEFAULT_SQUAD_CONFIG, THINKING_LEVELS } from "./types.js";
 import { Scheduler, type SchedulerEvent } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
+import { validatePlan, PLAN_STRUCTURE_RULES } from "./plan-rules.js";
 import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
 import { setupSquadWidget, type SquadWidgetState } from "./panel/squad-widget.js";
 import * as store from "./store.js";
@@ -40,6 +41,14 @@ let uiCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null = n
 /** Component-based widget state + controls */
 const widgetState: SquadWidgetState = { squadId: null, enabled: true };
 let widgetControls: { requestUpdate: () => void; dispose: () => void } | null = null;
+
+/** Reviewer instructions appended to squad-completed notifications —
+ * makes the main session behave like the QA/verification agents do. */
+const REVIEW_INSTRUCTIONS =
+	"Before reporting success to the user, REVIEW the work like a QA agent would: " +
+	"(1) check task outputs for QA verdicts (## Verdict: PASS/FAIL) and verification evidence (commands + results); " +
+	"(2) if a task claimed done without evidence, run its Verify command yourself; " +
+	"(3) report to the user what was verified (with evidence) and flag anything unverified — don't just relay the summary.";
 
 /** Get the active scheduler (for the focused squad) */
 function getActiveScheduler(): Scheduler | null {
@@ -115,7 +124,8 @@ export default function (pi: ExtensionAPI) {
 			`The squad tool decomposes work into tasks, assigns specialist agents, and runs them in parallel.`,
 			`When in doubt about whether a task is complex enough, prefer using squad — it handles the coordination for you.`,
 			allAgents.length > 0 ? `Available agents: ${agentList}. When providing tasks, the "agent" field must be one of these names.` : ``,
-			`When you provide task descriptions, structure them as: Goal (outcome first), Context (files to read), Output (deliverable), Boundaries (what must not change), Verify (proving command).`,
+			`When you provide tasks yourself, you take the planner's role — follow its rules: contract/design task first for shared interfaces, final QA task for user-facing changes, 3-7 tasks, first task(s) with empty depends.`,
+			`Structure descriptions as: Goal (outcome first), Context (files to read), Output (deliverable), Boundaries (what must not change), Verify (proving command).`,
 			`</squad_hint>`,
 		].filter(Boolean).join("\n");
 
@@ -140,6 +150,9 @@ export default function (pi: ExtensionAPI) {
 			"Do NOT use for simple single-file changes, quick bug fixes, or tasks a single agent can handle in a few minutes.",
 			"When in doubt about complexity, use squad — it's better to parallelize than to do everything sequentially.",
 			"Non-blocking: returns immediately with the plan while agents work in background.",
+			"If you provide tasks yourself (skipping the planner agent), follow the same rules the planner follows:",
+			PLAN_STRUCTURE_RULES.replace(/\n- /g, " ").replace(/^- /, ""),
+			"Plans are validated on submission — structural errors are rejected, rule violations come back as warnings.",
 		].join(" "),
 		parameters: Type.Object({
 			goal: Type.String({ description: "What the squad should accomplish" }),
@@ -361,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 								const s = schedulers.get(squadId); if (s) s.updateContext();
 								pi.sendMessage({
 									customType: "squad-completed",
-									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}`,
+									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}\n\n${REVIEW_INSTRUCTIONS}`,
 									display: true,
 								});
 								schedulers.delete(squadId);
@@ -411,6 +424,20 @@ export default function (pi: ExtensionAPI) {
 				case "add_task": {
 					if (!params.task) {
 						return { content: [{ type: "text" as const, text: "Provide a task definition for add_task." }], details: undefined };
+					}
+					// Validate against the live squad: deps must exist, agent must exist
+					const existing = store.loadAllTasks(activeSquadId);
+					const existingIds = new Set(existing.map((t) => t.id));
+					if (existingIds.has(params.task.id)) {
+						return { content: [{ type: "text" as const, text: `Task id '${params.task.id}' already exists in this squad.` }], details: undefined };
+					}
+					const badDeps = (params.task.depends || []).filter((d) => !existingIds.has(d));
+					if (badDeps.length > 0) {
+						return { content: [{ type: "text" as const, text: `Unknown dependency task(s): ${badDeps.join(", ")}. Existing tasks: ${[...existingIds].join(", ")}` }], details: undefined };
+					}
+					if (!store.loadAgentDef(params.task.agent, ctx.cwd)) {
+						const available = store.loadAllAgentDefs(ctx.cwd).filter((a) => !a.disabled).map((a) => a.name).join(", ");
+						return { content: [{ type: "text" as const, text: `Unknown agent '${params.task.agent}'. Available: ${available}` }], details: undefined };
 					}
 					const task: Task = {
 						id: params.task.id,
@@ -1215,6 +1242,15 @@ async function startSquad(
 		}
 	}
 
+	// Validate the plan — same enforcement for main-session and planner plans.
+	// Errors block squad creation; warnings are reported back to the plan author.
+	const validation = validatePlan(plan.tasks);
+	if (validation.errors.length > 0) {
+		throw new Error(
+			`Plan rejected:\n- ${validation.errors.join("\n- ")}\n\nFix the task list and call squad again.`,
+		);
+	}
+
 	// Create squad
 	const config: SquadConfig = {
 		...DEFAULT_SQUAD_CONFIG,
@@ -1249,16 +1285,8 @@ async function startSquad(
 			error: null,
 			usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
 		};
-
-		// Mark tasks with unmet deps as blocked
-		if (task.depends.length > 0) {
-			const allDepsMet = task.depends.every((depId) =>
-				plan.tasks.some((t) => t.id === depId),
-			);
-			if (!allDepsMet) {
-				task.status = "pending"; // deps reference external tasks, treat as ready
-			}
-		}
+		// Note: unknown dependency references are hard validation errors above,
+		// so blocked tasks here always have resolvable deps.
 
 		store.createTask(squadId, task);
 	}
@@ -1296,7 +1324,8 @@ async function startSquad(
 					customType: "squad-completed",
 					content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
 						`Summary:\n${summary}\n\n` +
-						`Total cost: $${totalCost.toFixed(4)}`,
+						`Total cost: $${totalCost.toFixed(4)}\n\n` +
+						REVIEW_INSTRUCTIONS,
 					display: true,
 				});
 
@@ -1358,7 +1387,11 @@ async function startSquad(
 		content: [
 			{
 				type: "text" as const,
-				text: `Squad "${squadId}" started with ${plan.tasks.length} tasks.\n\n${taskSummary}\n\nAgents are working in the background. Use squad_status to check progress.`,
+				text: `Squad "${squadId}" started with ${plan.tasks.length} tasks.\n\n${taskSummary}${
+					validation.warnings.length > 0
+						? `\n\n⚠️ Plan warnings (fix with squad_modify, or address at review):\n- ${validation.warnings.join("\n- ")}`
+						: ""
+				}\n\nAgents are working in the background. Use squad_status to check progress.`,
 			},
 		],
 		details: undefined,
