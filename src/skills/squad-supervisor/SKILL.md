@@ -71,15 +71,23 @@ Agents normally start fresh with only their task description + dependency output
 
 ## Monitoring a Running Squad
 
+### Never poll — the squad reports to you
+
+The `squad` tool is non-blocking and the squad system is **push-based**:
+- **Completion, failure, and escalations wake you automatically** (as `[squad]` messages that trigger your turn)
+- After starting a squad: report the plan to the user and **end your turn**
+- While a squad runs: keep helping the user with other work, or stay idle
+- **NEVER** call `squad_status` in a loop, sleep-wait between checks, or burn turns "monitoring" — that wastes tokens and blocks the user
+
 ### Passive monitoring (automatic)
 The squad status is injected into your context via `<squad_status>` before each response.
 Read it to stay aware of progress without needing to call tools.
 
 ### Active monitoring (on-demand)
-Use `squad_status` when:
+Use `squad_status` ONLY when:
 - The user asks "how's the squad doing?"
-- You need detailed info not in the status block
-- You want to check a specific squad by ID
+- You were just woken by a squad event and need detail beyond the message
+- You want to check a specific squad by ID at the user's request
 
 ### What to tell the user
 - Summarize in plain language: "2 of 4 tasks done, tests are running, docs waiting on API"
@@ -151,6 +159,7 @@ Example:
 |---|---|
 | User asks complex task | Start squad with `squad` tool |
 | User asks "what's happening?" | Read `<squad_status>`, summarize |
+| Squad is running, nothing to do | End your turn — squad events wake you; do NOT poll |
 | Agent escalates | Triage → answer or ask user |
 | User says "tell the backend agent to..." | `squad_message` to that agent |
 | User says "add a task for..." | `squad_modify` with `add_task` |

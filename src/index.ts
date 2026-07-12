@@ -241,6 +241,7 @@ export default function (pi: ExtensionAPI) {
 				taskLines,
 				`</squad_status>`,
 				`You have an active squad. Use squad_message to talk to agents, squad_status for details, squad_modify to change tasks.`,
+				`Do NOT poll squad_status in a loop or sleep-wait — the squad wakes you automatically on completion, failure, or escalation. Keep helping the user with other work, or end your turn and stay idle.`,
 			].join("\n");
 
 			return {
@@ -295,6 +296,7 @@ export default function (pi: ExtensionAPI) {
 			"Skip squad for single-file changes, quick fixes, or anything one agent finishes in minutes",
 			"Providing tasks yourself makes you the planner — follow the planner rules (contract task first, final QA task, 3-7 tasks)",
 			"Act on ⚠️ plan warnings in the response — fix with squad_modify or address at review",
+			"After starting a squad: report the plan and END YOUR TURN — never poll squad_status or sleep-wait; squad events wake you automatically",
 			"When the squad completes, review evidence like a QA agent before reporting success",
 		],
 		parameters: Type.Object({
@@ -359,7 +361,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_status",
 		label: "Squad Status",
-		description: "Check current squad status, task progress, and recent activity.",
+		description: "Check current squad status, task progress, and recent activity. Do NOT call this in a loop or after sleep-waits — squad completion/failure/escalations wake you automatically. Use only when the user asks for a status update or after being woken by a squad event.",
 		parameters: Type.Object({
 			squadId: Type.Optional(Type.String({ description: "Specific squad ID (default: most recent)" })),
 		}),
@@ -521,11 +523,13 @@ export default function (pi: ExtensionAPI) {
 									.join("\n");
 								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 								const s = schedulers.get(squadId); if (s) s.updateContext();
+								// followUp + triggerTurn: wake an idle main agent to review;
+								// if it's mid-conversation with the human, deliver after it finishes
 								pi.sendMessage({
 									customType: "squad-completed",
 									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}\n\n${REVIEW_INSTRUCTIONS}`,
 									display: true,
-								});
+								}, { triggerTurn: true, deliverAs: "followUp" });
 								schedulers.delete(squadId);
 								forceWidgetUpdate();
 								break;
@@ -538,7 +542,7 @@ export default function (pi: ExtensionAPI) {
 									customType: "squad-failed",
 									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}`,
 									display: true,
-								}, { triggerTurn: true });
+								}, { triggerTurn: true, deliverAs: "followUp" });
 								forceWidgetUpdate();
 								break;
 							}
@@ -1563,6 +1567,8 @@ async function startSquad(
 					completedSched.updateContext();
 				}
 
+				// followUp + triggerTurn: wake an idle main agent to review; if it's
+				// mid-conversation with the human, deliver after it finishes
 				pi.sendMessage({
 					customType: "squad-completed",
 					content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
@@ -1570,7 +1576,7 @@ async function startSquad(
 						`Total cost: $${totalCost.toFixed(4)}\n\n` +
 						REVIEW_INSTRUCTIONS,
 					display: true,
-				});
+				}, { triggerTurn: true, deliverAs: "followUp" });
 
 				// Clear scheduler but keep activeSquadId so squad_status still works
 				schedulers.delete(squadId);
@@ -1590,7 +1596,7 @@ async function startSquad(
 						`Failed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}\n` +
 						`Use squad_status for details or squad_modify to adjust.`,
 					display: true,
-				}, { triggerTurn: true });
+				}, { triggerTurn: true, deliverAs: "followUp" });
 				forceWidgetUpdate();
 				break;
 			}
@@ -1634,7 +1640,7 @@ async function startSquad(
 					validation.warnings.length > 0
 						? `\n\n⚠️ Plan warnings (fix with squad_modify, or address at review):\n- ${validation.warnings.join("\n- ")}`
 						: ""
-				}\n\nAgents are working in the background. Use squad_status to check progress.`,
+				}\n\nAgents work in the background — you will be woken automatically when the squad completes, fails, or needs help. Report this plan to the user and END YOUR TURN now. Do NOT poll squad_status, do NOT sleep-wait, do NOT loop.`,
 			},
 		],
 		details: undefined,
