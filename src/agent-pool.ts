@@ -147,8 +147,10 @@ export class AgentPool {
 		protocolOptions: ProtocolBuildOptions;
 		cwd: string;
 		skillPaths: string[];
+		/** Fork the given session file so the agent inherits its conversation context */
+		forkSession?: { file: string; sessionDir: string };
 	}): Promise<AgentProcess> {
-		const { taskId, agentDef, protocolOptions, cwd, skillPaths } = options;
+		const { taskId, agentDef, protocolOptions, cwd, skillPaths, forkSession } = options;
 
 		// Kill existing process for this task if any
 		if (this.agents.has(taskId)) {
@@ -162,7 +164,7 @@ export class AgentPool {
 		fs.writeFileSync(promptFile, systemPrompt, "utf-8");
 
 		// Build pi CLI args
-		const args = buildPiArgs(agentDef, promptFile, skillPaths);
+		const args = buildPiArgs(agentDef, promptFile, skillPaths, forkSession);
 
 		// Spawn pi process — set env var to prevent recursive squad extension loading
 		const invocation = getPiInvocation(["--mode", "rpc", ...args]);
@@ -419,8 +421,18 @@ export class AgentPool {
 // Helpers
 // ============================================================================
 
-function buildPiArgs(agentDef: AgentDef, promptFile: string, skillPaths: string[]): string[] {
-	const args: string[] = ["--no-session", "--append-system-prompt", promptFile];
+function buildPiArgs(
+	agentDef: AgentDef,
+	promptFile: string,
+	skillPaths: string[],
+	forkSession?: { file: string; sessionDir: string },
+): string[] {
+	// --fork cannot combine with --no-session; forked child sessions are
+	// stored under the squad's data dir to keep the user's session list clean.
+	const sessionArgs = forkSession
+		? ["--fork", forkSession.file, "--session-dir", forkSession.sessionDir]
+		: ["--no-session"];
+	const args: string[] = [...sessionArgs, "--append-system-prompt", promptFile];
 
 	if (agentDef.model) {
 		args.push("--model", agentDef.model);

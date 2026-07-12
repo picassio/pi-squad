@@ -60,6 +60,8 @@ export interface Squad {
 	status: SquadStatus;
 	created: string;
 	cwd: string;
+	/** Session file of the pi session that created this squad (for inheritContext forks) */
+	sessionFile?: string | null;
 	/** Agent name → overrides. Keys must exist in .pi/squad/agents/ */
 	agents: Record<string, SquadAgentEntry>;
 	config: SquadConfig;
@@ -85,6 +87,9 @@ export interface Task {
 	agent: string;
 	status: TaskStatus;
 	depends: string[];
+	/** Fork the main pi session so this agent inherits the full conversation context.
+	 * Skipped automatically if the estimated context exceeds 50% of the agent model's window. */
+	inheritContext?: boolean;
 	created: string;
 	started: string | null;
 	completed: string | null;
@@ -210,6 +215,7 @@ export interface PlannerOutput {
 		description: string;
 		agent: string;
 		depends: string[];
+		inheritContext?: boolean;
 	}>;
 }
 

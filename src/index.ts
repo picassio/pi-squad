@@ -16,7 +16,7 @@ import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Squad, Task, SquadConfig, PlannerOutput } from "./types.js";
 import { DEFAULT_SQUAD_CONFIG, THINKING_LEVELS } from "./types.js";
-import { Scheduler, type SchedulerEvent } from "./scheduler.js";
+import { Scheduler, type SchedulerEvent, type SchedulerSpawnContext } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
 import { validatePlan, PLAN_STRUCTURE_RULES } from "./plan-rules.js";
 import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
@@ -49,6 +49,38 @@ const REVIEW_INSTRUCTIONS =
 	"(1) check task outputs for QA verdicts (## Verdict: PASS/FAIL) and verification evidence (commands + results); " +
 	"(2) if a task claimed done without evidence, run its Verify command yourself; " +
 	"(3) report to the user what was verified (with evidence) and flag anything unverified — don't just relay the summary.";
+
+/**
+ * Resolve a model string (or null = session default) to its context window.
+ * Reads uiCtx lazily so it always uses the live session's registry.
+ */
+function resolveContextWindow(model: string | null): number | undefined {
+	const ctx = uiCtx;
+	if (!ctx) return undefined;
+	try {
+		if (!model) return ctx.model?.contextWindow;
+		// Strip a :<thinking> suffix if present
+		let clean = model;
+		const lastColon = model.lastIndexOf(":");
+		if (lastColon > 0 && (THINKING_LEVELS as readonly string[]).includes(model.slice(lastColon + 1))) {
+			clean = model.slice(0, lastColon);
+		}
+		const all = ctx.modelRegistry.getAll();
+		const slash = clean.indexOf("/");
+		if (slash > 0) {
+			const provider = clean.slice(0, slash);
+			const id = clean.slice(slash + 1);
+			const m = all.find((x) => x.provider === provider && x.id === id);
+			if (m) return m.contextWindow;
+		}
+		return all.find((x) => x.id === clean)?.contextWindow;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Spawn context shared by all Scheduler instances */
+const schedulerSpawnContext: SchedulerSpawnContext = { resolveContextWindow };
 
 /** Get the active scheduler (for the focused squad) */
 function getActiveScheduler(): Scheduler | null {
@@ -174,6 +206,7 @@ export default function (pi: ExtensionAPI) {
 						description: Type.Optional(Type.String({ description: "Structure as: Goal (outcome first, not steps), Context (files/contracts to read), Output (deliverable), Boundaries (what must NOT change), Verify (command that proves it works). Include only the parts that help." })),
 						agent: Type.String(),
 						depends: Type.Optional(Type.Array(Type.String())),
+						inheritContext: Type.Optional(Type.Boolean({ description: "Fork the current pi session so the agent inherits this conversation's full context. Use ONLY when the task depends on decisions/details discussed here that can't be restated briefly. Costly (agent pays the whole history as input each turn) and auto-skipped when the session exceeds 50% of the agent model's context window — prefer restating key context in the description." })),
 					}),
 					{ description: "Pre-defined task breakdown. If provided, skips the planner agent. Scope tasks to required work only — no optional polish." },
 				),
@@ -194,13 +227,17 @@ export default function (pi: ExtensionAPI) {
 
 			// Multiple squads can run concurrently — no guard needed
 
+			// Resolve to absolute: the fork happens later from a child process whose
+			// cwd may differ (e.g. when a relative --session-dir was used).
+			const rawSessionFile = ctx.sessionManager.getSessionFile();
+			const sessionFile = rawSessionFile ? path.resolve(rawSessionFile) : null;
 			const squadId = store.makeTaskId(params.goal);
 			if (store.squadExists(squadId)) {
 				const uniqueId = `${squadId}-${Date.now().toString(36)}`;
-				return await startSquad(uniqueId, params, ctx.cwd, squadSkillPaths, pi);
+				return await startSquad(uniqueId, params, ctx.cwd, squadSkillPaths, pi, sessionFile);
 			}
 
-			return await startSquad(squadId, params, ctx.cwd, squadSkillPaths, pi);
+			return await startSquad(squadId, params, ctx.cwd, squadSkillPaths, pi, sessionFile);
 		},
 	});
 
@@ -333,6 +370,7 @@ export default function (pi: ExtensionAPI) {
 					description: Type.Optional(Type.String()),
 					agent: Type.String(),
 					depends: Type.Optional(Type.Array(Type.String())),
+					inheritContext: Type.Optional(Type.Boolean({ description: "Fork the current pi session so the agent inherits this conversation's context (see squad tool docs for caveats)" })),
 				}, { description: "Task definition for add_task" }),
 			),
 		}),
@@ -351,7 +389,7 @@ export default function (pi: ExtensionAPI) {
 
 				// Create a fresh scheduler if needed
 				if (!schedulers.has(squadId)) {
-					const scheduler = new Scheduler(squadId, squadSkillPaths);
+					const scheduler = new Scheduler(squadId, squadSkillPaths, schedulerSpawnContext);
 					schedulers.set(squadId, scheduler);
 					activeSquadId = squadId;
 
@@ -446,6 +484,7 @@ export default function (pi: ExtensionAPI) {
 						agent: params.task.agent,
 						status: "pending",
 						depends: params.task.depends || [],
+						...(params.task.inheritContext ? { inheritContext: true } : {}),
 						created: store.now(),
 						started: null,
 						completed: null,
@@ -579,7 +618,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (activeSquadId) {
-						openPanel(ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths), activeSquadId);
+						openPanel(ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext), activeSquadId);
 					}
 					return { consume: true };
 				}
@@ -703,7 +742,7 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 					if (activeSquadId) {
-						const sched = schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths);
+						const sched = schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext);
 						openPanel(ctx, sched, activeSquadId);
 					}
 					return;
@@ -1195,12 +1234,14 @@ async function startSquad(
 			description?: string;
 			agent: string;
 			depends?: string[];
+			inheritContext?: boolean;
 		}>;
 		config?: { maxConcurrency?: number };
 	},
 	cwd: string,
 	skillPaths: string[],
 	pi: ExtensionAPI,
+	sessionFile: string | null = null,
 ) {
 	let plan: PlannerOutput;
 
@@ -1263,6 +1304,7 @@ async function startSquad(
 		status: "running",
 		created: store.now(),
 		cwd,
+		sessionFile,
 		agents,
 		config,
 	};
@@ -1278,6 +1320,7 @@ async function startSquad(
 			agent: taskDef.agent,
 			status: taskDef.depends.length === 0 ? "pending" : "blocked",
 			depends: taskDef.depends,
+			...(taskDef.inheritContext ? { inheritContext: true } : {}),
 			created: store.now(),
 			started: null,
 			completed: null,
@@ -1292,7 +1335,7 @@ async function startSquad(
 	}
 
 	// Start scheduler
-	const scheduler = new Scheduler(squadId, skillPaths);
+	const scheduler = new Scheduler(squadId, skillPaths, schedulerSpawnContext);
 	schedulers.set(squadId, scheduler);
 	activeSquadId = squadId;
 

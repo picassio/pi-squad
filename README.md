@@ -202,6 +202,28 @@ squad({
 })
 ```
 
+### Context Inheritance
+
+Agents normally start fresh with only their task description, dependency outputs, and squad protocol. Set `inheritContext: true` on a task to fork the main pi session (via `pi --fork`) so that agent inherits the full conversation context:
+
+```js
+squad({
+  goal: "Implement the design we discussed",
+  tasks: [
+    { id: "impl", title: "Implement agreed design", agent: "backend",
+      description: "Goal: implement the API design agreed in this conversation. Verify: npm test",
+      inheritContext: true },
+  ],
+})
+```
+
+**Caveats:**
+- **Cost**: the agent pays the entire conversation history as input tokens on every turn — use sparingly
+- **Context-window guard**: the fork is skipped automatically when the estimated session size exceeds 50% of the agent model's context window (agents on smaller-context models silently degrade to standard squad context; the skip is recorded in the task's message log and `debug.log`)
+- Requires the main session to have a session file (skipped under `--no-session`)
+- Forked child sessions are stored under `~/.pi/squad/<squad-id>/sessions/`, not in your project's session list
+- Prefer restating the 3-5 key decisions in the task description — reach for `inheritContext` only when that's impractical
+
 ### Custom Agents
 
 Create `~/.pi/squad/agents/my-agent.json` (global) or `{project}/.pi/squad/agents/my-agent.json` (project override):

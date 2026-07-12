@@ -9,6 +9,8 @@
  * - Detects squad completion
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { AgentDef, Squad, SquadConfig, Task, TaskMessage, TaskStatus } from "./types.js";
 import { AgentPool, type AgentEvent } from "./agent-pool.js";
 import { Monitor } from "./monitor.js";
@@ -44,6 +46,12 @@ export interface SchedulerEvent {
 
 export type SchedulerEventListener = (event: SchedulerEvent) => void;
 
+/** Host-session capabilities passed in by the extension (index.ts) */
+export interface SchedulerSpawnContext {
+	/** Resolve a model string (or null = default model) to its context window in tokens */
+	resolveContextWindow?: (model: string | null) => number | undefined;
+}
+
 // ============================================================================
 // Scheduler
 // ============================================================================
@@ -55,6 +63,7 @@ export class Scheduler {
 	private router: Router;
 	private listeners: SchedulerEventListener[] = [];
 	private skillPaths: string[] = [];
+	private spawnContext?: SchedulerSpawnContext;
 	private running = false;
 	/** Track spawn retries to allow one retry per task */
 	private spawnRetries = new Set<string>();
@@ -64,9 +73,10 @@ export class Scheduler {
 		return store.loadSquad(this.squadId)?.cwd;
 	}
 
-	constructor(squadId: string, skillPaths: string[]) {
+	constructor(squadId: string, skillPaths: string[], spawnContext?: SchedulerSpawnContext) {
 		this.squadId = squadId;
 		this.skillPaths = skillPaths;
+		this.spawnContext = spawnContext;
 		this.pool = new AgentPool();
 		this.monitor = new Monitor(this.pool, squadId);
 		this.router = new Router(this.pool, squadId);
@@ -288,6 +298,9 @@ export class Scheduler {
 			agentName: task.agent,
 		});
 
+		// Decide whether to fork the main session for context inheritance
+		const forkSessionFile = this.resolveForkSession(task, squad, agentDef);
+
 		try {
 			await this.pool.spawn({
 				taskId: task.id,
@@ -302,12 +315,61 @@ export class Scheduler {
 				},
 				cwd: squad.cwd,
 				skillPaths: this.skillPaths,
+				...(forkSessionFile
+					? {
+							forkSession: {
+								file: forkSessionFile,
+								sessionDir: path.join(store.getSquadDir(this.squadId), "sessions"),
+							},
+						}
+					: {}),
 			});
 		} catch (error) {
 			this.handleTaskFailed(task.id, (error as Error).message);
 		}
 
 		this.updateContext();
+	}
+
+	/**
+	 * Decide whether this task's agent should be spawned as a fork of the main
+	 * pi session (context inheritance). Guards against blowing the child model's
+	 * context window: forks only when the estimated session tokens fit within
+	 * 50% of the agent model's context window.
+	 */
+	private resolveForkSession(task: Task, squad: Squad, agentDef: AgentDef): string | undefined {
+		if (!task.inheritContext) return undefined;
+
+		const skip = (reason: string): undefined => {
+			logError("squad-scheduler", `inheritContext skipped for ${task.id}: ${reason}`);
+			store.appendMessage(this.squadId, task.id, {
+				ts: store.now(),
+				from: "system",
+				type: "status",
+				text: `Context inheritance skipped: ${reason}. Agent starts with standard squad context only.`,
+			});
+			return undefined;
+		};
+
+		const sessionFile = squad.sessionFile;
+		if (!sessionFile) return skip("main session has no session file (ephemeral --no-session run)");
+		if (!fs.existsSync(sessionFile)) return skip(`session file not found: ${sessionFile}`);
+
+		// Rough token estimate: JSONL bytes / 4. Overestimates (JSON overhead), which is safe.
+		const estTokens = Math.ceil(fs.statSync(sessionFile).size / 4);
+
+		const window = this.spawnContext?.resolveContextWindow?.(agentDef.model ?? null);
+		if (!window) {
+			return skip(`cannot determine context window for model "${agentDef.model || "(default)"}"`);
+		}
+		if (estTokens > window * 0.5) {
+			return skip(
+				`estimated session context (~${Math.round(estTokens / 1000)}k tokens) exceeds 50% of ${agentDef.model || "default model"}'s ${Math.round(window / 1000)}k window — restate key context in the task description instead`,
+			);
+		}
+
+		debug("squad-scheduler", `inheritContext: forking ${sessionFile} for ${task.id} (~${Math.round(estTokens / 1000)}k tokens, window ${Math.round(window / 1000)}k)`);
+		return sessionFile;
 	}
 
 	// =========================================================================
@@ -652,6 +714,7 @@ export class Scheduler {
 				agent: implTask.agent,
 				status: "pending",
 				depends: [],
+				...(implTask.inheritContext ? { inheritContext: true } : {}),
 				created: store.now(),
 				started: null,
 				completed: null,

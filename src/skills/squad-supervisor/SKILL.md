@@ -43,6 +43,19 @@ When you pass pre-defined `tasks` to the `squad` tool, structure each descriptio
 
 Scope tasks to required work only. Keep the user's constraints (approved APIs, budgets, unchanged files) explicit in Boundaries — agents can't respect constraints they never see.
 
+### Context inheritance (`inheritContext: true`)
+
+Agents normally start fresh with only their task description + dependency outputs. Setting `inheritContext: true` on a task forks the current pi session, so the agent inherits this conversation's full context.
+
+**Use it when** the task genuinely depends on the discussion — e.g. "implement the design we agreed on above", long requirement threads, or decisions scattered across the conversation that can't be restated briefly.
+
+**Avoid it by default**:
+- It's expensive — the agent pays the entire conversation history as input tokens on every turn
+- It's auto-skipped when the estimated session size exceeds 50% of the agent model's context window (a smaller-context model gets NO inherited context, silently degrading to standard behavior — the skip is noted in the task's message log)
+- A well-written task description (Goal/Context/Output/Boundaries/Verify) is usually better than raw history
+
+**Rule of thumb**: restate the 3-5 key decisions in the task description first; reach for `inheritContext` only when that's impractical.
+
 ## When to Use Squad
 
 **Use squad** when the user's request involves:
