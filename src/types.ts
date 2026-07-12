@@ -46,11 +46,25 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export interface SquadSettings {
 	defaultModel: string;
 	defaultThinking: string;
+	advisor: {
+		enabled: boolean;
+		model: string;
+		maxCallsPerTask: number;
+		maxTokens: number;
+		reasoning: string;
+	};
 }
 
 export const DEFAULT_SQUAD_SETTINGS: SquadSettings = {
 	defaultModel: "main",
 	defaultThinking: "main",
+	advisor: {
+		enabled: true,
+		model: "main",
+		maxCallsPerTask: 2,
+		maxTokens: 8192,
+		reasoning: "medium",
+	},
 };
 
 // ============================================================================

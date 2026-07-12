@@ -59,10 +59,14 @@ export function getSquadSettingsPath(): string {
 	return path.join(SQUAD_HOME, "settings.json");
 }
 
-/** Load global squad settings, merged over defaults */
+/** Load global squad settings, merged over defaults (advisor merged deep) */
 export function loadSquadSettings(): SquadSettings {
 	const loaded = readJson<Partial<SquadSettings>>(getSquadSettingsPath());
-	return { ...DEFAULT_SQUAD_SETTINGS, ...(loaded || {}) };
+	return {
+		...DEFAULT_SQUAD_SETTINGS,
+		...(loaded || {}),
+		advisor: { ...DEFAULT_SQUAD_SETTINGS.advisor, ...(loaded?.advisor || {}) },
+	};
 }
 
 export function saveSquadSettings(settings: SquadSettings): void {

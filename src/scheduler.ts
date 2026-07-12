@@ -18,6 +18,7 @@ import { Router } from "./router.js";
 import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
 import { buildAgentSystemPrompt } from "./protocol.js";
+import { buildAdvisorConsultText, formatAdvisorSteerMessage, adviceNeedsHuman, type AdvisorConsultInput } from "./advisor.js";
 
 // ============================================================================
 // Types
@@ -52,6 +53,8 @@ export interface SchedulerSpawnContext {
 	resolveContextWindow?: (model: string | null) => number | undefined;
 	/** Resolve the squad default model/thinking policy (settings.json + main session state) */
 	getDefaultModelThinking?: () => { model?: string; thinking?: string };
+	/** Consult the advisor model with a curated digest. Returns advice text, or null when disabled/unavailable. */
+	consultAdvisor?: (input: AdvisorConsultInput) => Promise<string | null>;
 }
 
 // ============================================================================
@@ -93,11 +96,16 @@ export class Scheduler {
 			} else if (action.type === "abort") {
 				this.handleTaskFailed(action.taskId, action.reason);
 			} else if (action.type === "escalate") {
-				this.emit({
-					type: "escalation",
-					squadId: this.squadId,
-					taskId: action.taskId,
-					message: action.reason,
+				// Advisor-first: try a strong-model rescue before interrupting the human
+				void this.tryAdvisorRescue(action.taskId, action.agentName, action.reason).then((rescued) => {
+					if (rescued) return;
+					this.emit({
+						type: "escalation",
+						squadId: this.squadId,
+						taskId: action.taskId,
+						agentName: action.agentName,
+						message: action.reason,
+					});
 				});
 			}
 		});
@@ -342,6 +350,82 @@ export class Scheduler {
 		}
 
 		this.updateContext();
+	}
+
+	/** Advisor consultations per task (advisor-first escalation) */
+	private advisorAttempts = new Map<string, number>();
+
+	/**
+	 * Consult the advisor for a stuck agent and steer it with the advice.
+	 * Returns true when the agent was steered (escalation suppressed).
+	 * Returns false when the advisor is disabled, exhausted, unavailable,
+	 * failed, or explicitly said the problem needs human input.
+	 */
+	private async tryAdvisorRescue(taskId: string, agentName: string | undefined, reason: string): Promise<boolean> {
+		try {
+			const consult = this.spawnContext?.consultAdvisor;
+			if (!consult) return false;
+
+			const settings = store.loadSquadSettings();
+			if (!settings.advisor.enabled) return false;
+
+			const attempts = this.advisorAttempts.get(taskId) || 0;
+			if (attempts >= settings.advisor.maxCallsPerTask) {
+				debug("squad-advisor", `${taskId}: advisor exhausted (${attempts}/${settings.advisor.maxCallsPerTask}), escalating`);
+				return false;
+			}
+			if (!this.pool.isRunning(taskId)) return false;
+
+			const task = store.loadTask(this.squadId, taskId);
+			const squad = store.loadSquad(this.squadId);
+			if (!task || !squad) return false;
+			const agentDef = store.loadAgentDef(task.agent, squad.cwd);
+			const activity = this.pool.getActivity(taskId);
+
+			this.advisorAttempts.set(taskId, attempts + 1);
+
+			const input: AdvisorConsultInput = {
+				taskId,
+				taskTitle: task.title,
+				taskDescription: task.description,
+				agentName: task.agent,
+				agentRole: agentDef?.role || task.agent,
+				reason,
+				recentMessages: store.loadMessages(this.squadId, taskId).slice(-12).map((m) => ({ from: m.from, type: m.type, text: m.text })),
+				recentToolCalls: activity ? [...activity.recentToolCalls] : [],
+				turnCount: activity?.turnCount || 0,
+				elapsedMinutes: activity ? (Date.now() - activity.startedAt) / 60000 : 0,
+			};
+
+			const advice = await consult(input);
+			if (!advice) return false;
+
+			store.appendMessage(this.squadId, taskId, {
+				ts: store.now(),
+				from: "advisor",
+				type: "message",
+				text: advice,
+			});
+
+			// Advisor says a human decision is required — escalate with the advice attached
+			if (adviceNeedsHuman(advice)) {
+				this.emit({
+					type: "escalation",
+					squadId: this.squadId,
+					taskId,
+					agentName,
+					message: `${reason}\n\nAdvisor assessment:\n${advice.slice(0, 800)}`,
+				});
+				return true; // escalation already emitted with richer context
+			}
+
+			const delivered = await this.pool.steer(taskId, formatAdvisorSteerMessage(advice, reason));
+			debug("squad-advisor", `${taskId}: advisor steered agent (attempt ${attempts + 1}, delivered=${delivered})`);
+			return delivered;
+		} catch (error) {
+			logError("squad-advisor", `rescue failed for ${taskId}: ${(error as Error).message}`);
+			return false;
+		}
 	}
 
 	/**

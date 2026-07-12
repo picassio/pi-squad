@@ -259,6 +259,17 @@ Change interactively with `/squad defaults`. The planner agent follows the same 
 - `tags`: Used by the planner to match agents to tasks automatically.
 - Project-local agents override global agents with the same name.
 
+### Advisor — Self-Healing Squads (`/squad advisor`)
+
+Modeled on the advisor tool pattern ([pi-advisor](https://github.com/RimuruW/pi-advisor) / Anthropic's advisor strategy): when the health monitor flags an agent as stuck, the squad consults a **stronger advisor model in-process** (via pi-ai, no subprocess) with a curated digest — task, recent messages, recent tool activity — before interrupting you.
+
+The advisor returns a verdict (`Course-correct` / `Push through` / `Needs human input`) plus ≤5 action items:
+- **Course-correct / Push through** → advice is steered directly into the stuck agent's conversation; escalation suppressed
+- **Needs human input** → escalates immediately with the advisor's assessment attached
+- Advisor disabled, exhausted (`maxCallsPerTask`), or failed → normal escalation to you
+
+Configure with `/squad advisor` (on/off, model, max calls per task, reasoning effort). Defaults: **enabled**, model = main session's model, 2 calls/task, medium reasoning. Settings persist in `~/.pi/squad/settings.json` under `advisor`. All consultations are recorded in the task's message log (`from: "advisor"`).
+
 ## Reliability
 
 ### Meaningful Work Check

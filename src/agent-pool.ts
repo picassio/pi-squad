@@ -342,10 +342,25 @@ export class AgentPool {
 	}
 
 	private handleRpcEvent(agent: AgentProcess, event: any): void {
-		agent.activity.lastOutputTs = Date.now();
+		// Only genuine agent activity advances the idle clock. Command acks
+		// (type=response) and echoes of injected user messages (steer messages
+		// recorded as user-role message events) must NOT reset it — otherwise the
+		// monitor's own idle/stuck steers keep a silent agent looking "healthy"
+		// forever and escalation (advisor rescue) can never fire.
+		const msgRole = event.message?.role;
+		const isAgentActivity =
+			event.type?.startsWith?.("tool_execution") ||
+			event.type === "turn_start" ||
+			event.type === "turn_end" ||
+			event.type === "agent_start" ||
+			event.type === "agent_end" ||
+			(event.type?.startsWith?.("message_") && msgRole !== "user");
+		if (isAgentActivity) {
+			agent.activity.lastOutputTs = Date.now();
+		}
 
-		// Parse event type and emit
-		if (event.type === "message_end" && event.message) {
+		// Parse event type and emit (user-message echoes don't count as turns)
+		if (event.type === "message_end" && event.message && msgRole !== "user") {
 			agent.activity.turnCount++;
 			this.emit({
 				type: "message_end",

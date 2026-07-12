@@ -11,16 +11,23 @@
 
 import type { AgentPool } from "./agent-pool.js";
 import type { HealthStatus } from "./types.js";
+import { debug } from "./logger.js";
 
 // ============================================================================
 // Config
 // ============================================================================
 
-const IDLE_WARNING_MS = 3 * 60 * 1000; // 3 min no output → warn
-const STUCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 min no output → intervene
-const HARD_CEILING_MS = 30 * 60 * 1000; // 30 min total → force stop
+/** Env-overridable for testing (PI_SQUAD_IDLE_MS etc.) */
+function envMs(name: string, fallback: number): number {
+	const v = Number(process.env[name]);
+	return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+
+const IDLE_WARNING_MS = envMs("PI_SQUAD_IDLE_MS", 3 * 60 * 1000); // no output → warn
+const STUCK_TIMEOUT_MS = envMs("PI_SQUAD_STUCK_MS", 5 * 60 * 1000); // no output → intervene
+const HARD_CEILING_MS = envMs("PI_SQUAD_CEILING_MS", 30 * 60 * 1000); // total → force stop
 const LOOP_THRESHOLD = 5; // same tool call 5x → looping
-const POLL_INTERVAL_MS = 30 * 1000; // check every 30s
+const POLL_INTERVAL_MS = envMs("PI_SQUAD_POLL_MS", 30 * 1000); // check interval
 
 // ============================================================================
 // Types
@@ -51,6 +58,8 @@ export class Monitor {
 	private warned = new Set<string>();
 	/** Track which agents have been steered for stuck (to avoid repeated steers) */
 	private stuckSteered = new Set<string>();
+	/** Track which tasks have been escalated (one escalation per stuck episode) */
+	private escalated = new Set<string>();
 
 	constructor(pool: AgentPool, squadId: string) {
 		this.pool = pool;
@@ -90,6 +99,7 @@ export class Monitor {
 		}
 		this.warned.clear();
 		this.stuckSteered.clear();
+		this.escalated.clear();
 	}
 
 	/** Check all running agents */
@@ -132,11 +142,13 @@ export class Monitor {
 
 	/** Take action based on health status */
 	private handleHealth(taskId: string, agentName: string, status: HealthStatus): void {
+		if (status !== "healthy") debug("squad-monitor", `${taskId} (${agentName}): ${status}`);
 		switch (status) {
 			case "healthy":
-				// Clear warning flags
+				// Clear warning flags — a new stuck episode escalates again
 				this.warned.delete(taskId);
 				this.stuckSteered.delete(taskId);
+				this.escalated.delete(taskId);
 				break;
 
 			case "idle_warning":
@@ -166,8 +178,9 @@ export class Monitor {
 							"Summarize what you've done and what's blocking you. " +
 							"If you can't proceed, state what you need.",
 					});
-				} else {
-					// Already steered once, escalate
+				} else if (!this.escalated.has(taskId)) {
+					// Already steered once — escalate, but only once per stuck episode
+					this.escalated.add(taskId);
 					this.emit({
 						type: "escalate",
 						taskId,

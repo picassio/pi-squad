@@ -19,6 +19,8 @@ import { DEFAULT_SQUAD_CONFIG, THINKING_LEVELS } from "./types.js";
 import { Scheduler, type SchedulerEvent, type SchedulerSpawnContext } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
 import { validatePlan, PLAN_STRUCTURE_RULES } from "./plan-rules.js";
+import { ADVISOR_SYSTEM_PROMPT, buildAdvisorConsultText, type AdvisorConsultInput } from "./advisor.js";
+import { completeSimple, type Message, type TextContent } from "@earendil-works/pi-ai";
 import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
 import { setupSquadWidget, type SquadWidgetState } from "./panel/squad-widget.js";
 import * as store from "./store.js";
@@ -108,10 +110,70 @@ function resolveSquadDefaults(): { model?: string; thinking?: string } {
 	return { model, thinking };
 }
 
+/**
+ * Consult the advisor model in-process via pi-ai (no subprocess).
+ * Returns advice text or null when disabled/unresolvable.
+ */
+async function consultAdvisor(input: AdvisorConsultInput): Promise<string | null> {
+	const ctx = uiCtx;
+	if (!ctx) return null;
+	const settings = store.loadSquadSettings();
+	if (!settings.advisor.enabled) return null;
+
+	try {
+		// Resolve advisor model: "main" = the main session's live model object
+		let model = settings.advisor.model === "main" ? ctx.model : undefined;
+		if (!model && settings.advisor.model !== "main") {
+			const ref = settings.advisor.model;
+			const slash = ref.indexOf("/");
+			if (slash > 0) model = ctx.modelRegistry.find(ref.slice(0, slash), ref.slice(slash + 1));
+		}
+		if (!model) {
+			logError("squad-advisor", `advisor model "${settings.advisor.model}" not resolvable`);
+			return null;
+		}
+
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok || !auth.apiKey) {
+			logError("squad-advisor", `no auth for advisor model ${model.provider}/${model.id}`);
+			return null;
+		}
+
+		const userMessage: Message = {
+			role: "user",
+			content: [{ type: "text", text: buildAdvisorConsultText(input) }],
+			timestamp: Date.now(),
+		} as Message;
+
+		const response = await completeSimple(
+			model,
+			{ systemPrompt: ADVISOR_SYSTEM_PROMPT, messages: [userMessage] },
+			{
+				apiKey: auth.apiKey,
+				headers: auth.headers,
+				maxTokens: settings.advisor.maxTokens,
+				reasoning: settings.advisor.reasoning as never,
+			},
+		);
+
+		const text = response.content
+			.filter((b): b is TextContent => b.type === "text")
+			.map((b) => b.text)
+			.join("\n")
+			.trim();
+		debug("squad-advisor", `consulted ${model.provider}/${model.id} for ${input.taskId}: in=${response.usage?.input ?? 0} out=${response.usage?.output ?? 0}`);
+		return text || null;
+	} catch (error) {
+		logError("squad-advisor", `consult failed: ${(error as Error).message}`);
+		return null;
+	}
+}
+
 /** Spawn context shared by all Scheduler instances */
 const schedulerSpawnContext: SchedulerSpawnContext = {
 	resolveContextWindow,
 	getDefaultModelThinking: resolveSquadDefaults,
+	consultAdvisor,
 };
 
 /** Get the active scheduler (for the focused squad) */
@@ -227,6 +289,14 @@ export default function (pi: ExtensionAPI) {
 			PLAN_STRUCTURE_RULES.replace(/\n- /g, " ").replace(/^- /, ""),
 			"Plans are validated on submission — structural errors are rejected, rule violations come back as warnings.",
 		].join(" "),
+		promptSnippet: "squad({ goal, tasks?, agents? }): decompose complex work into parallel specialist agents → non-blocking, monitor via squad_status",
+		promptGuidelines: [
+			"Use squad when work spans 2+ concerns (backend+frontend+tests+docs) or has natural parallelism",
+			"Skip squad for single-file changes, quick fixes, or anything one agent finishes in minutes",
+			"Providing tasks yourself makes you the planner — follow the planner rules (contract task first, final QA task, 3-7 tasks)",
+			"Act on ⚠️ plan warnings in the response — fix with squad_modify or address at review",
+			"When the squad completes, review evidence like a QA agent before reporting success",
+		],
 		parameters: Type.Object({
 			goal: Type.String({ description: "What the squad should accomplish" }),
 			agents: Type.Optional(
@@ -692,6 +762,7 @@ export default function (pi: ExtensionAPI) {
 				{ value: "select", label: "select", description: "Pick a squad to view (interactive)" },
 				{ value: "agents", label: "agents", description: "List, view, or edit agent definitions" },
 				{ value: "defaults", label: "defaults", description: "Default model/thinking for agents (follow main session, pi default, or fixed)" },
+				{ value: "advisor", label: "advisor", description: "Advisor-first rescue for stuck agents (on/off, model, limits)" },
 				{ value: "msg", label: "msg", description: "Send message to agent: /squad msg [agent] text" },
 				{ value: "widget", label: "widget", description: "Toggle live widget" },
 				{ value: "panel", label: "panel", description: "Toggle overlay panel" },
@@ -1033,6 +1104,47 @@ export default function (pi: ExtensionAPI) {
 						store.saveSquadSettings(settings);
 						ctx.ui.notify(`Squad default thinking → ${fmtPolicy(settings.defaultThinking, mainThinking)}`, "info");
 					}
+					return;
+				}
+
+				case "advisor": {
+					const settings = store.loadSquadSettings();
+					const adv = settings.advisor;
+					const mainModelLabel = getMainSessionModel() || "(unknown)";
+					const modelLabel = adv.model === "main" ? `main session (now: ${mainModelLabel})` : adv.model;
+
+					const choice = await ctx.ui.select(
+						`Squad advisor — ${adv.enabled ? "ON" : "OFF"} | model: ${modelLabel} | ${adv.maxCallsPerTask} calls/task, ${adv.reasoning} reasoning`,
+						[adv.enabled ? "Disable advisor" : "Enable advisor", "Change advisor model", "Change max calls per task", "Change reasoning effort", "Cancel"],
+					);
+					if (!choice || choice === "Cancel") return;
+
+					if (choice.startsWith("Disable") || choice.startsWith("Enable")) {
+						adv.enabled = !adv.enabled;
+						ctx.ui.notify(`Squad advisor ${adv.enabled ? "enabled — stuck agents get a strong-model rescue before escalating" : "disabled — stuck agents escalate directly"}`, "info");
+					} else if (choice === "Change advisor model") {
+						const sel = await ctx.ui.select("Advisor model", [`Follow main session (now: ${mainModelLabel})`, "Custom model…"]);
+						if (!sel) return;
+						if (sel.startsWith("Follow")) adv.model = "main";
+						else {
+							const custom = await ctx.ui.input("Advisor model (provider/id)", adv.model === "main" ? "" : adv.model);
+							if (!custom || !custom.trim()) return;
+							adv.model = custom.trim();
+						}
+						ctx.ui.notify(`Advisor model → ${adv.model}`, "info");
+					} else if (choice === "Change max calls per task") {
+						const n = await ctx.ui.input("Max advisor calls per task", String(adv.maxCallsPerTask));
+						const parsed = n ? Number.parseInt(n, 10) : NaN;
+						if (!Number.isFinite(parsed) || parsed < 0) return;
+						adv.maxCallsPerTask = parsed;
+						ctx.ui.notify(`Advisor max calls/task → ${parsed}`, "info");
+					} else {
+						const lvl = await ctx.ui.select("Advisor reasoning effort", ["minimal", "low", "medium", "high", "xhigh"]);
+						if (!lvl) return;
+						adv.reasoning = lvl;
+						ctx.ui.notify(`Advisor reasoning → ${lvl}`, "info");
+					}
+					store.saveSquadSettings(settings);
 					return;
 				}
 
