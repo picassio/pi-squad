@@ -2,8 +2,8 @@
  * task-list.ts — Task tree view with status icons, live activity preview.
  */
 
-import type { Theme } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth } from "@mariozechner/pi-tui";
+import type { Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { Task, TaskStatus } from "../types.js";
 import type { Scheduler } from "../scheduler.js";
 import * as store from "../store.js";

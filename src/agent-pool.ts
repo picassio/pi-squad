@@ -375,13 +375,6 @@ export class AgentPool {
 				agentName: agent.agentName,
 				data: event,
 			});
-		} else if (event.type === "tool_result_end") {
-			this.emit({
-				type: "tool_execution_end",
-				taskId: agent.taskId,
-				agentName: agent.agentName,
-				data: event,
-			});
 		} else if (event.type === "agent_end") {
 			// Pi RPC mode emits agent_end when the agent loop finishes.
 			// The RPC process stays alive waiting for more commands,

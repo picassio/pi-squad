@@ -610,7 +610,7 @@ export class Scheduler {
 		const allTasks = store.loadAllTasks(this.squadId);
 		const implDeps = task.depends
 			.map((depId) => allTasks.find((t) => t.id === depId))
-			.filter((t): t is Task => t !== null && !qaAgents.includes(t.agent));
+			.filter((t): t is Task => t !== undefined && !qaAgents.includes(t.agent));
 
 		if (implDeps.length === 0) return false;
 
