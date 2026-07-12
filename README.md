@@ -100,6 +100,7 @@ Bundled agent definitions are copied to `~/.pi/squad/agents/` on first run. Edit
 | `frontend` | Frontend Engineer | react, ui, css, tailwind, accessibility |
 | `fullstack` | Fullstack Developer | general, coding, implementation |
 | `qa` | QA Engineer | testing, verification, e2e |
+| `reviewer` | Code Reviewer (read-only) | review, code-quality, over-engineering |
 | `security` | Security Engineer | audit, vulnerability, threat-modeling |
 | `debugger` | Debugger & Root Cause Analyst | debugging, investigation, bugs |
 | `devops` | DevOps Engineer | ci-cd, docker, deployment |

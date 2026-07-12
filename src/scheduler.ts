@@ -761,7 +761,7 @@ export class Scheduler {
 	 */
 	private checkForRework(task: Task, output: string): boolean {
 		// Only trigger rework for QA/test agent tasks
-		const qaAgents = ["qa", "tester", "security"];
+		const qaAgents = ["qa", "tester", "security", "reviewer"];
 		if (!qaAgents.includes(task.agent)) return false;
 
 		// Parse verdict from output
