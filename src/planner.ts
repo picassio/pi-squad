@@ -63,6 +63,7 @@ export async function runPlanner(options: PlannerOptions): Promise<PlannerOutput
 			prompt: `Read the prompt file at ${promptFile} and follow the instructions.`,
 			systemPromptFile: systemFile,
 			model: model || plannerDef?.model || undefined,
+			thinking: plannerDef?.thinking || undefined,
 		});
 
 		const agentNames = new Set(allAgents.map((a) => a.name));
@@ -87,13 +88,15 @@ interface PiJsonOptions {
 	prompt: string;
 	systemPromptFile?: string;
 	model?: string;
+	thinking?: string;
 }
 
 async function runPiJson(options: PiJsonOptions): Promise<string> {
-	const { cwd, prompt, systemPromptFile, model } = options;
+	const { cwd, prompt, systemPromptFile, model, thinking } = options;
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (model) args.push("--model", model);
+	if (thinking) args.push("--thinking", thinking);
 	if (systemPromptFile) args.push("--append-system-prompt", systemPromptFile);
 	args.push(prompt);
 
@@ -244,7 +247,7 @@ Respond with a JSON object (and nothing else outside the JSON):
 {
   "agents": {
     "agent-name": {},
-    "agent-name": { "model": "override-model-if-needed" }
+    "agent-name": { "model": "override-model-if-needed", "thinking": "high" }
   },
   "tasks": [
     {
@@ -264,6 +267,7 @@ Respond with a JSON object (and nothing else outside the JSON):
 - Dependencies must reference task IDs from your own plan
 - First task(s) should have empty depends: []
 - Include a final QA/verification task if there are user-facing changes
+- Agent overrides are optional: "model" (a pi model id) and "thinking" (one of: off, minimal, low, medium, high, xhigh, max). Omit both to use defaults. Raise "thinking" only for tasks needing deep reasoning (architecture, security)
 - Keep descriptions actionable — agent should know exactly what to build
 - Don't over-decompose — 3-7 tasks is usually right for most goals
 

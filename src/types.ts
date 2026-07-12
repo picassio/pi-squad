@@ -11,6 +11,8 @@ export interface AgentDef {
 	description: string;
 	/** Override model (null = squad default or pi default) */
 	model: string | null;
+	/** Thinking level: off, minimal, low, medium, high, xhigh, max (null = pi default) */
+	thinking?: string | null;
 	/** Override tool list (null = all standard tools) */
 	tools: string[] | null;
 	/** Tags for planner's automatic agent matching */
@@ -24,7 +26,12 @@ export interface AgentDef {
 /** Agent entry in squad.json — just overrides, references an AgentDef by key */
 export interface SquadAgentEntry {
 	model?: string | null;
+	thinking?: string | null;
 }
+
+/** Valid thinking levels accepted by pi's --thinking flag */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 // ============================================================================
 // Squad
@@ -196,7 +203,7 @@ export interface SupervisorResult {
 // ============================================================================
 
 export interface PlannerOutput {
-	agents: Record<string, { model?: string }>;
+	agents: Record<string, { model?: string; thinking?: string }>;
 	tasks: Array<{
 		id: string;
 		title: string;

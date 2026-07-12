@@ -196,7 +196,8 @@ squad({
     maxRetries: 2,      // QA rework attempts before escalation (default: 2)
   },
   agents: {
-    backend: { model: "claude-sonnet-4-20250514" },  // per-agent model override
+    backend: { model: "claude-sonnet-4-20250514" },   // per-agent model override
+    architect: { thinking: "high" },                   // per-agent thinking level
   },
 })
 ```
@@ -211,6 +212,7 @@ Create `~/.pi/squad/agents/my-agent.json` (global) or `{project}/.pi/squad/agent
   "role": "ML Engineer",
   "description": "Machine learning, PyTorch, data pipelines",
   "model": null,
+  "thinking": null,
   "tools": null,
   "tags": ["ml", "pytorch", "data"],
   "prompt": "You are an ML engineer specializing in PyTorch..."
@@ -218,6 +220,7 @@ Create `~/.pi/squad/agents/my-agent.json` (global) or `{project}/.pi/squad/agent
 ```
 
 - `model`: `null` = use pi's default model. Override per agent or per squad.
+- `thinking`: `null` = pi's default. One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (passed to the agent via pi's `--thinking` flag). Override per agent or per squad. Also editable interactively via `/squad agents` → "Change thinking".
 - `tools`: `null` = all tools. Restrict with `["bash", "read", "write", "edit"]`.
 - `tags`: Used by the planner to match agents to tasks automatically.
 - Project-local agents override global agents with the same name.

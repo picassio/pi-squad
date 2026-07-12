@@ -248,10 +248,13 @@ export class Scheduler {
 			return;
 		}
 
-		// Apply squad-level model override
+		// Apply squad-level model/thinking overrides
 		const squadAgentEntry = squad.agents[task.agent];
 		if (squadAgentEntry?.model) {
 			agentDef.model = squadAgentEntry.model;
+		}
+		if (squadAgentEntry?.thinking) {
+			agentDef.thinking = squadAgentEntry.thinking;
 		}
 
 		// Build modified files map from all running agents

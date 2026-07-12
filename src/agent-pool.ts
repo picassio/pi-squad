@@ -166,7 +166,7 @@ export class AgentPool {
 
 		// Spawn pi process — set env var to prevent recursive squad extension loading
 		const invocation = getPiInvocation(["--mode", "rpc", ...args]);
-		debug("squad-pool", `spawn ${agentDef.name}: ${invocation.command} ${invocation.args.slice(0, 3).join(" ")} ...`);
+		debug("squad-pool", `spawn ${agentDef.name}: ${invocation.command} ${invocation.args.join(" ")}`);
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
@@ -424,6 +424,10 @@ function buildPiArgs(agentDef: AgentDef, promptFile: string, skillPaths: string[
 
 	if (agentDef.model) {
 		args.push("--model", agentDef.model);
+	}
+
+	if (agentDef.thinking) {
+		args.push("--thinking", agentDef.thinking);
 	}
 
 	if (agentDef.tools && agentDef.tools.length > 0) {

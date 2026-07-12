@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Squad, Task, SquadConfig, PlannerOutput } from "./types.js";
-import { DEFAULT_SQUAD_CONFIG } from "./types.js";
+import { DEFAULT_SQUAD_CONFIG, THINKING_LEVELS } from "./types.js";
 import { Scheduler, type SchedulerEvent } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
 import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
@@ -146,9 +146,10 @@ export default function (pi: ExtensionAPI) {
 				Type.Record(
 					Type.String(),
 					Type.Object({
-						model: Type.Optional(Type.String()),
+						model: Type.Optional(Type.String({ description: "Model override (e.g. 'github-copilot/claude-sonnet-5')" })),
+						thinking: Type.Optional(Type.String({ description: "Thinking level: off, minimal, low, medium, high, xhigh, max" })),
 					}),
-					{ description: "Agent roster with optional model overrides. Keys must match agent names in .pi/squad/agents/" },
+					{ description: "Agent roster with optional model/thinking overrides. Keys must match agent names in .pi/squad/agents/" },
 				),
 			),
 			tasks: Type.Optional(
@@ -892,7 +893,7 @@ export default function (pi: ExtensionAPI) {
 							return;
 						}
 						const options = allAgents.map((a) => {
-							const model = a.model ? ` [${a.model}]` : " [default]";
+							const model = a.model ? ` [${a.model}${a.thinking ? `:${a.thinking}` : ""}]` : a.thinking ? ` [default:${a.thinking}]` : " [default]";
 							const status = a.disabled ? " ✗ disabled" : "";
 							return `${a.name} — ${a.role}${model}${status}`;
 						});
@@ -908,6 +909,7 @@ export default function (pi: ExtensionAPI) {
 							"View details",
 							"Edit in editor",
 							"Change model",
+							"Change thinking",
 							"Toggle tools (restrict/unrestrict)",
 							disableLabel,
 							"Cancel",
@@ -921,6 +923,7 @@ export default function (pi: ExtensionAPI) {
 								`Role: ${agent.role}`,
 								`Description: ${agent.description}`,
 								`Model: ${agent.model || "(default)"}`,
+								`Thinking: ${agent.thinking || "(default)"}`,
 								`Tools: ${agent.tools ? agent.tools.join(", ") : "(all)"}`,
 								`Tags: ${agent.tags.join(", ")}`,
 								``,
@@ -949,6 +952,14 @@ export default function (pi: ExtensionAPI) {
 								agent.model = newModel.trim() || null;
 								store.saveAgentDef(agent);
 								ctx.ui.notify(`${agent.name} model → ${agent.model || "(default)"}`, "info");
+							}
+						} else if (action === "Change thinking") {
+							const levels = ["(default)", ...THINKING_LEVELS];
+							const level = await ctx.ui.select(`Thinking level for ${agent.name}`, levels);
+							if (level !== undefined) {
+								agent.thinking = level === "(default)" ? null : level;
+								store.saveAgentDef(agent);
+								ctx.ui.notify(`${agent.name} thinking → ${agent.thinking || "(default)"}`, "info");
 							}
 						} else if (action === disableLabel) {
 							agent.disabled = !agent.disabled;
@@ -983,6 +994,7 @@ export default function (pi: ExtensionAPI) {
 							`${agent.name} — ${agent.role}${status}`,
 							`${agent.description}`,
 							`Model: ${agent.model || "(default)"}`,
+							`Thinking: ${agent.thinking || "(default)"}`,
 							`Tools: ${agent.tools ? agent.tools.join(", ") : "(all)"}`,
 							`Tags: ${agent.tags.join(", ")}`,
 						].join("\n");
@@ -1148,7 +1160,7 @@ async function startSquad(
 	squadId: string,
 	params: {
 		goal: string;
-		agents?: Record<string, { model?: string }>;
+		agents?: Record<string, { model?: string; thinking?: string }>;
 		tasks?: Array<{
 			id: string;
 			title: string;
@@ -1195,7 +1207,7 @@ async function startSquad(
 	}
 
 	// Merge agent roster
-	const agents: Record<string, { model?: string }> = { ...plan.agents };
+	const agents: Record<string, { model?: string; thinking?: string }> = { ...plan.agents };
 	if (params.agents) {
 		for (const [name, entry] of Object.entries(params.agents)) {
 			agents[name] = { ...agents[name], ...entry };
