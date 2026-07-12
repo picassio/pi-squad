@@ -79,8 +79,40 @@ function resolveContextWindow(model: string | null): number | undefined {
 	}
 }
 
+/** Main session's current model as "provider/id", if known */
+function getMainSessionModel(): string | undefined {
+	try {
+		const m = uiCtx?.model;
+		return m ? `${m.provider}/${m.id}` : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Main session's current thinking level (set inside the extension entry, needs `pi`) */
+let getMainSessionThinking: () => string | undefined = () => undefined;
+
+/**
+ * Resolve the effective squad defaults from ~/.pi/squad/settings.json.
+ * "main" follows the live main session; "pi-default" leaves values unset
+ * (child pi resolves its own default); anything else is an explicit value.
+ */
+function resolveSquadDefaults(): { model?: string; thinking?: string } {
+	const settings = store.loadSquadSettings();
+	let model: string | undefined;
+	if (settings.defaultModel === "main") model = getMainSessionModel();
+	else if (settings.defaultModel !== "pi-default") model = settings.defaultModel;
+	let thinking: string | undefined;
+	if (settings.defaultThinking === "main") thinking = getMainSessionThinking();
+	else if (settings.defaultThinking !== "pi-default") thinking = settings.defaultThinking;
+	return { model, thinking };
+}
+
 /** Spawn context shared by all Scheduler instances */
-const schedulerSpawnContext: SchedulerSpawnContext = { resolveContextWindow };
+const schedulerSpawnContext: SchedulerSpawnContext = {
+	resolveContextWindow,
+	getDefaultModelThinking: resolveSquadDefaults,
+};
 
 /** Get the active scheduler (for the focused squad) */
 function getActiveScheduler(): Scheduler | null {
@@ -96,6 +128,15 @@ function getActiveScheduler(): Scheduler | null {
 export default function (pi: ExtensionAPI) {
 	// Don't load in child agent processes (prevent recursive squad-in-squad)
 	if (process.env.PI_SQUAD_CHILD === "1") return;
+
+	// Wire main-session thinking lookup (needs `pi`, guarded against stale API)
+	getMainSessionThinking = () => {
+		try {
+			return pi.getThinkingLevel();
+		} catch {
+			return undefined;
+		}
+	};
 
 	// Bootstrap default agents on first load
 	const defaultsDir = path.join(path.dirname(new URL(import.meta.url).pathname), "agents", "_defaults");
@@ -650,6 +691,7 @@ export default function (pi: ExtensionAPI) {
 				{ value: "all", label: "all", description: "List all squads, select to activate" },
 				{ value: "select", label: "select", description: "Pick a squad to view (interactive)" },
 				{ value: "agents", label: "agents", description: "List, view, or edit agent definitions" },
+				{ value: "defaults", label: "defaults", description: "Default model/thinking for agents (follow main session, pi default, or fixed)" },
 				{ value: "msg", label: "msg", description: "Send message to agent: /squad msg [agent] text" },
 				{ value: "widget", label: "widget", description: "Toggle live widget" },
 				{ value: "panel", label: "panel", description: "Toggle overlay panel" },
@@ -949,6 +991,51 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 
+				case "defaults": {
+					const settings = store.loadSquadSettings();
+					const mainModel = getMainSessionModel() || "(unknown)";
+					const mainThinking = getMainSessionThinking() || "(unknown)";
+					const fmtPolicy = (v: string, live: string) =>
+						v === "main" ? `follow main session (now: ${live})` : v === "pi-default" ? "pi default" : v;
+
+					const which = await ctx.ui.select(
+						`Squad defaults — model: ${fmtPolicy(settings.defaultModel, mainModel)} | thinking: ${fmtPolicy(settings.defaultThinking, mainThinking)}`,
+						["Change default model", "Change default thinking", "Cancel"],
+					);
+					if (!which || which === "Cancel") return;
+
+					if (which === "Change default model") {
+						const choice = await ctx.ui.select("Default model for squad agents", [
+							`Follow main session (now: ${mainModel})`,
+							"pi default (child pi resolves its own)",
+							"Custom model…",
+						]);
+						if (!choice) return;
+						if (choice.startsWith("Follow")) settings.defaultModel = "main";
+						else if (choice.startsWith("pi default")) settings.defaultModel = "pi-default";
+						else {
+							const custom = await ctx.ui.input("Model id (e.g. openai-codex/gpt-5.6-terra)", settings.defaultModel === "main" || settings.defaultModel === "pi-default" ? "" : settings.defaultModel);
+							if (!custom || !custom.trim()) return;
+							settings.defaultModel = custom.trim();
+						}
+						store.saveSquadSettings(settings);
+						ctx.ui.notify(`Squad default model → ${fmtPolicy(settings.defaultModel, mainModel)}`, "info");
+					} else {
+						const choice = await ctx.ui.select("Default thinking for squad agents", [
+							`Follow main session (now: ${mainThinking})`,
+							"pi default (child pi resolves its own)",
+							...THINKING_LEVELS,
+						]);
+						if (!choice) return;
+						if (choice.startsWith("Follow")) settings.defaultThinking = "main";
+						else if (choice.startsWith("pi default")) settings.defaultThinking = "pi-default";
+						else settings.defaultThinking = choice;
+						store.saveSquadSettings(settings);
+						ctx.ui.notify(`Squad default thinking → ${fmtPolicy(settings.defaultThinking, mainThinking)}`, "info");
+					}
+					return;
+				}
+
 				case "agents": {
 					const agentArg = parts[1];
 					const allAgents = store.loadAllAgentDefs(ctx.cwd);
@@ -1079,7 +1166,7 @@ export default function (pi: ExtensionAPI) {
 						activateSquadView(direct.id, ctx);
 						return;
 					}
-					ctx.ui.notify(`Unknown: /squad ${sub}. Try: list, all, select, widget, panel, cancel, clear`, "warning");
+					ctx.ui.notify(`Unknown: /squad ${sub}. Try: list, all, select, agents, defaults, msg, widget, panel, cancel, clear, cleanup`, "warning");
 			}
 		},
 	});
@@ -1266,9 +1353,10 @@ async function startSquad(
 			}
 		}
 	} else {
-		// Run planner to generate task breakdown
+		// Run planner to generate task breakdown (squad default policy as fallback)
 		try {
-			plan = await runPlanner({ goal: params.goal, cwd });
+			const defaults = resolveSquadDefaults();
+			plan = await runPlanner({ goal: params.goal, cwd, fallbackModel: defaults.model, fallbackThinking: defaults.thinking });
 		} catch (error) {
 			// Throwing marks the tool result as an error for the LLM (returning isError is ignored in current pi)
 			throw new Error(`Failed to plan: ${(error as Error).message}`);

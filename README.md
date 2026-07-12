@@ -241,8 +241,20 @@ Create `~/.pi/squad/agents/my-agent.json` (global) or `{project}/.pi/squad/agent
 }
 ```
 
-- `model`: `null` = use pi's default model. Override per agent or per squad.
-- `thinking`: `null` = pi's default. One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (passed to the agent via pi's `--thinking` flag). Override per agent or per squad. Also editable interactively via `/squad agents` → "Change thinking".
+- `model`: `null` = squad default (see below). Override per agent or per squad.
+- `thinking`: `null` = squad default. One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (passed via pi's `--thinking` flag). Override per agent or per squad. Also editable via `/squad agents` → "Change thinking".
+
+### Default Model & Thinking (`/squad defaults`)
+
+Agents without an explicit `model`/`thinking` follow the squad default policy (stored in `~/.pi/squad/settings.json`):
+
+| Policy | Behavior |
+|---|---|
+| `main` *(default)* | **Follow the main pi session's current model and thinking level** — switch models mid-session and new agents follow |
+| `pi-default` | Legacy behavior: the child pi process resolves its own configured default |
+| explicit value | A fixed model id (e.g. `openai-codex/gpt-5.6-terra`) or thinking level |
+
+Change interactively with `/squad defaults`. The planner agent follows the same policy. Resolution order: agent def → per-squad override → squad default policy.
 - `tools`: `null` = all tools. Restrict with `["bash", "read", "write", "edit"]`.
 - `tags`: Used by the planner to match agents to tasks automatically.
 - Project-local agents override global agents with the same name.

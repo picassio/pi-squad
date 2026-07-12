@@ -22,6 +22,10 @@ export interface PlannerOptions {
 	cwd: string;
 	/** If provided, use this model for planning instead of the planner agent's default */
 	model?: string;
+	/** Fallback model when neither `model` nor the planner agent def specifies one (squad default policy) */
+	fallbackModel?: string;
+	/** Fallback thinking level when the planner agent def doesn't specify one (squad default policy) */
+	fallbackThinking?: string;
 }
 
 /**
@@ -29,7 +33,7 @@ export interface PlannerOptions {
  * Returns the parsed plan or throws on failure.
  */
 export async function runPlanner(options: PlannerOptions): Promise<PlannerOutput> {
-	const { goal, cwd, model } = options;
+	const { goal, cwd, model, fallbackModel, fallbackThinking } = options;
 
 	const plannerDef = loadAgentDef("planner", cwd);
 	const allAgents = loadAllAgentDefs(cwd).filter((a) => a.name !== "planner" && !a.disabled);
@@ -63,8 +67,8 @@ export async function runPlanner(options: PlannerOptions): Promise<PlannerOutput
 			cwd,
 			prompt: `Read the prompt file at ${promptFile} and follow the instructions.`,
 			systemPromptFile: systemFile,
-			model: model || plannerDef?.model || undefined,
-			thinking: plannerDef?.thinking || undefined,
+			model: model || plannerDef?.model || fallbackModel || undefined,
+			thinking: plannerDef?.thinking || fallbackThinking || undefined,
 		});
 
 		const agentNames = new Set(allAgents.map((a) => a.name));

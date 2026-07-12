@@ -50,6 +50,8 @@ export type SchedulerEventListener = (event: SchedulerEvent) => void;
 export interface SchedulerSpawnContext {
 	/** Resolve a model string (or null = default model) to its context window in tokens */
 	resolveContextWindow?: (model: string | null) => number | undefined;
+	/** Resolve the squad default model/thinking policy (settings.json + main session state) */
+	getDefaultModelThinking?: () => { model?: string; thinking?: string };
 }
 
 // ============================================================================
@@ -265,6 +267,17 @@ export class Scheduler {
 		}
 		if (squadAgentEntry?.thinking) {
 			agentDef.thinking = squadAgentEntry.thinking;
+		}
+
+		// Apply squad defaults for anything still unset (policy resolved by the
+		// extension host: "main" = main session's model/thinking, "pi-default" =
+		// leave unset, or an explicit value from ~/.pi/squad/settings.json)
+		const defaults = this.spawnContext?.getDefaultModelThinking?.();
+		if (!agentDef.model && defaults?.model) {
+			agentDef.model = defaults.model;
+		}
+		if (!agentDef.thinking && defaults?.thinking) {
+			agentDef.thinking = defaults.thinking;
 		}
 
 		// Build modified files map from all running agents

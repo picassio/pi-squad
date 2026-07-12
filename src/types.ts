@@ -34,6 +34,26 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 // ============================================================================
+// Squad Settings (global, ~/.pi/squad/settings.json)
+// ============================================================================
+
+/**
+ * Default model/thinking policy for agents whose def doesn't set one.
+ * - "main": follow the main pi session's current model / thinking level (default)
+ * - "pi-default": let the child pi process resolve its own configured default
+ * - any other string: an explicit model id (defaultModel) or thinking level (defaultThinking)
+ */
+export interface SquadSettings {
+	defaultModel: string;
+	defaultThinking: string;
+}
+
+export const DEFAULT_SQUAD_SETTINGS: SquadSettings = {
+	defaultModel: "main",
+	defaultThinking: "main",
+};
+
+// ============================================================================
 // Squad
 // ============================================================================
 

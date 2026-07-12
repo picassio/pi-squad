@@ -49,6 +49,26 @@ export function getGlobalAgentsDir(): string {
 	return path.join(SQUAD_HOME, "agents");
 }
 
+// ============================================================================
+// Squad Settings (~/.pi/squad/settings.json)
+// ============================================================================
+
+import { DEFAULT_SQUAD_SETTINGS, type SquadSettings } from "./types.js";
+
+export function getSquadSettingsPath(): string {
+	return path.join(SQUAD_HOME, "settings.json");
+}
+
+/** Load global squad settings, merged over defaults */
+export function loadSquadSettings(): SquadSettings {
+	const loaded = readJson<Partial<SquadSettings>>(getSquadSettingsPath());
+	return { ...DEFAULT_SQUAD_SETTINGS, ...(loaded || {}) };
+}
+
+export function saveSquadSettings(settings: SquadSettings): void {
+	writeJsonAtomic(getSquadSettingsPath(), settings);
+}
+
 /** Project-local agent directory (overrides global) */
 export function getLocalAgentsDir(projectCwd: string): string {
 	return path.join(projectCwd, ".pi", "squad", "agents");
