@@ -253,7 +253,7 @@ Respond with a JSON object (and nothing else outside the JSON):
     {
       "id": "short-kebab-id",
       "title": "Human-readable task title",
-      "description": "Detailed description of what to implement",
+      "description": "Goal: the outcome to achieve. Context: relevant files/contracts to read. Output: expected deliverable and format. Boundaries: what must NOT change. Verify: command or check that proves it works.",
       "agent": "agent-name",
       "depends": ["id-of-dependency", "another-dependency"]
     }
@@ -268,8 +268,16 @@ Respond with a JSON object (and nothing else outside the JSON):
 - First task(s) should have empty depends: []
 - Include a final QA/verification task if there are user-facing changes
 - Agent overrides are optional: "model" (a pi model id) and "thinking" (one of: off, minimal, low, medium, high, xhigh, max). Omit both to use defaults. Raise "thinking" only for tasks needing deep reasoning (architecture, security)
-- Keep descriptions actionable — agent should know exactly what to build
 - Don't over-decompose — 3-7 tasks is usually right for most goals
+
+## Task Descriptions
+Structure each description around these parts (include only the parts that help):
+- **Goal**: the outcome, stated first. Describe the result, not step-by-step process — prescribe steps only when the process itself matters
+- **Context**: the specific files, contracts, or dependency outputs the agent should read — name where to look, don't dump everything
+- **Output**: the expected deliverable — files, format, level of detail
+- **Boundaries**: what must stay unchanged (public APIs, schemas, config), what the agent must not do, and anything requiring escalation instead of guessing
+- **Verify**: the exact command or check that proves the task is done (e.g. "npm test -- auth", "curl /api/health returns 200")
+- Scope tasks to required work only — no optional polish or nice-to-haves unless the goal asks for them
 
 ## Shared Contracts
 - When tasks share an interface (e.g., API endpoints, database schema, data formats), create a design/architecture task first that defines the contract, and make consuming tasks depend on it

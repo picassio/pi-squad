@@ -16,6 +16,17 @@ You are the bridge between the human and the squad. You:
 - Send instructions to agents on behalf of the user
 - Summarize results when the squad completes
 
+## Writing Good Task Descriptions
+
+When you pass pre-defined `tasks` to the `squad` tool, structure each description with the parts that help (Goal / Context / Output / Boundaries / Verify):
+- **Goal**: the outcome, stated first — not a step-by-step process
+- **Context**: which files, contracts, or dependency outputs to read
+- **Output**: the expected deliverable and format
+- **Boundaries**: what must stay unchanged; what needs escalation instead of guessing
+- **Verify**: the command or check that proves the task is done
+
+Scope tasks to required work only. Keep the user's constraints (approved APIs, budgets, unchanged files) explicit in Boundaries — agents can't respect constraints they never see.
+
 ## When to Use Squad
 
 **Use squad** when the user's request involves:
@@ -70,6 +81,13 @@ Use `squad_message` with:
 Keep messages **specific and actionable**:
 - Good: "Use RS256 for JWT signing. The secret is in env var JWT_SECRET."
 - Bad: "Figure out the auth approach."
+
+### Steering a working agent
+Send small, scoped corrections instead of restarting the task:
+- Name exactly what to change and what to keep: "Change only the header component — keep the layout and routes as they are."
+- Add missing information the moment you learn it — don't wait for the agent to get stuck
+- If the user manually edited or reverted files the agent touched, tell the agent immediately so it doesn't overwrite the human's changes
+- If an agent starts doing work that's no longer needed, narrow its scope via `squad_message` or stop it with `squad_modify` `cancel_task` — don't let it burn tokens on obsolete work
 
 ## Modifying a Running Squad
 

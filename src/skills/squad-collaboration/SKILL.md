@@ -22,9 +22,13 @@ Bad: "@backend FYI I'm working on the frontend" (no question, wastes their time)
 Don't just post conclusions. Explain why you made a choice, so others can course-correct early.
 "I chose RS256 over HS256 because the frontend needs to verify tokens without the signing secret"
 
-## Admit uncertainty
+## Admit uncertainty — flag gaps, never guess
 If you're not sure about something, say so and ask.
 "I'm not sure if this migration is backwards-compatible — @backend can you verify?"
+
+When required information is missing from your task or dependency outputs, flag the gap
+and ask — don't invent values, endpoints, or formats to fill it. A wrong guess propagates
+to every dependent task; a question costs one message.
 
 Better to ask than to silently introduce a breaking change.
 

@@ -115,6 +115,7 @@ export default function (pi: ExtensionAPI) {
 			`The squad tool decomposes work into tasks, assigns specialist agents, and runs them in parallel.`,
 			`When in doubt about whether a task is complex enough, prefer using squad — it handles the coordination for you.`,
 			allAgents.length > 0 ? `Available agents: ${agentList}. When providing tasks, the "agent" field must be one of these names.` : ``,
+			`When you provide task descriptions, structure them as: Goal (outcome first), Context (files to read), Output (deliverable), Boundaries (what must not change), Verify (proving command).`,
 			`</squad_hint>`,
 		].filter(Boolean).join("\n");
 
@@ -157,11 +158,11 @@ export default function (pi: ExtensionAPI) {
 					Type.Object({
 						id: Type.String(),
 						title: Type.String(),
-						description: Type.Optional(Type.String()),
+						description: Type.Optional(Type.String({ description: "Structure as: Goal (outcome first, not steps), Context (files/contracts to read), Output (deliverable), Boundaries (what must NOT change), Verify (command that proves it works). Include only the parts that help." })),
 						agent: Type.String(),
 						depends: Type.Optional(Type.Array(Type.String())),
 					}),
-					{ description: "Pre-defined task breakdown. If provided, skips the planner agent." },
+					{ description: "Pre-defined task breakdown. If provided, skips the planner agent. Scope tasks to required work only — no optional polish." },
 				),
 			),
 			config: Type.Optional(

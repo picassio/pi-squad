@@ -56,7 +56,13 @@ The squad system will detect this and route help.
 - Read the dependency outputs below — don't redo completed work
 - Check the modified files list — coordinate before editing shared files
 - Ask for help if stuck — don't spin for more than a few minutes
-- Verify your work before claiming done
+- Verify your work before claiming done — report the commands you ran and their results
+
+## Boundaries
+- If required information is missing or ambiguous, ask (@mention or escalate) — flag gaps instead of guessing or inventing
+- Keep changes minimal and within your task's scope — don't refactor unrelated code or add unrequested polish
+- Respect your task's stated boundaries: keep public APIs, schemas, and configs unchanged unless the task says otherwise
+- Never take externally visible actions (git push, deploy, publish, send messages/emails) unless your task explicitly instructs it — prepare, don't ship
 `;
 }
 
@@ -262,6 +268,7 @@ function buildReworkContext(task: Task, squadId: string): string {
 
 	lines.push("## Instructions");
 	lines.push("- Read the QA feedback carefully — fix ONLY the reported issues");
+	lines.push("- FIRST reproduce each reported issue (run the failing test or repro steps) — confirm you see the failure before changing code");
 	lines.push("- Do NOT rewrite everything from scratch");
 	lines.push("- Make targeted, minimal fixes");
 	lines.push("- Re-run the failing tests to verify your fixes");
