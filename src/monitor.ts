@@ -5,8 +5,11 @@
  * - Idle timeout (no output for N minutes)
  * - Stuck detection (no output for longer)
  * - Loop detection (same tool call repeated)
- * - Hard ceiling (max total runtime)
+ * - Long-running check-in (notify the main session; never aborts)
  * - File conflict warnings
+ *
+ * The monitor NEVER kills or blocks work on its own. Its strongest action is
+ * `notify`: tell the main Pi session so a human/main agent can check in.
  */
 
 import type { AgentPool } from "./agent-pool.js";
@@ -25,7 +28,7 @@ function envMs(name: string, fallback: number): number {
 
 const IDLE_WARNING_MS = envMs("PI_SQUAD_IDLE_MS", 3 * 60 * 1000); // no output → warn
 const STUCK_TIMEOUT_MS = envMs("PI_SQUAD_STUCK_MS", 5 * 60 * 1000); // no output → intervene
-const HARD_CEILING_MS = envMs("PI_SQUAD_CEILING_MS", 30 * 60 * 1000); // total → force stop
+const LONG_RUN_NOTIFY_MS = envMs("PI_SQUAD_CEILING_MS", 30 * 60 * 1000); // total → notify main session (no abort)
 const LOOP_THRESHOLD = 5; // same tool call 5x → looping
 const POLL_INTERVAL_MS = envMs("PI_SQUAD_POLL_MS", 30 * 1000); // check interval
 
@@ -33,7 +36,7 @@ const POLL_INTERVAL_MS = envMs("PI_SQUAD_POLL_MS", 30 * 1000); // check interval
 // Types
 // ============================================================================
 
-export type MonitorActionType = "steer" | "abort" | "escalate";
+export type MonitorActionType = "steer" | "escalate" | "notify";
 
 export interface MonitorAction {
 	type: MonitorActionType;
@@ -60,6 +63,8 @@ export class Monitor {
 	private stuckSteered = new Set<string>();
 	/** Track which tasks have been escalated (one escalation per stuck episode) */
 	private escalated = new Set<string>();
+	/** Last long-run threshold multiple notified per task (notify once per multiple) */
+	private longRunNotified = new Map<string, number>();
 
 	constructor(pool: AgentPool, squadId: string) {
 		this.pool = pool;
@@ -100,6 +105,7 @@ export class Monitor {
 		this.warned.clear();
 		this.stuckSteered.clear();
 		this.escalated.clear();
+		this.longRunNotified.clear();
 	}
 
 	/** Check all running agents */
@@ -112,7 +118,7 @@ export class Monitor {
 			if (!activity) continue;
 
 			const health = this.checkHealth(activity);
-			this.handleHealth(taskId, agentName, health);
+			this.handleHealth(taskId, agentName, health, activity);
 		}
 	}
 
@@ -133,7 +139,7 @@ export class Monitor {
 			if (unique.size === 1) return "looping";
 		}
 
-		if (totalMs >= HARD_CEILING_MS) return "exceeded_ceiling";
+		if (totalMs >= LONG_RUN_NOTIFY_MS) return "long_running";
 		if (idleMs >= STUCK_TIMEOUT_MS) return "stuck";
 		if (idleMs >= IDLE_WARNING_MS) return "idle_warning";
 
@@ -141,7 +147,12 @@ export class Monitor {
 	}
 
 	/** Take action based on health status */
-	private handleHealth(taskId: string, agentName: string, status: HealthStatus): void {
+	private handleHealth(
+		taskId: string,
+		agentName: string,
+		status: HealthStatus,
+		activity?: { startedAt: number },
+	): void {
 		if (status !== "healthy") debug("squad-monitor", `${taskId} (${agentName}): ${status}`);
 		switch (status) {
 			case "healthy":
@@ -203,15 +214,25 @@ export class Monitor {
 				});
 				break;
 
-			case "exceeded_ceiling":
-				this.emit({
-					type: "abort",
-					taskId,
-					agentName,
-					reason: `Agent ${agentName} exceeded time ceiling on ${taskId}`,
-					message: "",
-				});
+			case "long_running": {
+				// Never abort. Notify the main Pi session once per threshold multiple
+				// (30m, 60m, 90m, …) so it can check in if needed — work continues.
+				const totalMs = Date.now() - (activity?.startedAt ?? Date.now());
+				const multiple = Math.floor(totalMs / LONG_RUN_NOTIFY_MS);
+				const lastNotified = this.longRunNotified.get(taskId) ?? 0;
+				if (multiple > lastNotified) {
+					this.longRunNotified.set(taskId, multiple);
+					const minutes = Math.round(totalMs / 60_000);
+					this.emit({
+						type: "notify",
+						taskId,
+						agentName,
+						reason: `Agent ${agentName} has been working on ${taskId} for ${minutes}m. Still running — check on it if needed (steer, pause, or let it continue).`,
+						message: "",
+					});
+				}
 				break;
+			}
 		}
 	}
 }

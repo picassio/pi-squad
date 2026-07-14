@@ -93,8 +93,16 @@ export class Scheduler {
 		this.monitor.onAction((action) => {
 			if (action.type === "steer") {
 				this.pool.steer(action.taskId, action.message);
-			} else if (action.type === "abort") {
-				this.handleTaskFailed(action.taskId, action.reason);
+			} else if (action.type === "notify") {
+				// Informational only — tell the main Pi session directly (no advisor
+				// detour, no kill). The agent keeps working.
+				this.emit({
+					type: "escalation",
+					squadId: this.squadId,
+					taskId: action.taskId,
+					agentName: action.agentName,
+					message: action.reason,
+				});
 			} else if (action.type === "escalate") {
 				// Advisor-first: try a strong-model rescue before interrupting the human
 				void this.tryAdvisorRescue(action.taskId, action.agentName, action.reason).then((rescued) => {

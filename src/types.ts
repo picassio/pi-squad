@@ -223,7 +223,7 @@ export interface AgentActivity {
 	modifiedFiles: Set<string>;
 }
 
-export type HealthStatus = "healthy" | "idle_warning" | "stuck" | "looping" | "exceeded_ceiling";
+export type HealthStatus = "healthy" | "idle_warning" | "stuck" | "looping" | "long_running";
 
 // ============================================================================
 // Supervisor

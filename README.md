@@ -286,12 +286,14 @@ Agents must complete at least 1 LLM turn AND make at least 1 tool call to be mar
 
 ### Health Monitoring
 
+The monitor never kills or blocks work on its own — its strongest action is notifying the main Pi session so you (or the main agent) can decide.
+
 | Check | Threshold | Action |
 |---|---|---|
 | Idle warning | 3 minutes no output | Steer agent with nudge |
-| Stuck detection | 5 minutes no output | Abort and fail task |
+| Stuck detection | 5 minutes no output | Steer, then escalate to main session |
 | Loop detection | Same tool call 5x | Steer with warning |
-| Hard ceiling | 30 minutes total | Abort task |
+| Long-running check-in | Every 30 minutes total (`PI_SQUAD_CEILING_MS`) | Notify main session — work continues |
 
 ## Data Layout
 
@@ -320,7 +322,7 @@ src/
 ├── agent-pool.ts     — pi RPC process management, activity tracking
 ├── protocol.ts       — system prompt builder (chain context, sibling awareness, knowledge)
 ├── router.ts         — @mention parsing, cross-agent messaging
-├── monitor.ts        — health checks (idle, stuck, loop, ceiling)
+├── monitor.ts        — health checks (idle, stuck, loop, long-run notify)
 ├── planner.ts        — one-shot goal decomposition via LLM
 ├── logger.ts         — file-based logging (never writes to stderr)
 ├── panel/            — TUI overlay panel and widget
