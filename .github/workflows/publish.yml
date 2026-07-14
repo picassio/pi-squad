@@ -35,6 +35,9 @@ jobs:
             echo "already=true" >> "$GITHUB_ENV"
             echo "$NAME@$PKG already on npm — skipping"
           fi
+      - name: Run tests
+        if: env.already != 'true'
+        run: npm test
       - name: Publish
         if: env.already != 'true'
         run: npm publish --provenance --access public
