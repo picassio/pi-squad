@@ -72,6 +72,8 @@ export class Scheduler {
 	private running = false;
 	/** Track spawn retries to allow one retry per task */
 	private spawnRetries = new Set<string>();
+	/** Periodic level-triggered reconcile (heals missed events / out-of-band store edits) */
+	private reconcileTimer: ReturnType<typeof setInterval> | null = null;
 
 	/** Get the project cwd for this squad (from squad.json) */
 	getProjectCwd(): string | undefined {
@@ -168,13 +170,22 @@ export class Scheduler {
 	async start(): Promise<void> {
 		this.running = true;
 		this.monitor.start();
-		await this.scheduleReadyTasks();
+		await this.reconcile();
+		// Level-triggered safety net: periodically re-derive scheduling decisions
+		// from persisted state so missed in-memory events (crashes, out-of-band
+		// store edits, external recovery) cannot strand ready tasks.
+		this.reconcileTimer = setInterval(() => void this.reconcile(), 60_000);
+		(this.reconcileTimer as { unref?: () => void }).unref?.();
 	}
 
 	/** Stop the scheduler — kills all agents, saves state */
 	async stop(): Promise<void> {
 		this.running = false;
 		this.monitor.stop();
+		if (this.reconcileTimer) {
+			clearInterval(this.reconcileTimer);
+			this.reconcileTimer = null;
+		}
 
 		// Suspend in-progress tasks
 		const tasks = store.loadAllTasks(this.squadId);
@@ -187,22 +198,77 @@ export class Scheduler {
 		await this.pool.killAll();
 	}
 
-	/** Resume from suspended state */
+	/** Resume from suspended OR failed state. Failure is never terminal:
+	 * failed tasks are reset to pending and a failed squad becomes running. */
 	async resume(): Promise<void> {
 		const tasks = store.loadAllTasks(this.squadId);
 		for (const task of tasks) {
 			if (task.status === "suspended") {
 				store.updateTaskStatus(this.squadId, task.id, "pending");
+			} else if (task.status === "failed") {
+				store.updateTaskStatus(this.squadId, task.id, "pending", { error: null });
+				store.appendMessage(this.squadId, task.id, {
+					ts: store.now(),
+					from: "system",
+					type: "status",
+					text: "Reset failed → pending on squad resume",
+				});
 			}
 		}
 
 		const squad = store.loadSquad(this.squadId);
-		if (squad && squad.status === "paused") {
+		if (squad && (squad.status === "paused" || squad.status === "failed")) {
 			squad.status = "running";
 			store.saveSquad(squad);
 		}
 
 		await this.start();
+	}
+
+	/**
+	 * Level-triggered reconciliation — derive scheduling from persisted state:
+	 * 1. Unblock blocked tasks whose deps are all done (missed autoUnblock events)
+	 * 2. Self-heal a "failed" squad when runnable work exists (out-of-band recovery)
+	 * 3. Schedule ready tasks
+	 * Safe to call any time; no-ops when nothing changed.
+	 */
+	async reconcile(): Promise<void> {
+		if (!this.running) return;
+		const squad = store.loadSquad(this.squadId);
+		if (!squad) return;
+
+		const tasks = store.loadAllTasks(this.squadId);
+
+		// 1. Blocked → pending when all deps are done (respects autoUnblock config)
+		if (squad.config.autoUnblock) {
+			for (const task of tasks) {
+				if (task.status !== "blocked") continue;
+				const allDepsDone = task.depends.every((depId) => {
+					const dep = tasks.find((t) => t.id === depId);
+					return dep?.status === "done";
+				});
+				if (allDepsDone) {
+					task.status = "pending";
+					store.updateTaskStatus(this.squadId, task.id, "pending");
+					this.emit({ type: "task_unblocked", squadId: this.squadId, taskId: task.id });
+				}
+			}
+		}
+
+		// 2. A "failed" squad with runnable work self-heals to running. This makes
+		// the terminal status derivable from task state instead of a one-way latch.
+		const hasRunnable = tasks.some((t) => {
+			if (t.status === "in_progress") return true;
+			if (t.status !== "pending") return false;
+			return t.depends.every((depId) => tasks.find((x) => x.id === depId)?.status === "done");
+		});
+		if (squad.status === "failed" && hasRunnable) {
+			squad.status = "running";
+			store.saveSquad(squad);
+			debug("squad-scheduler", "reconcile: failed squad has runnable work — healing to running");
+		}
+
+		await this.scheduleReadyTasks();
 	}
 
 	// =========================================================================
@@ -1081,10 +1147,53 @@ export class Scheduler {
 		this.updateContext();
 	}
 
-	/** Resume a suspended task */
+	/** Resume a suspended/failed task. Reconciles so a failed squad heals too. */
 	async resumeTask(taskId: string): Promise<void> {
-		store.updateTaskStatus(this.squadId, taskId, "pending");
-		await this.scheduleReadyTasks();
+		store.updateTaskStatus(this.squadId, taskId, "pending", { error: null });
+		await this.reconcile();
+	}
+
+	/**
+	 * Mark a task done through the normal completion flow (admin/recovery path).
+	 * Unlike editing the store directly, this fires auto-unblock and scheduling,
+	 * so dependents transition pending → running. Skips the QA rework check —
+	 * a human/main agent marking a task done is an explicit override.
+	 */
+	async completeTask(taskId: string, output?: string): Promise<void> {
+		const task = store.loadTask(this.squadId, taskId);
+		if (!task) throw new Error(`Task not found: ${taskId}`);
+		if (task.status === "done") return;
+
+		if (this.pool.isRunning(taskId)) {
+			await this.pool.kill(taskId);
+		}
+
+		store.updateTaskStatus(this.squadId, taskId, "done", {
+			output: output ?? task.output ?? "Marked done (recovered/admin)",
+			error: null,
+			completed: store.now(),
+		});
+		store.appendMessage(this.squadId, taskId, {
+			ts: store.now(),
+			from: "system",
+			type: "done",
+			text: "Task marked done (recovered/admin)",
+		});
+		this.emit({
+			type: "task_completed",
+			squadId: this.squadId,
+			taskId,
+			agentName: task.agent,
+			message: output ?? "",
+		});
+
+		this.autoUnblock(taskId);
+		await this.reconcile();
+
+		const freshTasks = store.loadAllTasks(this.squadId);
+		const freshSquad = store.loadSquad(this.squadId);
+		if (freshSquad) this.checkSquadCompletion(freshTasks, freshSquad);
+		this.updateContext();
 	}
 
 	/** Cancel a task */

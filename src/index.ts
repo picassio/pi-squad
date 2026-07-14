@@ -461,7 +461,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_modify",
 		label: "Squad Modify",
-		description: "Modify the running squad: add_task, cancel_task, pause, resume, cancel (entire squad).",
+		description: "Modify the running squad: add_task, cancel_task, complete_task (mark done + schedule dependents), pause, resume (also recovers failed squads), cancel (entire squad).",
 		parameters: Type.Object({
 			action: Type.Union(
 				[
@@ -469,6 +469,7 @@ export default function (pi: ExtensionAPI) {
 					Type.Literal("cancel_task"),
 					Type.Literal("pause_task"),
 					Type.Literal("resume_task"),
+					Type.Literal("complete_task"),
 					Type.Literal("pause"),
 					Type.Literal("resume"),
 					Type.Literal("cancel"),
@@ -476,6 +477,7 @@ export default function (pi: ExtensionAPI) {
 				{ description: "Action to perform" },
 			),
 			taskId: Type.Optional(Type.String({ description: "Task ID for task-specific actions" })),
+			output: Type.Optional(Type.String({ description: "Result summary for complete_task (what was accomplished)" })),
 			task: Type.Optional(
 				Type.Object({
 					id: Type.String(),
@@ -493,11 +495,11 @@ export default function (pi: ExtensionAPI) {
 			if (params.action === "resume") {
 				// Find a squad to resume: use activeSquadId or find the latest paused one
 				const squadId = activeSquadId || store.findActiveSquads()
-					.filter((s) => s.cwd === ctx.cwd && s.status === "paused")
+					.filter((s) => s.cwd === ctx.cwd && (s.status === "paused" || s.status === "failed"))
 					.sort((a, b) => b.created.localeCompare(a.created))[0]?.id;
 
 				if (!squadId) {
-					return { content: [{ type: "text" as const, text: "No paused squad found to resume." }], details: undefined };
+					return { content: [{ type: "text" as const, text: "No paused or failed squad found to resume." }], details: undefined };
 				}
 
 				// Create a fresh scheduler if needed
@@ -630,6 +632,16 @@ export default function (pi: ExtensionAPI) {
 						logError("squad", `Resume task error: ${(err as Error).message}`);
 					});
 					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' resumed.` }], details: undefined };
+				}
+
+				case "complete_task": {
+					if (!params.taskId) return { content: [{ type: "text" as const, text: "Provide taskId." }], details: undefined };
+					try {
+						await activeScheduler.completeTask(params.taskId, params.output);
+					} catch (err) {
+						return { content: [{ type: "text" as const, text: `complete_task failed: ${(err as Error).message}` }], details: undefined };
+					}
+					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' marked done — dependents unblocked and scheduled.` }], details: undefined };
 				}
 
 				case "pause": {

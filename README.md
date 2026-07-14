@@ -183,7 +183,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `squad` | Start a squad with goal + optional tasks/config |
 | `squad_status` | Check progress, costs, task states |
 | `squad_message` | Send message to a running agent |
-| `squad_modify` | Add/cancel/pause/resume tasks or squads |
+| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads |
 
 The main agent sees available agents in its system prompt and squad state when a squad is active.
 
@@ -280,6 +280,7 @@ Agents must complete at least 1 LLM turn AND make at least 1 tool call to be mar
 ### Session Resilience
 
 - In-progress tasks are **suspended** on session crash, **resumed** on next startup
+- Failure is never terminal: `resume` recovers failed squads (failed tasks reset to pending), `complete_task` marks recovered work done and schedules dependents, and a 60s reconcile loop re-derives scheduling from persisted state so out-of-band store edits can't strand ready tasks
 - Squads are fully reconstructable from JSON files on disk
 - Spawn failures are retried once with a 2-second delay
 - All errors logged to `~/.pi/squad/debug.log` (always for errors, `PI_SQUAD_DEBUG=1` for verbose)
