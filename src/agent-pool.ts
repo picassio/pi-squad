@@ -270,16 +270,14 @@ export class AgentPool {
 	async steer(taskId: string, message: string): Promise<boolean> {
 		const agent = this.agents.get(taskId);
 		if (!agent || agent.aborted || agent.process.exitCode !== null) return false;
-		this.sendRpcCommand(agent.process, { type: "steer", message });
-		return true;
+		return this.sendRpcCommand(agent.process, { type: "steer", message });
 	}
 
 	/** Queue a follow-up message for after the current turn */
 	async followUp(taskId: string, message: string): Promise<boolean> {
 		const agent = this.agents.get(taskId);
 		if (!agent || agent.aborted || agent.process.exitCode !== null) return false;
-		this.sendRpcCommand(agent.process, { type: "follow_up", message });
-		return true;
+		return this.sendRpcCommand(agent.process, { type: "follow_up", message });
 	}
 
 	/** Abort the current operation */
@@ -301,7 +299,7 @@ export class AgentPool {
 		agent.process.kill("SIGTERM");
 		// Force kill after 5s
 		const timer = setTimeout(() => {
-			if (!agent.process.killed) agent.process.kill("SIGKILL");
+			if (agent.process.exitCode === null) agent.process.kill("SIGKILL");
 		}, 5000);
 		await new Promise<void>((resolve) => {
 			agent.process.on("exit", () => {
@@ -337,9 +335,17 @@ export class AgentPool {
 	// Internal
 	// =========================================================================
 
-	private sendRpcCommand(proc: ChildProcess, command: Record<string, unknown>): void {
-		if (!proc.stdin || proc.stdin.destroyed) return;
-		proc.stdin.write(serializeJsonLine(command));
+	private sendRpcCommand(proc: ChildProcess, command: Record<string, unknown>): boolean {
+		if (!proc.stdin || proc.stdin.destroyed) return false;
+		try {
+			// Writable.write(false) means backpressure, not rejection; the bytes are
+			// still buffered. Reaching write() without throwing means the JSONL
+			// command was handed to the child stream.
+			proc.stdin.write(serializeJsonLine(command));
+			return true;
+		} catch {
+			return false;
+		}
 	}
 
 	private handleRpcEvent(agent: AgentProcess, event: any): void {
@@ -394,10 +400,12 @@ export class AgentPool {
 				data: event,
 			});
 		} else if (event.type === "agent_end") {
-			// Pi RPC mode emits agent_end when the agent loop finishes.
-			// The RPC process stays alive waiting for more commands,
-			// so we need to explicitly kill it and emit our own agent_end.
-			debug("squad-pool", `agent_end from RPC: ${agent.agentName} (task: ${agent.taskId})`);
+			// agent_end is one low-level run. Pi may still process queued steer,
+			// follow-up, retry, or compaction continuations. Killing here races and
+			// drops main-session steering. agent_settled is the final lifecycle edge.
+			debug("squad-pool", `agent_end from RPC (awaiting settled): ${agent.agentName} (task: ${agent.taskId})`);
+		} else if (event.type === "agent_settled") {
+			debug("squad-pool", `agent_settled from RPC: ${agent.agentName} (task: ${agent.taskId})`);
 			// Mark the guard to prevent double-emit from proc.on("exit")
 			const guardFn = (agent as any)._agentEndEmitted;
 			if (guardFn) guardFn();
@@ -417,11 +425,12 @@ export class AgentPool {
 					filesModified: endActivity.modifiedFiles.size,
 				},
 			});
-			// Kill the RPC process since the agent's work is done
+			// The session is fully settled, so the RPC process can now close.
 			agent.process.kill("SIGTERM");
-			setTimeout(() => {
-				if (!agent.process.killed) agent.process.kill("SIGKILL");
+			const forceKill = setTimeout(() => {
+				if (agent.process.exitCode === null) agent.process.kill("SIGKILL");
 			}, 3000);
+			forceKill.unref();
 		} else if (event.type === "error") {
 			this.emit({
 				type: "error",
