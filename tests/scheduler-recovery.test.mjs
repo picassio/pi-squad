@@ -26,6 +26,7 @@ process.env.USERPROFILE = tempHome;
 
 const store = await import("../src/store.ts");
 const { Scheduler } = await import("../src/scheduler.ts");
+const { recordOrchestratorReview } = await import("../src/review.ts");
 
 let squadCounter = 0;
 
@@ -90,6 +91,21 @@ test("assistant handoffs are persisted and promoted to task output without trunc
 
 	await scheduler.handleTaskCompleted("report");
 	assert.equal(store.loadTask(id, "report").output, report, "task handoff must equal the complete report");
+	const squad = store.loadSquad(id);
+	assert.equal(squad.status, "review", "agent completion must enter review, never done");
+	assert.equal(squad.review.status, "pending");
+	assert.ok(store.findActiveSquads().some((candidate) => candidate.id === id), "pending review must remain discoverable after restart");
+
+	recordOrchestratorReview(squad, {
+		verdict: "pass",
+		contractChecks: ["Complete 15-role report persisted exactly"],
+		diffReview: "Inspected durable message and task output records.",
+		verificationEvidence: ["Exact equality assertions passed for message and task output"],
+		integrationEvidence: "Persistence/reload path exercised through the real file-backed store.",
+		issues: [],
+	});
+	store.saveSquad(squad);
+	assert.equal(store.loadSquad(id).status, "done", "only recorded orchestrator pass accepts the squad");
 	await scheduler.stop();
 });
 

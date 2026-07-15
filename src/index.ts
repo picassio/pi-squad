@@ -26,6 +26,7 @@ import { setupSquadWidget, type SquadWidgetState } from "./panel/squad-widget.js
 import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
 import { buildCompletionSummary, buildFailureSummary } from "./report.js";
+import { buildOrchestratorReviewGate, recordOrchestratorReview } from "./review.js";
 
 // ============================================================================
 // State
@@ -44,14 +45,6 @@ let uiCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null = n
 /** Component-based widget state + controls */
 const widgetState: SquadWidgetState = { squadId: null, enabled: true };
 let widgetControls: { requestUpdate: () => void; dispose: () => void } | null = null;
-
-/** Reviewer instructions appended to squad-completed notifications —
- * makes the main session behave like the QA/verification agents do. */
-const REVIEW_INSTRUCTIONS =
-	"Before reporting success to the user, REVIEW the work like a QA agent would: " +
-	"(1) check task outputs for QA verdicts (## Verdict: PASS/FAIL) and verification evidence (commands + results); " +
-	"(2) if a task claimed done without evidence, run its Verify command yourself; " +
-	"(3) report to the user what was verified (with evidence) and flag anything unverified — don't just relay the summary.";
 
 /**
  * Resolve a model string (or null = session default) to its context window.
@@ -215,14 +208,33 @@ export default function (pi: ExtensionAPI) {
 
 	// Inject squad awareness before each LLM call
 	pi.on("before_agent_start", async (event, ctx) => {
-		if (!squadEnabled) return;
+		// Review gates are project-wide and survive focus changes, new squads, and
+		// disabling normal squad operations. Unaccepted work must stay visible.
+		const pendingReviewGates = store.findActiveSquads()
+			.filter((s) => s.cwd === ctx.cwd && s.status === "review")
+			.map((s) => ({ squad: s, gate: buildOrchestratorReviewGate(s, store.loadAllTasks(s.id)) }));
+		if (!squadEnabled) {
+			if (pendingReviewGates.length === 0) return;
+			return { systemPrompt: event.systemPrompt + "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") };
+		}
 
 		// When a squad is active, inject its status
 		if (activeSquadId) {
 			const squad = store.loadSquad(activeSquadId);
-			if (!squad) return;
+			if (!squad) {
+				activeSquadId = null;
+				if (pendingReviewGates.length > 0) {
+					return { systemPrompt: event.systemPrompt + "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") };
+				}
+				return;
+			}
 			const tasks = store.loadAllTasks(activeSquadId);
-			if (tasks.length === 0) return;
+			if (tasks.length === 0) {
+				if (pendingReviewGates.length > 0) {
+					return { systemPrompt: event.systemPrompt + "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") };
+				}
+				return;
+			}
 
 			const doneCount = tasks.filter((t) => t.status === "done").length;
 			const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
@@ -241,6 +253,8 @@ export default function (pi: ExtensionAPI) {
 				`Status: ${squad.status} | ${doneCount}/${tasks.length} tasks | $${totalCost.toFixed(2)}`,
 				taskLines,
 				`</squad_status>`,
+				...(squad.status === "review" ? [buildOrchestratorReviewGate(squad, tasks)] : []),
+				...pendingReviewGates.filter(({ squad: pending }) => pending.id !== squad.id).map(({ gate }) => gate),
 				`You have an active squad. Use squad_message to talk to agents, squad_status for details, squad_modify to change tasks.`,
 				`Do NOT poll squad_status in a loop or sleep-wait — the squad wakes you automatically on completion, failure, or escalation. Keep helping the user with other work, or end your turn and stay idle.`,
 			].join("\n");
@@ -267,7 +281,8 @@ export default function (pi: ExtensionAPI) {
 		].filter(Boolean).join("\n");
 
 		return {
-			systemPrompt: event.systemPrompt + "\n\n" + squadNudge,
+			systemPrompt: event.systemPrompt + "\n\n" + squadNudge +
+				(pendingReviewGates.length > 0 ? "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") : ""),
 		};
 	});
 
@@ -298,10 +313,10 @@ export default function (pi: ExtensionAPI) {
 			"Providing tasks yourself makes you the planner — follow the planner rules (contract task first, final QA task, 3-7 tasks)",
 			"Act on ⚠️ plan warnings in the response — fix with squad_modify or address at review",
 			"After starting a squad: report the plan and END YOUR TURN — never poll squad_status or sleep-wait; squad events wake you automatically",
-			"When the squad completes, review evidence like a QA agent before reporting success",
+			"When agents finish, treat every squad report and QA verdict as untrusted; independently inspect the diff/source and rerun contract verification + integration/E2E, then call squad_review before reporting success",
 		],
 		parameters: Type.Object({
-			goal: Type.String({ description: "What the squad should accomplish" }),
+			goal: Type.String({ description: "Complete original user outcome/acceptance contract the squad should accomplish. Preserve requirements and boundaries; this is shown during mandatory main-orchestrator review." }),
 			agents: Type.Optional(
 				Type.Record(
 					Type.String(),
@@ -408,12 +423,77 @@ export default function (pi: ExtensionAPI) {
 				`Status: ${context.status}`,
 				`Elapsed: ${context.elapsed}`,
 				`Cost: $${context.costs.total.toFixed(4)}`,
+				...(context.status === "review" ? ["Acceptance: BLOCKED — independent main-orchestrator review required via squad_review"] : []),
 				"",
 				"Tasks:",
 				taskLines,
 			].join("\n");
 
 			return { content: [{ type: "text" as const, text: summary }], details: undefined };
+		},
+	});
+
+	// =========================================================================
+	// Tool: squad_review — mandatory main-orchestrator acceptance gate
+	// =========================================================================
+
+	pi.registerTool({
+		name: "squad_review",
+		label: "Record Independent Squad Review",
+		description: "Record the MAIN Pi/orchestrator's independent review of completed squad work against the original user contract. Call only after inspecting the actual diff/source and independently running verification plus integration/E2E where applicable. Squad reports and squad QA evidence are not sufficient.",
+		parameters: Type.Object({
+			squadId: Type.Optional(Type.String({ description: "Squad awaiting review (default: active/latest)" })),
+			verdict: Type.Union([
+				Type.Literal("pass"),
+				Type.Literal("pass_with_issues"),
+				Type.Literal("fail"),
+			]),
+			contractChecks: Type.Array(Type.String(), { minItems: 1, description: "Requirement-by-requirement checks against the ORIGINAL user request and later clarifications; include observed result for each" }),
+			diffReview: Type.String({ description: "What you independently inspected in the actual diff/source, including scope and integration concerns" }),
+			verificationEvidence: Type.Array(Type.String(), { minItems: 1, description: "Commands/checks YOU ran and their actual results; do not copy squad claims" }),
+			integrationEvidence: Type.String({ description: "Integration/E2E result from the real target or production-like environment, or a precise reason it is not applicable/impossible and therefore unverified" }),
+			issues: Type.Array(Type.String(), { description: "Every discovered or remaining issue; required for fail/pass_with_issues" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			let id = params.squadId;
+			if (!id && activeSquadId && store.loadSquad(activeSquadId)?.status === "review") {
+				id = activeSquadId;
+			}
+			if (!id) {
+				id = store.listSquadsForProject(ctx.cwd)
+					.filter((s) => s.status === "review")
+					.sort((a, b) => b.created.localeCompare(a.created))[0]?.id;
+			}
+			if (!id) {
+				return { content: [{ type: "text" as const, text: "No squad is awaiting orchestrator review." }], details: undefined };
+			}
+
+			const squad = store.loadSquad(id);
+			if (!squad) {
+				return { content: [{ type: "text" as const, text: `Squad '${id}' not found.` }], details: undefined };
+			}
+
+			try {
+				recordOrchestratorReview(squad, {
+					verdict: params.verdict,
+					contractChecks: params.contractChecks,
+					diffReview: params.diffReview,
+					verificationEvidence: params.verificationEvidence,
+					integrationEvidence: params.integrationEvidence,
+					issues: params.issues,
+				});
+			} catch (error) {
+				return { content: [{ type: "text" as const, text: `Review rejected: ${(error as Error).message}` }], details: undefined };
+			}
+
+			store.saveSquad(squad);
+			forceWidgetUpdate();
+			const accepted = squad.status === "done";
+			const text = accepted
+				? `Independent orchestrator review recorded for '${id}' (${params.verdict}). The squad is now accepted as done.`
+				: `Independent review FAILED for '${id}'. The squad remains review-required. Fix every issue, rerun verification/E2E, then submit a fresh squad_review.`;
+			return { content: [{ type: "text" as const, text }], details: undefined };
 		},
 	});
 
@@ -518,16 +598,17 @@ export default function (pi: ExtensionAPI) {
 					scheduler.onEvent((event: SchedulerEvent) => {
 						forceWidgetUpdate();
 						switch (event.type) {
-							case "squad_completed": {
+							case "squad_review_required": {
 								const tasks = store.loadAllTasks(squadId);
 								const summary = buildCompletionSummary(tasks);
 								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 								const s = schedulers.get(squadId); if (s) s.updateContext();
-								// followUp + triggerTurn: wake an idle main agent to review;
-								// if it's mid-conversation with the human, deliver after it finishes
+								const squad = store.loadSquad(squadId)!;
+								// Wake the main agent into an explicit acceptance gate. Agent reports
+								// are untrusted inputs; only independent orchestrator evidence can pass it.
 								pi.sendMessage({
-									customType: "squad-completed",
-									content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\nSummary:\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}\n\n${REVIEW_INSTRUCTIONS}`,
+									customType: "squad-review-required",
+									content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\nSquad claims (review inputs only):\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}\n\n${buildOrchestratorReviewGate(squad, tasks)}`,
 									display: true,
 								}, { triggerTurn: true, deliverAs: "followUp" });
 								schedulers.delete(squadId);
@@ -721,6 +802,24 @@ export default function (pi: ExtensionAPI) {
 					display: true,
 				});
 			}
+		}
+
+		// Restore pending acceptance gates after a main-session restart. Review is
+		// persisted state, not a one-shot completion message that can be missed.
+		const pendingReviews = store.findActiveSquads()
+			.filter((s) => s.cwd === ctx.cwd && s.status === "review");
+		if (pendingReviews.length > 0) {
+			const squad = pendingReviews.sort((a, b) => b.created.localeCompare(a.created))[0];
+			activeSquadId = squad.id;
+			widgetState.squadId = squad.id;
+			widgetState.enabled = true;
+			widgetControls?.requestUpdate();
+			const tasks = store.loadAllTasks(squad.id);
+			pi.sendMessage({
+				customType: "squad-review-required",
+				content: `[squad] Restored mandatory orchestrator review for "${squad.id}" after session restart. The work remains untrusted and not accepted.\n\n${buildOrchestratorReviewGate(squad, tasks)}`,
+				display: true,
+			});
 		}
 
 		// Register Ctrl+Q terminal input handler for panel toggle
@@ -1008,7 +1107,7 @@ export default function (pi: ExtensionAPI) {
 							const tasks = store.loadAllTasks(s.id);
 							const done = tasks.filter((t) => t.status === "done").length;
 							const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-							const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "failed" ? "✗" : "·";
+							const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "review" ? "◆" : s.status === "failed" ? "✗" : "·";
 							return `${icon} ${s.id} [${s.status}] ${done}/${tasks.length} $${cost.toFixed(2)}`;
 						}),
 					];
@@ -1318,7 +1417,7 @@ async function pickSquad(
 		const tasks = store.loadAllTasks(s.id);
 		const done = tasks.filter((t) => t.status === "done").length;
 		const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-		const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "failed" ? "✗" : "·";
+		const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "review" ? "◆" : s.status === "failed" ? "✗" : "·";
 		const project = showProject ? ` — ${s.cwd.split("/").pop()}` : "";
 		return `${icon} ${s.id} [${s.status}] ${done}/${tasks.length} $${cost.toFixed(2)}${project}`;
 	});
@@ -1563,7 +1662,7 @@ async function startSquad(
 		// Update widget on every scheduler event
 		forceWidgetUpdate();
 		switch (event.type) {
-				case "squad_completed": {
+				case "squad_review_required": {
 				const tasks = store.loadAllTasks(squadId);
 				const summary = buildCompletionSummary(tasks);
 				const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
@@ -1573,15 +1672,16 @@ async function startSquad(
 				if (completedSched) {
 					completedSched.updateContext();
 				}
+				const squad = store.loadSquad(squadId)!;
 
-				// followUp + triggerTurn: wake an idle main agent to review; if it's
-				// mid-conversation with the human, deliver after it finishes
+				// Wake the main agent into an explicit acceptance gate. Never frame
+				// agent execution or squad QA as trusted completion.
 				pi.sendMessage({
-					customType: "squad-completed",
-					content: `[squad] Squad "${squadId}" completed all ${tasks.length} tasks.\n\n` +
-						`Summary:\n${summary}\n\n` +
+					customType: "squad-review-required",
+					content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` +
+						`Squad claims (review inputs only):\n${summary}\n\n` +
 						`Total cost: $${totalCost.toFixed(4)}\n\n` +
-						REVIEW_INSTRUCTIONS,
+						buildOrchestratorReviewGate(squad, tasks),
 					display: true,
 				}, { triggerTurn: true, deliverAs: "followUp" });
 

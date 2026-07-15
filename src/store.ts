@@ -269,11 +269,11 @@ export function listSquads(): string[] {
 }
 
 export function findActiveSquads(): Squad[] {
-	// Includes "failed": failure is recoverable (resume resets failed tasks), so
-	// failed squads must stay discoverable. All callers filter by status.
+	// Includes "failed" (recoverable) and "review" (main-orchestrator gate), so
+	// neither state disappears across session restarts. All callers filter by status.
 	return listSquads()
 		.map((id) => loadSquad(id))
-		.filter((s): s is Squad => s !== null && (s.status === "running" || s.status === "paused" || s.status === "failed"));
+		.filter((s): s is Squad => s !== null && (s.status === "running" || s.status === "paused" || s.status === "failed" || s.status === "review"));
 }
 
 /** List squads filtered by project cwd. If no cwd, returns all. */

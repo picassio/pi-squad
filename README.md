@@ -41,8 +41,21 @@ The planner agent reads your codebase and creates a task breakdown automatically
 2. A **live widget** appears above the editor showing task progress
 3. **Specialist agents** spawn as separate pi processes, working in parallel where dependencies allow
 4. QA agents can trigger **automatic rework loops** when they find bugs
-5. On completion, pi receives a summary with each task's **complete, untruncated output**
-6. Multiple squads can run concurrently across different projects
+5. When agents finish, the squad enters **`review`**, not `done`; main Pi receives every complete task output as untrusted review input
+6. Main Pi independently checks the original user contract, actual diff/source, verification commands, and integration/E2E, then records acceptance with `squad_review`
+7. Multiple squads can run concurrently across different projects
+
+### Mandatory Orchestrator Review Gate
+
+Squad agents—including QA/reviewer agents—produce candidate work and evidence claims. They cannot mark a squad accepted. After all tasks finish:
+
+- Persisted status becomes `review`, never directly `done`.
+- A persistent `<squad_review_required>` system reminder tells main Pi to re-read the original conversation contract, inspect the actual diff/source, rerun verification independently, and run integration/E2E where applicable.
+- Main Pi must call `squad_review` with requirement-by-requirement contract checks, diff review, actual command/result evidence, integration/E2E evidence, and issues.
+- Only `pass` or `pass_with_issues` changes the squad to `done`; `fail` leaves it review-blocked for fixes and re-review.
+- Pending review survives Pi restarts and is restored on the next session.
+
+The completion report is explicitly labeled **untrusted and not yet accepted**. Main Pi must never merely relay it or ask whether verification should be run.
 
 ### No-Truncation Contract
 

@@ -19,6 +19,7 @@ import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
 import { buildAgentSystemPrompt } from "./protocol.js";
 import { buildAdvisorConsultText, formatAdvisorSteerMessage, adviceNeedsHuman, type AdvisorConsultInput } from "./advisor.js";
+import { beginOrchestratorReview } from "./review.js";
 
 // ============================================================================
 // Types
@@ -31,7 +32,7 @@ export type SchedulerEventType =
 	| "task_blocked"
 	| "task_unblocked"
 	| "task_rework"
-	| "squad_completed"
+	| "squad_review_required"
 	| "squad_failed"
 	| "escalation"
 	| "activity";
@@ -996,9 +997,12 @@ export class Scheduler {
 		);
 
 		if (allDone) {
-			squad.status = "done";
+			// Agent execution is only a candidate result. It cannot become "done"
+			// until the main Pi independently reviews it against the original contract.
+			if (squad.status === "review") return;
+			beginOrchestratorReview(squad);
 			store.saveSquad(squad);
-			this.emit({ type: "squad_completed", squadId: this.squadId });
+			this.emit({ type: "squad_review_required", squadId: this.squadId });
 		} else if (anyFailed && !anyInProgress) {
 			// All remaining tasks are blocked/failed with no way forward
 			const blockedCount = tasks.filter((t) => t.status === "blocked").length;

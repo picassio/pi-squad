@@ -71,11 +71,24 @@ export const DEFAULT_SQUAD_SETTINGS: SquadSettings = {
 // Squad
 // ============================================================================
 
-export type SquadStatus = "planning" | "running" | "paused" | "done" | "failed";
+export type SquadStatus = "planning" | "running" | "paused" | "review" | "done" | "failed";
+
+export interface SquadReview {
+	status: "pending" | "passed" | "failed";
+	requestedAt: string;
+	completedAt: string | null;
+	verdict: "pass" | "pass_with_issues" | "fail" | null;
+	contractChecks: string[];
+	diffReview: string;
+	verificationEvidence: string[];
+	integrationEvidence: string;
+	issues: string[];
+}
 
 export interface SquadConfig {
 	maxConcurrency: number;
 	autoUnblock: boolean;
+	/** @deprecated Independent main-orchestrator review is always required. */
 	reviewOnComplete: boolean;
 	/** Max rework attempts when QA fails a task (0 = no rework, just fail) */
 	maxRetries: number;
@@ -84,7 +97,7 @@ export interface SquadConfig {
 export const DEFAULT_SQUAD_CONFIG: SquadConfig = {
 	maxConcurrency: 2,
 	autoUnblock: true,
-	reviewOnComplete: false,
+	reviewOnComplete: true,
 	maxRetries: 2,
 };
 
@@ -99,6 +112,8 @@ export interface Squad {
 	/** Agent name → overrides. Keys must exist in .pi/squad/agents/ */
 	agents: Record<string, SquadAgentEntry>;
 	config: SquadConfig;
+	/** Mandatory independent main-session review; absent on legacy/running squads. */
+	review?: SquadReview;
 }
 
 // ============================================================================

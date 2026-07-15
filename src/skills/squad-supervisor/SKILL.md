@@ -152,23 +152,30 @@ Use `squad_modify` when:
 - **`pause`** / **`resume`**: Stop/restart the entire squad
 - **`cancel`**: Abort everything (user changed their mind)
 
-## After Squad Completes — Reviewing Completed Work
+## After Agents Finish — Mandatory Independent Orchestrator Review
 
-When you receive `[squad] Squad completed`, you are the last line of review. Do NOT just relay the summary:
-1. **Check verdicts**: scan task outputs for QA verdicts (`## Verdict: PASS/FAIL/PASS WITH ISSUES`) and note any `PASS WITH ISSUES` minor issues
-2. **Check evidence**: each task's output should include verification evidence (commands + results). If a task claimed done without evidence, run its Verify command yourself (build, test, curl — whatever the task description specified)
-3. **Spot-check integration**: individual tasks passing doesn't guarantee the integrated result works — run the end-to-end check when one exists (app builds, server starts, main flow works)
-4. **Report with evidence**: tell the user what was verified (with the commands/results), and explicitly flag anything unverified or concerning
-5. Suggest next steps if applicable
+Agent execution finishing is **not completion or acceptance**. When you receive `[squad] TASK EXECUTION FINISHED` / `<squad_review_required>`, every squad output—including QA PASS—is an untrusted claim. You are the independent acceptance authority.
 
-Example:
-> Squad finished all 4 tasks:
-> - API endpoints created at `/api/auth` and `/api/users`
-> - JWT middleware with RS256 validation
-> - 12 tests passing
-> - README updated with API docs
+You MUST do all of this before telling the user the work succeeded:
+1. **Re-read the original contract**: reconstruct every requirement, boundary, and later clarification from the user's main-session conversation. The squad goal/task plan is only a secondary aid and cannot narrow the original request.
+2. **Inspect reality, not reports**: read the actual working-tree/commit diff and relevant source. Check every changed line for correctness, scope, integration points, unintended changes, error paths, security, and regressions.
+3. **Independently verify**: run the original Verify commands, build, and relevant tests yourself. Do not count command output pasted by squad agents as your evidence.
+4. **Run integration/E2E**: individual task/QA passes do not prove the integrated system. Exercise the real user flow in the target or production-like environment whenever runtime behavior changed. If impossible or genuinely inapplicable, state exactly why and mark it unverified—never silently skip it.
+5. **Fix and repeat**: if you find defects, fix them (or route explicit rework), then rerun the affected checks. Squad QA does not overrule your findings.
+6. **Record the gate**: call `squad_review` with requirement-by-requirement contract checks, your diff review, actual command/result evidence, integration/E2E evidence, and all issues. Until that tool records PASS/PASS_WITH_ISSUES, the squad remains `review` rather than `done`.
+7. **Report only reviewed facts**: clearly separate what you personally verified, remaining issues, and anything unverified.
+
+Never ask “Want me to run the tests/E2E?” after agents finish. Run required acceptance checks immediately. Never merely relay or paraphrase the squad summary.
+
+Example after independent review:
+> Independent orchestrator review complete against the original 7 acceptance criteria:
+> - Inspected `git diff --stat` and the auth/router/test changes; no unrelated files changed
+> - `npm test`: 42/42 passed; `npm run build`: passed
+> - Production-like E2E: login → refresh → protected route → logout passed
+> - Found and fixed a cookie-domain defect missed by squad QA; reran unit + E2E successfully
+> - `squad_review`: PASS
 >
-> Total cost: $1.23. Want me to run the full test suite or deploy?
+> Remaining unverified: none.
 
 ## Decision Framework
 
@@ -181,5 +188,5 @@ Example:
 | User says "tell the backend agent to..." | `squad_message` to that agent |
 | User says "add a task for..." | `squad_modify` with `add_task` |
 | User says "cancel/stop" | `squad_modify` with `cancel` |
-| Squad completes | Summarize results, suggest next steps |
+| Agents finish | Independently review against original contract, inspect diff, run verification + integration/E2E, call `squad_review`; only then report acceptance |
 | Squad fails | Report what failed, offer options (retry, modify, cancel) |

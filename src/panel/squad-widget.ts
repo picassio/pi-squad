@@ -79,6 +79,7 @@ export function setupSquadWidget(
 
 		const sIcon = squad.status === "done" ? th.fg("success", "✓")
 			: squad.status === "failed" ? th.fg("error", "✗")
+			: squad.status === "review" ? th.fg("warning", "◆")
 			: th.fg("warning", "⏳");
 
 		lines.push(
@@ -141,6 +142,8 @@ export function setupSquadWidget(
 			? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
 			: squad.status === "failed"
 			? th.fg("error", `✗ squad ${doneCount}/${tasks.length}`)
+			: squad.status === "review"
+			? th.fg("warning", `◆ squad review required`)
 			: th.fg("accent", `⏳ squad ${doneCount}/${tasks.length} $${totalCost.toFixed(2)}`);
 
 		return { lines, cacheKey, statusText };
@@ -215,7 +218,7 @@ export function setupSquadWidget(
 			return;
 		}
 		const squad = store.loadSquad(state.squadId);
-		const isActive = squad && (squad.status === "running" || squad.status === "paused");
+		const isActive = squad && (squad.status === "running" || squad.status === "paused" || squad.status === "review");
 		if (isActive && !durationTimer) {
 			durationTimer = setInterval(() => render(), 5000);
 		} else if (!isActive && durationTimer) {
