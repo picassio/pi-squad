@@ -217,7 +217,7 @@ export class AgentPool {
 		proc.on("exit", (code, signal) => {
 			// Log diagnostic info for debugging spawn failures
 			if (code !== 0 && code !== null) {
-				logError("squad-pool", `${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr.slice(0, 300) || "(empty)"}`);
+				logError("squad-pool", `${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr || "(empty)"}`);
 			}
 			// Capture activity stats BEFORE deleting the agent
 			const finalActivity = agentProc.activity;
@@ -232,7 +232,8 @@ export class AgentPool {
 					agentName: agentDef.name,
 					data: {
 						exitCode: code,
-						stderr: stderr.slice(-2000),
+						// Preserve complete diagnostics for task failure reports and recovery.
+						stderr,
 						turnCount: finalActivity.turnCount,
 						toolCallCount: finalActivity.recentToolCalls.length,
 						filesModified: finalActivity.modifiedFiles.size,

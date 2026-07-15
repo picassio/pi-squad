@@ -70,10 +70,9 @@ export async function analyzeStuckAgent(
 ): Promise<{ action: "retry" | "reassign" | "escalate"; reason: string; suggestion?: string }> {
 	const task = store.loadTask(squadId, taskId);
 	const messages = store.loadMessages(squadId, taskId);
-	const recentMessages = messages.slice(-10);
 
-	// Simple heuristic for now
-	const errorMessages = recentMessages.filter((m) => m.type === "error");
+	// Simple heuristic for now — inspect the complete task history.
+	const errorMessages = messages.filter((m) => m.type === "error");
 	if (errorMessages.length >= 3) {
 		return {
 			action: "escalate",
@@ -128,7 +127,7 @@ export async function analyzeBlockRequest(
 		return {
 			action: "create_subtask",
 			subtask: {
-				title: `Support: ${blockReason.slice(0, 60)}`,
+				title: `Support: ${blockReason}`,
 				agent: "fullstack",
 				description: `Created from block request by ${agentName} on task ${taskId}: ${blockReason}`,
 			},

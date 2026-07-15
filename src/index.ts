@@ -25,6 +25,7 @@ import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
 import { setupSquadWidget, type SquadWidgetState } from "./panel/squad-widget.js";
 import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
+import { buildCompletionSummary, buildFailureSummary } from "./report.js";
 
 // ============================================================================
 // State
@@ -229,8 +230,8 @@ export default function (pi: ExtensionAPI) {
 			const taskLines = tasks.map((t) => {
 				const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : "·";
 				let line = `  ${icon} ${t.id} (${t.agent}) [${t.status}]`;
-				if (t.output) line += ` — ${t.output.split("\n")[0].slice(0, 80)}`;
-				if (t.error) line += ` ERROR: ${t.error.slice(0, 60)}`;
+				if (t.output) line += ` — ${t.output}`;
+				if (t.error) line += ` ERROR: ${t.error}`;
 				return line;
 			}).join("\n");
 
@@ -519,10 +520,7 @@ export default function (pi: ExtensionAPI) {
 						switch (event.type) {
 							case "squad_completed": {
 								const tasks = store.loadAllTasks(squadId);
-								const summary = tasks
-									.filter((t) => t.status === "done")
-									.map((t) => `- ${t.id} (${t.agent}): ${t.output?.slice(0, 150) || "done"}`)
-									.join("\n");
+								const summary = buildCompletionSummary(tasks);
 								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 								const s = schedulers.get(squadId); if (s) s.updateContext();
 								// followUp + triggerTurn: wake an idle main agent to review;
@@ -542,7 +540,7 @@ export default function (pi: ExtensionAPI) {
 								const done = tasks.filter((t) => t.status === "done");
 								pi.sendMessage({
 									customType: "squad-failed",
-									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}`,
+									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${buildFailureSummary(tasks)}`,
 									display: true,
 								}, { triggerTurn: true, deliverAs: "followUp" });
 								forceWidgetUpdate();
@@ -932,7 +930,7 @@ export default function (pi: ExtensionAPI) {
 					const msgSched = getActiveScheduler();
 					if (msgSched) {
 						await msgSched.sendHumanMessage(targetTaskId, msgText);
-						ctx.ui.notify(`Sent to ${targetAgent}: "${msgText.slice(0, 50)}"`, "info");
+						ctx.ui.notify(`Sent to ${targetAgent}: "${msgText}"`, "info");
 					} else {
 						store.appendMessage(activeSquadId, targetTaskId, {
 							ts: store.now(),
@@ -1210,7 +1208,7 @@ export default function (pi: ExtensionAPI) {
 								`Tags: ${agent.tags.join(", ")}`,
 								``,
 								`Prompt:`,
-								`${agent.prompt.slice(0, 300)}${agent.prompt.length > 300 ? "..." : ""}`,
+								agent.prompt,
 								``,
 								`File: ${store.getGlobalAgentsDir()}/${agent.name}.json`,
 							].join("\n");
@@ -1399,7 +1397,7 @@ function openPanel(
 				const panelSched = schedulers.get(squadId);
 				if (input && panelSched) {
 					await panelSched.sendHumanMessage(taskId, input);
-					ctx.ui.notify(`Sent to ${agentName}: "${input.slice(0, 50)}"`, "info");
+					ctx.ui.notify(`Sent to ${agentName}: "${input}"`, "info");
 				} else if (input) {
 					store.appendMessage(squadId, taskId, {
 						ts: store.now(),
@@ -1567,10 +1565,7 @@ async function startSquad(
 		switch (event.type) {
 				case "squad_completed": {
 				const tasks = store.loadAllTasks(squadId);
-				const summary = tasks
-					.filter((t) => t.status === "done")
-					.map((t) => `- ${t.id} (${t.agent}): ${t.output?.slice(0, 150) || "done"}`)
-					.join("\n");
+				const summary = buildCompletionSummary(tasks);
 				const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
 				// Final context update before clearing scheduler
@@ -1605,7 +1600,7 @@ async function startSquad(
 					customType: "squad-failed",
 					content: `[squad] Squad "${squadId}" has stalled. ` +
 						`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
-						`Failed: ${failed.map((t) => `${t.id}: ${t.error?.slice(0, 100)}`).join("; ")}\n` +
+						`Failed: ${buildFailureSummary(tasks)}\n` +
 						`Use squad_status for details or squad_modify to adjust.`,
 					display: true,
 				}, { triggerTurn: true, deliverAs: "followUp" });

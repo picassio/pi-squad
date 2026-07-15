@@ -68,6 +68,31 @@ function makeSquad({ squadStatus, tasks }) {
 	return { id, scheduler, spawned };
 }
 
+test("assistant handoffs are persisted and promoted to task output without truncation", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "report", status: "in_progress" }],
+	});
+	const report = Array.from({ length: 15 }, (_, i) =>
+		`ROLE-${i + 1}\n${String(i + 1).repeat(1000)}\nEND-ROLE-${i + 1}`,
+	).join("\n\n");
+	assert.ok(report.length > 15_000);
+
+	scheduler.handleAgentEvent({
+		type: "message_end",
+		taskId: "report",
+		agentName: "backend",
+		data: { role: "assistant", content: [{ type: "text", text: report }] },
+	});
+
+	const messages = store.loadMessages(id, "report");
+	assert.equal(messages.at(-1).text, report, "durable message must equal the complete report");
+
+	await scheduler.handleTaskCompleted("report");
+	assert.equal(store.loadTask(id, "report").output, report, "task handoff must equal the complete report");
+	await scheduler.stop();
+});
+
 test("resume() recovers a terminal-failed squad: failed tasks reset and respawn", async () => {
 	const { id, scheduler, spawned } = makeSquad({
 		squadStatus: "failed",

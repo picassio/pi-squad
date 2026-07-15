@@ -41,8 +41,12 @@ The planner agent reads your codebase and creates a task breakdown automatically
 2. A **live widget** appears above the editor showing task progress
 3. **Specialist agents** spawn as separate pi processes, working in parallel where dependencies allow
 4. QA agents can trigger **automatic rework loops** when they find bugs
-5. On completion, pi receives a summary with each task's output
+5. On completion, pi receives a summary with each task's **complete, untruncated output**
 6. Multiple squads can run concurrently across different projects
+
+### No-Truncation Contract
+
+Task messages, task outputs, dependency/rework handoffs, QA feedback, advisor handoffs, completion reports, failure diagnostics, and planner errors are persisted and forwarded in full. There is no character or task-count limit on report data. TUI widgets may show width/height-limited **views** to fit the terminal, but the underlying data and agent/main-session handoffs remain complete.
 
 ## Features
 

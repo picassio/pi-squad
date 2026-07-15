@@ -30,23 +30,23 @@ test("consult text includes task, reason, activity, and messages", () => {
 	assert.ok(text.includes("14 turns"));
 });
 
-test("consult text clamps long messages", () => {
+test("consult text preserves long messages in full", () => {
+	const longMessage = "x".repeat(20_000) + "-END";
 	const text = buildAdvisorConsultText({
 		...baseInput,
-		recentMessages: [{ from: "backend", type: "text", text: "x".repeat(2000) }],
+		recentMessages: [{ from: "backend", type: "text", text: longMessage }],
 	});
-	assert.ok(!text.includes("x".repeat(500)));
-	assert.ok(text.includes("…"));
+	assert.ok(text.includes(longMessage));
 });
 
-test("consult text tails messages to 12", () => {
+test("consult text preserves every message", () => {
 	const messages = Array.from({ length: 30 }, (_, i) => ({
 		from: "backend",
 		type: "text",
 		text: `msg-${i}`,
 	}));
 	const text = buildAdvisorConsultText({ ...baseInput, recentMessages: messages });
-	assert.ok(!text.includes("msg-0 "));
+	assert.ok(text.includes("msg-0"));
 	assert.ok(text.includes("msg-29"));
 });
 
@@ -58,9 +58,8 @@ test("steer message wraps advice with execution instruction", () => {
 	assert.ok(msg.includes("state the conflict explicitly"));
 });
 
-test("adviceNeedsHuman detects the verdict near the top only", () => {
+test("adviceNeedsHuman scans the complete advice", () => {
 	assert.equal(adviceNeedsHuman("Needs human input\n1. Ask which provider to use"), true);
 	assert.equal(adviceNeedsHuman("Course-correct\n1. Fix the test"), false);
-	// mention far into the body doesn't trigger
-	assert.equal(adviceNeedsHuman(`Course-correct\n${"a".repeat(300)}\nneeds human input maybe`), false);
+	assert.equal(adviceNeedsHuman(`Course-correct\n${"a".repeat(3000)}\nneeds human input maybe`), true);
 });

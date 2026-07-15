@@ -78,18 +78,10 @@ Output format:
 
 Keep it short. The agent reads your advice and immediately acts on it.`;
 
-const MAX_MSG_CHARS = 400;
-const MAX_MESSAGES = 12;
-const MAX_TOOL_CALLS = 10;
-
-function clamp(text: string, max: number): string {
-	const t = text.trim();
-	return t.length > max ? `${t.slice(0, max).trimEnd()}…` : t;
-}
-
 /**
  * Build the user-message digest sent to the advisor model.
- * Curated and bounded — summaries, not full transcripts.
+ * Preserve complete descriptions, messages, and tool history: advisor handoffs
+ * follow the same no-truncation contract as task and completion reports.
  */
 export function buildAdvisorConsultText(input: AdvisorConsultInput): string {
 	const lines: string[] = [];
@@ -102,22 +94,21 @@ export function buildAdvisorConsultText(input: AdvisorConsultInput): string {
 	lines.push(`Progress: ${input.turnCount} turns, ~${Math.round(input.elapsedMinutes)} min elapsed`);
 	lines.push("");
 	lines.push(`## Task Description`);
-	lines.push(clamp(input.taskDescription || "(no description)", 1500));
+	lines.push((input.taskDescription || "(no description)").trim());
 
 	if (input.recentToolCalls.length > 0) {
 		lines.push("");
 		lines.push(`## Recent Tool Activity (newest last)`);
-		for (const call of input.recentToolCalls.slice(-MAX_TOOL_CALLS)) {
-			lines.push(`- ${clamp(call, 160)}`);
+		for (const call of input.recentToolCalls) {
+			lines.push(`- ${call.trim()}`);
 		}
 	}
 
-	const messages = input.recentMessages.slice(-MAX_MESSAGES);
-	if (messages.length > 0) {
+	if (input.recentMessages.length > 0) {
 		lines.push("");
 		lines.push(`## Recent Messages (newest last)`);
-		for (const msg of messages) {
-			lines.push(`[${msg.from}/${msg.type}] ${clamp(msg.text, MAX_MSG_CHARS)}`);
+		for (const msg of input.recentMessages) {
+			lines.push(`[${msg.from}/${msg.type}] ${msg.text.trim()}`);
 		}
 	}
 
@@ -141,5 +132,5 @@ export function formatAdvisorSteerMessage(advice: string, reason: string): strin
 
 /** True when the advisor's verdict says a human decision is required. */
 export function adviceNeedsHuman(advice: string): boolean {
-	return /needs human input/i.test(advice.slice(0, 200));
+	return /needs human input/i.test(advice);
 }

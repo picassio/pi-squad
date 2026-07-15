@@ -202,6 +202,6 @@ export class Router {
 				return line.trim();
 			}
 		}
-		return text.slice(0, 200);
+		return text;
 	}
 }

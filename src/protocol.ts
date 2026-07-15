@@ -102,7 +102,6 @@ function buildChainContext(task: Task, allTasks: Task[], squadId: string): strin
 			const messages = loadMessages(squadId, dep.id);
 			const lastText = messages
 				.filter((m) => m.from === dep.agent && (m.type === "text" || m.type === "done"))
-				.slice(-3)
 				.map((m) => m.text)
 				.join("\n");
 			if (lastText) {
@@ -155,11 +154,8 @@ function buildSiblingAwareness(
 		for (const [agent, files] of fileEntries) {
 			if (files.length > 0) {
 				lines.push(`**${agent}:**`);
-				for (const f of files.slice(0, 10)) {
+				for (const f of files) {
 					lines.push(`  - ${f}`);
-				}
-				if (files.length > 10) {
-					lines.push(`  - ...and ${files.length - 10} more`);
 				}
 			}
 		}
@@ -187,7 +183,7 @@ function buildKnowledgeSection(squadId: string): string {
 
 	if (decisions.length > 0) {
 		lines.push("## Decisions");
-		for (const d of decisions.slice(-10)) {
+		for (const d of decisions) {
 			lines.push(`- ${d.text} (${d.from})`);
 		}
 		lines.push("");
@@ -195,7 +191,7 @@ function buildKnowledgeSection(squadId: string): string {
 
 	if (conventions.length > 0) {
 		lines.push("## Project Conventions");
-		for (const c of conventions.slice(-10)) {
+		for (const c of conventions) {
 			lines.push(`- ${c.text} (${c.from})`);
 		}
 		lines.push("");
@@ -203,7 +199,7 @@ function buildKnowledgeSection(squadId: string): string {
 
 	if (findings.length > 0) {
 		lines.push("## Findings");
-		for (const f of findings.slice(-10)) {
+		for (const f of findings) {
 			lines.push(`- ${f.text} (${f.from})`);
 		}
 		lines.push("");
@@ -256,7 +252,8 @@ function buildReworkContext(task: Task, squadId: string): string {
 
 	if (originalTask?.output) {
 		lines.push("## What Was Built (Previous Attempt)");
-		lines.push(originalTask.output.slice(0, 2000));
+		// Rework agents need the complete prior handoff, not an arbitrary prefix.
+		lines.push(originalTask.output);
 		lines.push("");
 	}
 

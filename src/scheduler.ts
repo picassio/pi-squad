@@ -465,7 +465,7 @@ export class Scheduler {
 				agentName: task.agent,
 				agentRole: agentDef?.role || task.agent,
 				reason,
-				recentMessages: store.loadMessages(this.squadId, taskId).slice(-12).map((m) => ({ from: m.from, type: m.type, text: m.text })),
+				recentMessages: store.loadMessages(this.squadId, taskId).map((m) => ({ from: m.from, type: m.type, text: m.text })),
 				recentToolCalls: activity ? [...activity.recentToolCalls] : [],
 				turnCount: activity?.turnCount || 0,
 				elapsedMinutes: activity ? (Date.now() - activity.startedAt) / 60000 : 0,
@@ -488,7 +488,7 @@ export class Scheduler {
 					squadId: this.squadId,
 					taskId,
 					agentName,
-					message: `${reason}\n\nAdvisor assessment:\n${advice.slice(0, 800)}`,
+					message: `${reason}\n\nAdvisor assessment:\n${advice}`,
 				});
 				return true; // escalation already emitted with richer context
 			}
@@ -563,7 +563,9 @@ export class Scheduler {
 							ts: store.now(),
 							from: event.agentName,
 							type: "text",
-							text: text.slice(0, 2000),
+							// Persist the complete handoff. Reports can be arbitrarily long;
+							// presentation layers may viewport them, but source data must never truncate.
+							text,
 						});
 					}
 
@@ -636,7 +638,7 @@ export class Scheduler {
 						const reason = turnCount === 0
 							? `exited with 0 turns (likely rate limit or API error)`
 							: `exited with ${turnCount} turns but 0 tool calls (no work done)`;
-						logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr.slice(0, 200)}`);
+						logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr}`);
 						store.updateTaskStatus(this.squadId, event.taskId, "pending");
 						store.appendMessage(this.squadId, event.taskId, {
 							ts: store.now(),
@@ -650,7 +652,7 @@ export class Scheduler {
 						}, 2000);
 					} else {
 						const stderr = event.data?.stderr || "";
-						this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode} (retry exhausted). ${stderr.slice(0, 500)}`);
+						this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode} (retry exhausted). ${stderr}`);
 					}
 					this.updateContext();
 				}
@@ -682,10 +684,9 @@ export class Scheduler {
 
 		// Extract output from last messages
 		const messages = store.loadMessages(this.squadId, taskId);
-		const lastAgentMessages = messages
-			.filter((m) => m.from === task.agent && (m.type === "text" || m.type === "done"))
-			.slice(-3);
-		const output = lastAgentMessages.map((m) => m.text).join("\n");
+		const agentMessages = messages
+			.filter((m) => m.from === task.agent && (m.type === "text" || m.type === "done"));
+		const output = agentMessages.map((m) => m.text).join("\n");
 
 		store.updateTaskStatus(this.squadId, taskId, "done", {
 			output: output || "Task completed",
@@ -869,7 +870,7 @@ export class Scheduler {
 					squadId: this.squadId,
 					taskId: task.id,
 					agentName: task.agent,
-					message: `QA failed ${originalId} ${retryCount} times. Retry limit reached.\nLatest feedback:\n${feedback.slice(0, 500)}`,
+					message: `QA failed ${originalId} ${retryCount} times. Retry limit reached.\nLatest feedback:\n${feedback}`,
 				});
 				continue;
 			}
@@ -974,12 +975,11 @@ export class Scheduler {
 
 		// Try to extract lines containing "FAIL", "Error", "✗"
 		const failLines = output.split("\n")
-			.filter((line) => /fail|error|✗|✘|broken|bug/i.test(line))
-			.slice(0, 20);
+			.filter((line) => /fail|error|✗|✘|broken|bug/i.test(line));
 		if (failLines.length > 0) return failLines.join("\n");
 
-		// Fallback: last 500 chars
-		return output.slice(-500);
+		// Preserve the complete QA handoff when no structured failure section exists.
+		return output;
 	}
 
 	// =========================================================================
@@ -1047,7 +1047,7 @@ export class Scheduler {
 				status: task.status,
 				agent: task.agent,
 				title: task.title,
-				...(task.output ? { output: task.output.slice(0, 500) } : {}),
+				...(task.output ? { output: task.output } : {}),
 				...(task.status === "blocked"
 					? {
 							blockedBy: task.depends.filter((d) => {
@@ -1089,7 +1089,7 @@ export class Scheduler {
 					action:
 						msg.type === "tool"
 							? `→ ${msg.name} ${msg.args?.path || msg.args?.command || ""}`.trim()
-							: msg.text.slice(0, 80),
+							: msg.text,
 				});
 			}
 		}

@@ -152,7 +152,7 @@ async function runPiJson(options: PiJsonOptions): Promise<string> {
 			}
 
 			if (code !== 0 && messages.length === 0) {
-				reject(new Error(`Planner failed (code ${code}): ${stderr.slice(0, 500)}`));
+				reject(new Error(`Planner failed (code ${code}): ${stderr}`));
 				return;
 			}
 
@@ -217,7 +217,7 @@ function parsePlannerOutput(text: string, validAgents?: Set<string>): PlannerOut
 		return parsed as PlannerOutput;
 	} catch (error) {
 		if (error instanceof SyntaxError) {
-			throw new Error(`Planner output is not valid JSON: ${text.slice(0, 200)}`);
+			throw new Error(`Planner output is not valid JSON: ${text}`);
 		}
 		throw error;
 	}
