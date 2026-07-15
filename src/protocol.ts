@@ -90,9 +90,10 @@ function buildChainContext(task: Task, allTasks: Task[], squadId: string): strin
 
 	const sections: string[] = [];
 
-	for (const depId of task.depends) {
-		const dep = allTasks.find((t) => t.id === depId);
-		if (!dep || dep.status !== "done") continue;
+	// A downstream integration/QA task needs the contracts its direct inputs
+	// were built from, not only the last edge in the DAG. Walk the complete
+	// ancestor closure, ancestors first, and deduplicate diamond dependencies.
+	for (const dep of completedDependencyClosure(task, allTasks)) {
 
 		let section = `## ${dep.id} (done by ${dep.agent})\n**${dep.title}**\n`;
 		if (dep.output) {
@@ -117,6 +118,24 @@ function buildChainContext(task: Task, allTasks: Task[], squadId: string): strin
 
 ${sections.join("\n---\n\n")}
 `;
+}
+
+function completedDependencyClosure(task: Task, allTasks: Task[]): Task[] {
+	const byId = new Map(allTasks.map((candidate) => [candidate.id, candidate]));
+	const seen = new Set<string>();
+	const ordered: Task[] = [];
+
+	const visit = (id: string): void => {
+		if (seen.has(id)) return;
+		seen.add(id);
+		const dependency = byId.get(id);
+		if (!dependency) return;
+		for (const ancestorId of dependency.depends) visit(ancestorId);
+		if (dependency.status === "done") ordered.push(dependency);
+	};
+
+	for (const dependencyId of task.depends) visit(dependencyId);
+	return ordered;
 }
 
 // ============================================================================

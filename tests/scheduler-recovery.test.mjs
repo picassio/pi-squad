@@ -109,6 +109,35 @@ test("assistant handoffs are persisted and promoted to task output without trunc
 	await scheduler.stop();
 });
 
+test("substantive report-only output completes without a tool call", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "planning-report", status: "in_progress" }],
+	});
+	const report = `PLANNING-REPORT\n${"evidence\n".repeat(500)}REPORT-END`;
+
+	scheduler.handleAgentEvent({
+		type: "message_end",
+		taskId: "planning-report",
+		agentName: "backend",
+		data: { role: "assistant", content: [{ type: "text", text: report }] },
+	});
+	scheduler.handleAgentEvent({
+		type: "agent_end",
+		taskId: "planning-report",
+		agentName: "backend",
+		data: { exitCode: 0, turnCount: 1, toolCallCount: 0, stderr: "" },
+	});
+
+	for (let i = 0; i < 50 && store.loadSquad(id).status !== "review"; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 5));
+	}
+	assert.equal(store.loadTask(id, "planning-report").status, "done");
+	assert.equal(store.loadTask(id, "planning-report").output, report);
+	assert.equal(store.loadSquad(id).status, "review", "report still requires independent orchestrator acceptance");
+	await scheduler.stop();
+});
+
 test("resume() recovers a terminal-failed squad: failed tasks reset and respawn", async () => {
 	const { id, scheduler, spawned } = makeSquad({
 		squadStatus: "failed",

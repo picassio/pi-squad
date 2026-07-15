@@ -53,6 +53,29 @@ function isQaLikeTask(task: PlanTaskInput): boolean {
 	return /\b(qa|test|tests|testing|verif\w*|review|audit)\b/.test(hay);
 }
 
+/** Task IDs explicitly named in a "depend on ..." Context sentence. */
+function describedDependencies(task: PlanTaskInput, knownIds: Set<string>): string[] {
+	const refs = new Set<string>();
+	for (const clause of task.description.matchAll(/\bdepend(?:s|ing)?\s+on\b([^.;\n]*)/gi)) {
+		for (const quoted of clause[1].matchAll(/`([^`]+)`/g)) {
+			if (knownIds.has(quoted[1])) refs.add(quoted[1]);
+		}
+	}
+	return [...refs];
+}
+
+function dependencyClosure(task: PlanTaskInput, byId: Map<string, PlanTaskInput>): Set<string> {
+	const closure = new Set<string>();
+	const visit = (id: string): void => {
+		if (closure.has(id)) return;
+		closure.add(id);
+		const dependency = byId.get(id);
+		if (dependency) for (const ancestor of dependency.depends) visit(ancestor);
+	};
+	for (const dependency of task.depends) visit(dependency);
+	return closure;
+}
+
 /**
  * Validate a plan's structure. Errors block squad creation;
  * warnings are returned to the plan author for correction.
@@ -125,8 +148,16 @@ export function validatePlan(tasks: PlanTaskInput[]): PlanValidation {
 	for (const t of tasks) {
 		if (!t.description || t.description.trim().length === 0) {
 			warnings.push(`Task "${t.id}" has no description — the agent only gets the title.`);
-		} else if (!/verif|test|check|curl|run\b|npm |pnpm |cargo |pytest|tsc\b/i.test(t.description)) {
-			warnings.push(`Task "${t.id}" description has no Verify criterion — the agent won't know how to prove it's done.`);
+		} else {
+			if (!/verif|test|check|curl|run\b|npm |pnpm |cargo |pytest|tsc\b/i.test(t.description)) {
+				warnings.push(`Task "${t.id}" description has no Verify criterion — the agent won't know how to prove it's done.`);
+			}
+			const closure = dependencyClosure(t, byId);
+			for (const described of describedDependencies(t, ids)) {
+				if (!closure.has(described)) {
+					warnings.push(`Task "${t.id}" says it depends on "${described}", but that task is absent from its formal dependency closure.`);
+				}
+			}
 		}
 	}
 

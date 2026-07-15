@@ -127,7 +127,11 @@ Bundled agent definitions are copied to `~/.pi/squad/agents/` on first run. Edit
 
 ### Agent Collaboration
 
-**Chain context**: When task A completes, its output is injected into task B's system prompt. Downstream agents know what was built.
+**Chain context**: When task A completes, its complete output is injected into downstream prompts across the full dependency-ancestor closure (ancestors first, diamond dependencies deduplicated), not only the final direct edge. Integration and QA tasks therefore receive the original contracts their inputs were built from.
+
+**Completed-agent replies**: An `@agent` request aimed at an agent whose task already finished is answered immediately from that agent's durable task output. It is never queued for a nonexistent future spawn, and a blocker resolved this way does not escalate to the human.
+
+**Report-only work**: Planning/review agents may complete with a substantive assistant artifact even when they needed no tool call. Their output still passes through mandatory independent orchestrator review.
 
 **Shared filesystem**: All agents work in the same project directory. Upstream agents create files, downstream agents read and modify them.
 

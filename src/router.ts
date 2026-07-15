@@ -47,12 +47,18 @@ export class Router {
 	processMessage(taskId: string, fromAgent: string, text: string): void {
 		// Parse @mentions
 		const mentions = this.parseMentions(text, fromAgent);
+		let resolvedFromDurableOutput = false;
 		for (const mention of mentions) {
-			this.routeMention(taskId, fromAgent, mention.target, mention.message);
+			const resolved = this.routeMention(taskId, fromAgent, mention.target, mention.message);
+			// Only suppress escalation when the resolved mention itself expressed
+			// the blocker; an unrelated completed-agent FYI must not hide another block.
+			resolvedFromDurableOutput =
+				(resolved && this.isBlockSignal(mention.message)) || resolvedFromDurableOutput;
 		}
 
-		// Detect block signals
-		if (this.isBlockSignal(text)) {
+		// Do not wake the human for a blocker we immediately resolved from a
+		// completed agent's durable task output.
+		if (this.isBlockSignal(text) && !resolvedFromDurableOutput) {
 			for (const listener of this.escalationListeners) {
 				listener(taskId, fromAgent, this.extractBlockReason(text));
 			}
@@ -67,7 +73,7 @@ export class Router {
 		fromAgent: string,
 		targetAgent: string,
 		message: string,
-	): void {
+	): boolean {
 		// Log the mention in the source task
 		store.appendMessage(this.squadId, sourceTaskId, {
 			ts: store.now(),
@@ -93,8 +99,41 @@ export class Router {
 				to: targetAgent,
 				text: message,
 			});
-		} else {
-			// Target not running — queue for later
+			return false;
+		}
+
+		const targetTasks = store.loadAllTasks(this.squadId).filter((task) => task.agent === targetAgent);
+		const hasFutureRun = targetTasks.some((task) =>
+			task.status === "pending" || task.status === "blocked" || task.status === "suspended" || task.status === "in_progress",
+		);
+		if (!hasFutureRun) {
+			const completed = targetTasks.filter((task) => task.status === "done" && task.output);
+			if (completed.length > 0) {
+				const durableReply = [
+					`[squad] @${targetAgent} has completed and is no longer running. Durable completed output:`,
+					...completed.map((task) => `\n## ${task.id}: ${task.title}\n${task.output}`),
+				].join("\n");
+				const reply = {
+					ts: store.now(),
+					from: targetAgent,
+					type: "reply" as const,
+					to: fromAgent,
+					text: durableReply,
+				};
+				store.appendMessage(this.squadId, sourceTaskId, reply);
+				if (this.pool.isRunning(sourceTaskId)) {
+					this.pool.steer(sourceTaskId, durableReply);
+				} else {
+					this.pool.queueMessage(fromAgent, reply);
+				}
+				return true;
+			}
+		}
+
+		// Target has future work and may spawn again — queue for that run. If the
+		// target is terminal with no output, do not create an undeliverable queue;
+		// leave the blocker unresolved so it escalates to the main orchestrator.
+		if (hasFutureRun) {
 			this.pool.queueMessage(targetAgent, {
 				ts: store.now(),
 				from: fromAgent,
@@ -103,6 +142,7 @@ export class Router {
 				text: message,
 			});
 		}
+		return false;
 	}
 
 	/**

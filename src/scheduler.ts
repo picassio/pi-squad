@@ -622,15 +622,18 @@ export class Scheduler {
 				const turnCount = event.data?.turnCount ?? 0;
 				const toolCallCount = event.data?.toolCallCount ?? 0;
 
-				// Agent must have done real work: at least 1 turn AND at least 1 tool call.
-				// An agent that exits cleanly but with 0 turns/tools did nothing —
-				// likely hit a rate limit or API error. Treat as crash, not success.
-				const hadMeaningfulWork = turnCount > 0 && toolCallCount > 0;
+				// Tool use is strong evidence of work, but planning/review tasks can
+				// legitimately deliver a substantive report without calling a tool.
+				// Accept durable assistant output; the mandatory main-orchestrator
+				// review gate still decides whether the work satisfies the contract.
+				const hasSubstantiveOutput = store.loadMessages(this.squadId, event.taskId)
+					.some((message) => message.from === event.agentName && message.type === "text" && message.text.trim().length > 0);
+				const hadMeaningfulWork = turnCount > 0 && (toolCallCount > 0 || hasSubstantiveOutput);
 				if (hadMeaningfulWork) {
 					this.handleTaskCompleted(event.taskId).then(() => this.updateContext());
 				} else {
-					// Agent exited without doing real work (0 turns or 0 tool calls).
-					// Common causes: rate limit, API error, resource pressure, crash.
+					// Agent exited without a completed turn, tool work, or substantive
+					// assistant artifact. Common causes: rate limit/API/resource failure.
 					// Retry once before failing.
 					const retryKey = `spawn-retry:${event.taskId}`;
 					if (!this.spawnRetries.has(retryKey)) {
@@ -638,7 +641,7 @@ export class Scheduler {
 						const stderr = event.data?.stderr || "";
 						const reason = turnCount === 0
 							? `exited with 0 turns (likely rate limit or API error)`
-							: `exited with ${turnCount} turns but 0 tool calls (no work done)`;
+							: `exited with ${turnCount} turns but no tool calls or substantive output`;
 						logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr}`);
 						store.updateTaskStatus(this.squadId, event.taskId, "pending");
 						store.appendMessage(this.squadId, event.taskId, {

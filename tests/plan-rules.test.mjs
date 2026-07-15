@@ -69,6 +69,34 @@ test("empty description warns", () => {
 	assert.ok(r.warnings.some((w) => w.includes("no description")));
 });
 
+test("description dependency absent from formal dependency closure warns", () => {
+	const result = validatePlan([
+		task("contract", { title: "Contract", description: "Verify: inspect contract" }),
+		task("implementation", { title: "Implementation", description: "Verify: npm test" }),
+		task("qa", {
+			title: "QA",
+			agent: "qa",
+			depends: ["implementation"],
+			description: "Context: Depend on `contract` and `implementation`. Verify: npm test",
+		}),
+	]);
+	assert.ok(result.warnings.some((warning) => warning.includes('"qa"') && warning.includes('"contract"') && warning.includes("dependency closure")));
+});
+
+test("transitive description dependency satisfies the dependency closure", () => {
+	const result = validatePlan([
+		task("contract", { title: "Contract", description: "Verify: inspect contract" }),
+		task("implementation", { title: "Implementation", depends: ["contract"], description: "Verify: npm test" }),
+		task("qa", {
+			title: "QA",
+			agent: "qa",
+			depends: ["implementation"],
+			description: "Context: Depend on `contract` and `implementation`. Verify: npm test",
+		}),
+	]);
+	assert.ok(!result.warnings.some((warning) => warning.includes("dependency closure")));
+});
+
 test("over-decomposition warns above 9 tasks", () => {
 	const tasks = Array.from({ length: 10 }, (_, i) => task(`t${i}`));
 	const r = validatePlan(tasks);
