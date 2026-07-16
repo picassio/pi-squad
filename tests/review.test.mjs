@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
 	beginOrchestratorReview,
+	beginOrchestratorRework,
 	buildOrchestratorReviewGate,
 	recordOrchestratorReview,
 } from "../src/review.ts";
@@ -71,6 +72,48 @@ test("only evidence-backed orchestrator pass changes review to done", () => {
 	assert.deepEqual(value.review.verificationEvidence, evidence.verificationEvidence);
 });
 
+test("failed review evidence moves to history when same-squad rework starts", () => {
+	const value = squad();
+	beginOrchestratorReview(value);
+	recordOrchestratorReview(value, {
+		...evidence,
+		verdict: "fail",
+		issues: ["Production E2E exposed an invalid cookie domain"],
+	});
+	const failedAttempt = value.review;
+
+	beginOrchestratorRework(value);
+	assert.equal(value.status, "running");
+	assert.equal(value.review, undefined);
+	assert.deepEqual(value.reviewHistory, [failedAttempt]);
+
+	beginOrchestratorReview(value);
+	assert.equal(value.status, "review");
+	assert.equal(value.review.status, "pending", "fresh attempt is the only active gate");
+	assert.deepEqual(value.reviewHistory, [failedAttempt], "prior evidence remains immutable history");
+});
+
+test("accepting an unrelated squad cannot resolve another squad's failed gate", () => {
+	const failed = squad();
+	failed.id = "sq-authoritative-failed";
+	beginOrchestratorReview(failed);
+	recordOrchestratorReview(failed, {
+		...evidence,
+		verdict: "fail",
+		issues: ["Authoritative squad still needs rework"],
+	});
+
+	const unrelated = squad();
+	unrelated.id = "sq-unrelated-remediation";
+	beginOrchestratorReview(unrelated);
+	recordOrchestratorReview(unrelated, evidence);
+
+	assert.equal(unrelated.status, "done");
+	assert.equal(failed.status, "review");
+	assert.equal(failed.review.status, "failed");
+	assert.equal(failed.reviewHistory, undefined);
+});
+
 test("failed independent review remains gated until fixes and re-review", () => {
 	const value = squad();
 	beginOrchestratorReview(value);
@@ -82,7 +125,8 @@ test("failed independent review remains gated until fixes and re-review", () => 
 	assert.equal(value.status, "review");
 	assert.equal(value.review.status, "failed");
 	assert.throws(
-		() => recordOrchestratorReview(value, { ...evidence, verdict: "pass_with_issues", issues: [] }),
-		/pass_with_issues must list/,
+		() => recordOrchestratorReview(value, evidence),
+		/already failed; begin same-squad rework/,
+		"a failed attempt cannot be overwritten by a pass without settled rework and a fresh pending gate",
 	);
 });

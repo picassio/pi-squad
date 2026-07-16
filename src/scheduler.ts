@@ -19,7 +19,7 @@ import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
 import { buildAgentSystemPrompt } from "./protocol.js";
 import { buildAdvisorConsultText, formatAdvisorSteerMessage, adviceNeedsHuman, type AdvisorConsultInput } from "./advisor.js";
-import { beginOrchestratorReview } from "./review.js";
+import { beginOrchestratorReview, beginOrchestratorRework } from "./review.js";
 
 // ============================================================================
 // Types
@@ -170,6 +170,10 @@ export class Scheduler {
 
 	/** Start the scheduler — begins scheduling ready tasks */
 	async start(): Promise<void> {
+		if (this.running) {
+			await this.reconcile();
+			return;
+		}
 		this.running = true;
 		this.monitor.start();
 		await this.reconcile();
@@ -200,13 +204,15 @@ export class Scheduler {
 		await this.pool.killAll();
 	}
 
-	/** Resume from suspended OR failed state. Failure is never terminal:
-	 * failed tasks are reset to pending and a failed squad becomes running. */
+	/** Resume suspended/failed work. A failed review is archived only when
+	 * resumable work actually exists; a bare resume cannot bypass the gate. */
 	async resume(): Promise<void> {
 		const tasks = store.loadAllTasks(this.squadId);
+		let resumedWork = false;
 		for (const task of tasks) {
 			if (task.status === "suspended") {
 				store.updateTaskStatus(this.squadId, task.id, "pending");
+				resumedWork = true;
 			} else if (task.status === "failed") {
 				store.updateTaskStatus(this.squadId, task.id, "pending", { error: null });
 				store.appendMessage(this.squadId, task.id, {
@@ -215,13 +221,19 @@ export class Scheduler {
 					type: "status",
 					text: "Reset failed → pending on squad resume",
 				});
+				resumedWork = true;
 			}
 		}
 
 		const squad = store.loadSquad(this.squadId);
-		if (squad && (squad.status === "paused" || squad.status === "failed")) {
-			squad.status = "running";
-			store.saveSquad(squad);
+		if (squad) {
+			if (resumedWork && squad.status === "review" && squad.review?.status === "failed") {
+				beginOrchestratorRework(squad);
+				store.saveSquad(squad);
+			} else if (squad.status === "paused" || squad.status === "failed") {
+				squad.status = "running";
+				store.saveSquad(squad);
+			}
 		}
 
 		await this.start();
@@ -262,8 +274,7 @@ export class Scheduler {
 			recoveredMailbox = true;
 		}
 		if (recoveredMailbox && squad.status !== "running") {
-			squad.status = "running";
-			delete squad.review;
+			beginOrchestratorRework(squad);
 			store.saveSquad(squad);
 		}
 
@@ -1301,6 +1312,17 @@ export class Scheduler {
 		await Promise.all(kills);
 	}
 
+	private reopenSquadForWork(): void {
+		const squad = store.loadSquad(this.squadId);
+		if (!squad) throw new Error(`Squad not found: ${this.squadId}`);
+		if (squad.status === "review" || squad.status === "done" || squad.review) {
+			beginOrchestratorRework(squad);
+		} else if (squad.status !== "running") {
+			squad.status = "running";
+		}
+		store.saveSquad(squad);
+	}
+
 	private async reopenTaskForMessage(task: Task): Promise<void> {
 		if (task.status === "done") await this.invalidateDescendants(task.id);
 		const tasks = store.loadAllTasks(this.squadId);
@@ -1313,14 +1335,7 @@ export class Scheduler {
 			completed: null,
 		});
 
-		const squad = store.loadSquad(this.squadId);
-		if (squad && squad.status !== "running") {
-			squad.status = "running";
-			// Any prior acceptance/review applies to the pre-resume result. The
-			// normal all-done path will require a fresh independent review.
-			delete squad.review;
-			store.saveSquad(squad);
-		}
+		this.reopenSquadForWork();
 	}
 
 	/** Send a main-orchestrator request to one exact task and await its next reply. */
@@ -1381,10 +1396,32 @@ export class Scheduler {
 		this.updateContext();
 	}
 
-	/** Resume a suspended/failed task. Reconciles so a failed squad heals too. */
+	/** Add work to this exact squad and schedule it, reconstructing safely after restart. */
+	async addTask(task: Task): Promise<void> {
+		if (store.loadTask(this.squadId, task.id)) throw new Error(`Task already exists: ${task.id}`);
+		store.createTask(this.squadId, task);
+		this.reopenSquadForWork();
+		await this.start();
+		this.updateContext();
+	}
+
+	/** Resume one exact task. Reopening completed work invalidates descendants and
+	 * archives a completed active review before fresh scheduling begins. */
 	async resumeTask(taskId: string): Promise<void> {
-		store.updateTaskStatus(this.squadId, taskId, "pending", { error: null });
-		await this.reconcile();
+		const task = store.loadTask(this.squadId, taskId);
+		if (!task) throw new Error(`Task not found: ${taskId}`);
+		if (task.status === "done") await this.invalidateDescendants(taskId);
+		const tasks = store.loadAllTasks(this.squadId);
+		const dependenciesDone = task.depends.every(
+			(depId) => tasks.find((candidate) => candidate.id === depId)?.status === "done",
+		);
+		store.updateTaskStatus(this.squadId, taskId, dependenciesDone ? "pending" : "blocked", {
+			error: null,
+			completed: null,
+		});
+		this.reopenSquadForWork();
+		await this.start();
+		this.updateContext();
 	}
 
 	/**

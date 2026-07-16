@@ -52,8 +52,10 @@ Squad agents—including QA/reviewer agents—produce candidate work and evidenc
 - Persisted status becomes `review`, never directly `done`.
 - A persistent `<squad_review_required>` system reminder tells main Pi to re-read the original conversation contract, inspect the actual diff/source, rerun verification independently, and run integration/E2E where applicable.
 - Main Pi must call `squad_review` with requirement-by-requirement contract checks, diff review, actual command/result evidence, integration/E2E evidence, and issues.
-- Only `pass` or `pass_with_issues` changes the squad to `done`; `fail` leaves it review-blocked for fixes and re-review.
-- Pending review survives Pi restarts and is restored on the next session.
+- Only `pass` or `pass_with_issues` changes the squad to `done`; `fail` leaves it review-blocked and cannot be overwritten by another verdict.
+- Failed review is reworked in the **same authoritative squad**: use `squad_modify` with that `squadId` and `add_task` or `resume_task` (or `resume` when interrupted work exists). These operations reconstruct the scheduler after restart. `/squad resume <squad-id>` provides the same resume path.
+- When rework begins, the failed attempt moves to `reviewHistory`, the squad returns to `running`, and its evidence remains auditable. After every rework task settles, a fresh pending review becomes the active gate and `squad_review` is required again.
+- Pending and failed review gates survive Pi restarts and are restored on the next session. A separate squad never links to, remediates, or accepts the failed gate.
 
 The completion report is explicitly labeled **untrusted and not yet accepted**. Main Pi must never merely relay it or ask whether verification should be run.
 
@@ -188,6 +190,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | Command | Description |
 |---|---|
 | `/squad select` | Pick a squad to view |
+| `/squad resume [squad-id]` | Reconstruct and resume an exact paused/failed/failed-review squad |
 | `/squad list` | List project squads |
 | `/squad all` | List all squads |
 | `/squad agents` | Manage agent definitions |
@@ -206,7 +209,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `squad` | Start a squad with goal + optional tasks/config |
 | `squad_status` | Check progress, costs, task states |
 | `squad_message` | Durably message an exact task; completed tasks reopen on their original session |
-| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads |
+| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads; accepts `squadId` for exact same-squad failed-review rework |
 
 The main agent sees available agents in its system prompt and squad state when a squad is active.
 

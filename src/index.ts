@@ -176,6 +176,38 @@ function getActiveScheduler(): Scheduler | null {
 	return schedulers.get(activeSquadId) || null;
 }
 
+/** Reconstruct and focus one exact persisted squad without creating/linking another. */
+function ensureScheduler(pi: ExtensionAPI, squadId: string, skillPaths: string[]): Scheduler {
+	let scheduler = schedulers.get(squadId);
+	if (!scheduler) {
+		scheduler = new Scheduler(squadId, skillPaths, schedulerSpawnContext);
+		schedulers.set(squadId, scheduler);
+		wireSchedulerEvents(pi, scheduler, squadId);
+	}
+	activeSquadId = squadId;
+	widgetState.squadId = squadId;
+	widgetState.enabled = true;
+	widgetControls?.requestUpdate();
+	return scheduler;
+}
+
+function isResumeCandidate(squad: Squad): boolean {
+	return squad.status === "paused" || squad.status === "failed" ||
+		(squad.status === "review" && squad.review?.status === "failed") ||
+		store.loadAllTasks(squad.id).some((task) => task.status === "suspended" || task.status === "failed");
+}
+
+function resolveResumeSquad(cwd: string, explicitId?: string): Squad | null {
+	if (explicitId) return store.loadSquad(explicitId);
+	if (activeSquadId) {
+		const active = store.loadSquad(activeSquadId);
+		if (active?.cwd === cwd && isResumeCandidate(active)) return active;
+	}
+	return store.listSquadsForProject(cwd)
+		.filter(isResumeCandidate)
+		.sort((a, b) => b.created.localeCompare(a.created))[0] ?? null;
+}
+
 
 // ============================================================================
 // Extension Entry
@@ -560,8 +592,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_modify",
 		label: "Squad Modify",
-		description: "Modify the running squad: add_task, cancel_task, complete_task (mark done + schedule dependents), pause, resume (also recovers failed squads), cancel (entire squad).",
+		description: "Modify one exact squad: add_task, cancel_task, complete_task (mark done + schedule dependents), pause, resume_task, resume (including failed-review rework), cancel. add_task/resume_task/resume reconstruct the persisted scheduler after restart.",
 		parameters: Type.Object({
+			squadId: Type.Optional(Type.String({ description: "Exact squad to modify (recommended for failed-review rework; default: focused/recoverable project squad)" })),
 			action: Type.Union(
 				[
 					Type.Literal("add_task"),
@@ -590,45 +623,37 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			// Resume can work without an active scheduler — it recreates one from disk
 			if (params.action === "resume") {
-				// Find a squad to resume: use activeSquadId or find the latest paused one
-				const squadId = activeSquadId || store.findActiveSquads()
-					.filter((s) => s.cwd === ctx.cwd && (s.status === "paused" || s.status === "failed"))
-					.sort((a, b) => b.created.localeCompare(a.created))[0]?.id;
-
-				if (!squadId) {
-					return { content: [{ type: "text" as const, text: "No paused or failed squad found to resume." }], details: undefined };
+				const squad = resolveResumeSquad(ctx.cwd, params.squadId);
+				if (!squad) {
+					const text = params.squadId
+						? `Squad '${params.squadId}' not found.`
+						: "No paused, failed, or failed-review squad found to resume.";
+					return { content: [{ type: "text" as const, text }], details: undefined };
 				}
-
-				// Create a fresh scheduler if needed
-				if (!schedulers.has(squadId)) {
-					const scheduler = new Scheduler(squadId, squadSkillPaths, schedulerSpawnContext);
-					schedulers.set(squadId, scheduler);
-					activeSquadId = squadId;
-
-					// Activate widget
-					widgetState.squadId = squadId;
-					widgetState.enabled = true;
-					widgetControls?.requestUpdate();
-
-					wireSchedulerEvents(pi, scheduler, squadId);
+				const resumeSched = ensureScheduler(pi, squad.id, squadSkillPaths);
+				try {
+					await resumeSched.resume();
+				} catch (err) {
+					return { content: [{ type: "text" as const, text: `Resume failed: ${(err as Error).message}` }], details: undefined };
 				}
-
-				const resumeSched = schedulers.get(squadId)!;
-				resumeSched.resume().catch((err) => {
-					logError("squad", `Resume error: ${(err as Error).message}`);
-				});
-
-				const tasks = store.loadAllTasks(squadId);
-				const done = tasks.filter(t => t.status === "done").length;
-				return { content: [{ type: "text" as const, text: `Squad "${squadId}" resumed (${done}/${tasks.length} done). Agents restarting in background.` }], details: undefined };
+				const tasks = store.loadAllTasks(squad.id);
+				const done = tasks.filter((task) => task.status === "done").length;
+				return { content: [{ type: "text" as const, text: `Squad "${squad.id}" resumed (${done}/${tasks.length} done). Agents restarting in background.` }], details: undefined };
 			}
 
-			const activeScheduler = getActiveScheduler();
-			if (!activeScheduler || !activeSquadId) {
-				return { content: [{ type: "text" as const, text: "No active squad. Use squad_modify with action 'resume' to resume a paused squad, or start a new one with the squad tool." }], details: undefined };
+			const squadId = params.squadId || activeSquadId;
+			if (!squadId || !store.loadSquad(squadId)) {
+				return { content: [{ type: "text" as const, text: params.squadId ? `Squad '${params.squadId}' not found.` : "No active squad. Provide squadId, select the squad, or start a new one." }], details: undefined };
 			}
+			let activeScheduler = schedulers.get(squadId) || null;
+			if (!activeScheduler && (params.action === "add_task" || params.action === "resume_task")) {
+				activeScheduler = ensureScheduler(pi, squadId, squadSkillPaths);
+			}
+			if (!activeScheduler) {
+				return { content: [{ type: "text" as const, text: `Squad '${squadId}' has no active scheduler. Use resume, add_task, or resume_task to reconstruct it.` }], details: undefined };
+			}
+			activeSquadId = squadId;
 
 			switch (params.action) {
 				case "add_task": {
@@ -645,17 +670,19 @@ export default function (pi: ExtensionAPI) {
 					if (badDeps.length > 0) {
 						return { content: [{ type: "text" as const, text: `Unknown dependency task(s): ${badDeps.join(", ")}. Existing tasks: ${[...existingIds].join(", ")}` }], details: undefined };
 					}
-					if (!store.loadAgentDef(params.task.agent, ctx.cwd)) {
-						const available = store.loadAllAgentDefs(ctx.cwd).filter((a) => !a.disabled).map((a) => a.name).join(", ");
+					const targetCwd = store.loadSquad(squadId)!.cwd;
+					if (!store.loadAgentDef(params.task.agent, targetCwd)) {
+						const available = store.loadAllAgentDefs(targetCwd).filter((a) => !a.disabled).map((a) => a.name).join(", ");
 						return { content: [{ type: "text" as const, text: `Unknown agent '${params.task.agent}'. Available: ${available}` }], details: undefined };
 					}
+					const dependencies = params.task.depends || [];
 					const task: Task = {
 						id: params.task.id,
 						title: params.task.title,
 						description: params.task.description || "",
 						agent: params.task.agent,
-						status: "pending",
-						depends: params.task.depends || [],
+						status: dependencies.every((dependency) => existing.find((candidate) => candidate.id === dependency)?.status === "done") ? "pending" : "blocked",
+						depends: dependencies,
 						...(params.task.inheritContext ? { inheritContext: true } : {}),
 						created: store.now(),
 						started: null,
@@ -664,9 +691,12 @@ export default function (pi: ExtensionAPI) {
 						error: null,
 						usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
 					};
-					store.createTask(activeSquadId, task);
-					activeScheduler.updateContext();
-					return { content: [{ type: "text" as const, text: `Task '${task.id}' added.` }], details: undefined };
+					try {
+						await activeScheduler.addTask(task);
+					} catch (err) {
+						return { content: [{ type: "text" as const, text: `add_task failed: ${(err as Error).message}` }], details: undefined };
+					}
+					return { content: [{ type: "text" as const, text: `Task '${task.id}' added to squad '${squadId}'.` }], details: undefined };
 				}
 
 				case "cancel_task": {
@@ -683,10 +713,12 @@ export default function (pi: ExtensionAPI) {
 
 				case "resume_task": {
 					if (!params.taskId) return { content: [{ type: "text" as const, text: "Provide taskId." }], details: undefined };
-					activeScheduler.resumeTask(params.taskId).catch((err) => {
-						logError("squad", `Resume task error: ${(err as Error).message}`);
-					});
-					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' resumed.` }], details: undefined };
+					try {
+						await activeScheduler.resumeTask(params.taskId);
+					} catch (err) {
+						return { content: [{ type: "text" as const, text: `resume_task failed: ${(err as Error).message}` }], details: undefined };
+					}
+					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' resumed in squad '${squadId}'.` }], details: undefined };
 				}
 
 				case "complete_task": {
@@ -866,12 +898,13 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 
 	pi.registerCommand("squad", {
-		description: "Browse, select, and manage squads. Usage: /squad [list|all|select|agents|msg|widget|panel|cancel|clear]",
+		description: "Browse, select, and manage squads. Usage: /squad [list|all|select|resume|agents|msg|widget|panel|cancel|clear]",
 		getArgumentCompletions: (prefix) => {
 			const subs = [
 				{ value: "list", label: "list", description: "List squads for current project" },
 				{ value: "all", label: "all", description: "List all squads, select to activate" },
 				{ value: "select", label: "select", description: "Pick a squad to view (interactive)" },
+				{ value: "resume", label: "resume", description: "Resume an exact paused/failed/failed-review squad" },
 				{ value: "agents", label: "agents", description: "List, view, or edit agent definitions" },
 				{ value: "defaults", label: "defaults", description: "Default model/thinking for agents (follow main session, pi default, or fixed)" },
 				{ value: "advisor", label: "advisor", description: "Advisor-first rescue for stuck agents (on/off, model, limits)" },
@@ -938,6 +971,25 @@ export default function (pi: ExtensionAPI) {
 					}
 					const selected = await pickSquad(ctx, squads, showProject);
 					if (selected) activateSquadView(selected.id, ctx);
+					return;
+				}
+
+				case "resume": {
+					const squad = resolveResumeSquad(ctx.cwd, parts[1]);
+					if (!squad) {
+						ctx.ui.notify(parts[1] ? `Squad '${parts[1]}' not found` : "No paused, failed, or failed-review squad found", "warning");
+						return;
+					}
+					const scheduler = ensureScheduler(pi, squad.id, squadSkillPaths);
+					try {
+						await scheduler.resume();
+					} catch (error) {
+						ctx.ui.notify(`Resume failed: ${(error as Error).message}`, "error");
+						return;
+					}
+					const tasks = store.loadAllTasks(squad.id);
+					const done = tasks.filter((task) => task.status === "done").length;
+					ctx.ui.notify(`Resumed: ${squad.id} (${done}/${tasks.length} done)`, "info");
 					return;
 				}
 
@@ -1398,7 +1450,7 @@ export default function (pi: ExtensionAPI) {
 						activateSquadView(direct.id, ctx);
 						return;
 					}
-					ctx.ui.notify(`Unknown: /squad ${sub}. Try: list, all, select, agents, defaults, msg, widget, panel, cancel, clear, cleanup`, "warning");
+					ctx.ui.notify(`Unknown: /squad ${sub}. Try: list, all, select, resume, agents, defaults, msg, widget, panel, cancel, clear, cleanup`, "warning");
 			}
 		},
 	});

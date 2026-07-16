@@ -71,6 +71,15 @@ process.stdin.on("data", (chunk) => {
 			response.data = { sessionFile, sessionId: "original-session-id" };
 		}
 		process.stdout.write(JSON.stringify(response) + "\\n");
+		if (command.type === "prompt" && command.message.includes("QA_RPC_AUTO_SETTLE")) {
+			setTimeout(() => {
+				process.stdout.write(JSON.stringify({
+					type: "message_end",
+					message: { role: "assistant", content: [{ type: "text", text: "QA fake RPC work settled" }] },
+				}) + "\\n");
+				process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+			}, 100);
+		}
 	}
 });
 process.on("SIGTERM", () => process.exit(0));
@@ -88,14 +97,16 @@ const { default: registerExtension } = await import("../src/index.ts");
 
 function createFakeExtensionApi() {
 	const tools = new Map();
+	const commands = new Map();
 	const events = new Map();
 	const sent = [];
 	return {
 		tools,
+		commands,
 		events,
 		sent,
 		registerTool(definition) { tools.set(definition.name, definition); },
-		registerCommand() {},
+		registerCommand(name, definition) { commands.set(name, definition); },
 		on(name, listener) {
 			const listeners = events.get(name) || [];
 			listeners.push(listener);
@@ -111,7 +122,17 @@ async function emit(api, name, ...args) {
 }
 
 function readRpcLog() {
+	if (!fs.existsSync(rpcLog)) return [];
 	return fs.readFileSync(rpcLog, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+}
+
+async function waitFor(predicate, message, timeoutMs = 5_000) {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate()) return;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.fail(message);
 }
 
 test("squad_message reconstructs after restart and reopens a done task with --session", async (t) => {
@@ -178,6 +199,376 @@ test("squad_message reconstructs after restart and reopens a done task with --se
 
 	await emit(api, "session_shutdown");
 	assert.equal(store.loadTask(squadId, taskId).status, "suspended", "intentional shutdown must not be misclassified as an unexpected exit");
+});
+
+test("failed review can add same-squad rework after restart and requires a fresh passing review", async () => {
+	const squadId = "sq-extension-review-rework";
+	const originalTaskId = "original-work";
+	const failedReview = {
+		status: "failed",
+		requestedAt: "2026-07-16T10:30:00.000Z",
+		completedAt: "2026-07-16T10:31:00.000Z",
+		verdict: "fail",
+		contractChecks: ["Original behavior remains broken"],
+		diffReview: "Inspected the implementation and found the defect.",
+		verificationEvidence: ["npm test -> one regression failed"],
+		integrationEvidence: "Production-like reproduction failed.",
+		issues: ["Fix the failed-review lifecycle"],
+	};
+	store.saveSquad({
+		id: squadId,
+		goal: "repair the failed review in the authoritative squad",
+		status: "review",
+		created: "2026-07-16T10:30:00.000Z",
+		cwd: tempHome,
+		agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+		review: failedReview,
+	});
+	store.createTask(squadId, {
+		id: originalTaskId,
+		title: "Original work",
+		description: "The first candidate",
+		agent: "backend",
+		status: "done",
+		depends: [],
+		created: "2026-07-16T10:30:00.000Z",
+		started: "2026-07-16T10:30:01.000Z",
+		completed: "2026-07-16T10:30:30.000Z",
+		output: "candidate rejected by review",
+		error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 1 },
+	});
+
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome };
+	await emit(api, "session_start", {}, ctx);
+
+	const review = api.tools.get("squad_review");
+	const prematurePass = await review.execute("premature-pass", {
+		squadId,
+		verdict: "pass",
+		contractChecks: ["Claimed fixed without rework"],
+		diffReview: "No new rework exists.",
+		verificationEvidence: ["No fresh verification exists."],
+		integrationEvidence: "Not rerun.",
+		issues: [],
+	}, undefined, undefined, ctx);
+	assert.match(prematurePass.content[0].text, /Review rejected: .*already failed/);
+	assert.deepEqual(store.loadSquad(squadId).review, failedReview, "a second verdict cannot overwrite the failed gate");
+
+	const modify = api.tools.get("squad_modify");
+	const resumeResult = await modify.execute("reconstruct-review", {
+		action: "resume",
+		squadId,
+	}, undefined, undefined, ctx);
+	assert.match(resumeResult.content[0].text, /Squad .* resumed/);
+	assert.equal(store.loadSquad(squadId).status, "review", "resume reconstruction alone cannot bypass a failed gate without resumable work");
+	assert.deepEqual(store.loadSquad(squadId).review, failedReview);
+
+	const addResult = await modify.execute("add-rework", {
+		action: "add_task",
+		squadId,
+		task: {
+			id: "review-fix",
+			title: "Fix failed review",
+			description: "Address the recorded failed-review issue",
+			agent: "backend",
+			depends: [originalTaskId],
+		},
+	}, undefined, undefined, ctx);
+	assert.match(addResult.content[0].text, /Task 'review-fix' added/);
+	assert.equal(store.loadTask(squadId, "review-fix").status, "in_progress", "new rework starts on a reconstructed scheduler");
+	let squad = store.loadSquad(squadId);
+	assert.equal(squad.status, "running");
+	assert.equal(squad.review, undefined, "failed gate is no longer the active attempt during rework");
+	assert.deepEqual(squad.reviewHistory, [failedReview], "failed evidence remains in same-squad history");
+
+	const settleResult = await modify.execute("settle-rework", {
+		action: "complete_task",
+		squadId,
+		taskId: "review-fix",
+		output: "failed-review lifecycle repaired",
+	}, undefined, undefined, ctx);
+	assert.match(settleResult.content[0].text, /marked done/);
+	squad = store.loadSquad(squadId);
+	assert.equal(squad.status, "review", "settled rework creates a fresh mandatory gate");
+	assert.equal(squad.review.status, "pending");
+	assert.deepEqual(squad.reviewHistory, [failedReview]);
+
+	const passResult = await review.execute("pass-rework", {
+		squadId,
+		verdict: "pass",
+		contractChecks: ["Same-squad rework completed"],
+		diffReview: "Inspected the rework in the authoritative squad.",
+		verificationEvidence: ["public lifecycle regression passed"],
+		integrationEvidence: "Restart, scheduler reconstruction, rework, and settlement exercised through public tools.",
+		issues: [],
+	}, undefined, undefined, ctx);
+	assert.match(passResult.content[0].text, /accepted as done/);
+	squad = store.loadSquad(squadId);
+	assert.equal(squad.status, "done");
+	assert.equal(squad.review.status, "passed", "fresh review replaces the active gate");
+	assert.deepEqual(squad.reviewHistory, [failedReview], "the original failure remains auditable after acceptance");
+
+	await emit(api, "session_shutdown");
+});
+
+test("public tools preserve the failed gate across restart until fake-RPC rework agent_settled and fresh review", async (t) => {
+	const ctx = {
+		hasUI: false,
+		cwd: tempHome,
+		sessionManager: { getSessionFile: () => null },
+	};
+	const startParams = (goal, taskId) => ({
+		goal,
+		tasks: [{
+			id: taskId,
+			title: "Fake RPC lifecycle work",
+			description: "QA_RPC_AUTO_SETTLE. Verify the fake RPC agent_settled lifecycle.",
+			agent: "backend",
+			depends: [],
+		}],
+		config: { maxConcurrency: 1 },
+	});
+	const reviewEvidence = (verdict, issue = []) => ({
+		verdict,
+		contractChecks: ["Observed the exact public-tool lifecycle"],
+		diffReview: "Inspected same-squad persisted state and review history.",
+		verificationEvidence: ["Fake Pi RPC emitted message_end then agent_settled."],
+		integrationEvidence: "Extension tools, scheduler reconstruction, child RPC, and file-backed store were exercised together.",
+		issues: issue,
+	});
+
+	const firstApi = createFakeExtensionApi();
+	registerExtension(firstApi);
+	await emit(firstApi, "session_start", {}, ctx);
+	const initialResult = await firstApi.tools.get("squad").execute(
+		"initial-squad",
+		startParams("QA authoritative failed-review RPC lifecycle", "initial-work"),
+		undefined,
+		undefined,
+		ctx,
+	);
+	const squadId = initialResult.content[0].text.match(/Squad "([^"]+)"/)?.[1];
+	assert.ok(squadId);
+	await waitFor(
+		() => store.loadSquad(squadId)?.review?.status === "pending",
+		"initial agent_settled did not create the mandatory pending review",
+	);
+	assert.equal(store.loadTask(squadId, "initial-work").status, "done");
+
+	const failedResult = await firstApi.tools.get("squad_review").execute(
+		"fail-initial",
+		{ squadId, ...reviewEvidence("fail", ["Rework is required"]) },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.match(failedResult.content[0].text, /review FAILED/i);
+	const failedReview = store.loadSquad(squadId).review;
+	assert.equal(failedReview.status, "failed");
+
+	const unrelatedResult = await firstApi.tools.get("squad").execute(
+		"unrelated-squad",
+		startParams("QA unrelated RPC lifecycle", "unrelated-work"),
+		undefined,
+		undefined,
+		ctx,
+	);
+	const unrelatedId = unrelatedResult.content[0].text.match(/Squad "([^"]+)"/)?.[1];
+	assert.ok(unrelatedId);
+	await waitFor(
+		() => store.loadSquad(unrelatedId)?.review?.status === "pending",
+		"unrelated agent_settled did not create its pending review",
+	);
+	await firstApi.tools.get("squad_review").execute(
+		"pass-unrelated",
+		{ squadId: unrelatedId, ...reviewEvidence("pass") },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.equal(store.loadSquad(unrelatedId).status, "done");
+	assert.equal(store.loadSquad(squadId).review.status, "failed", "unrelated acceptance cannot alter the authoritative gate");
+
+	await emit(firstApi, "session_shutdown");
+
+	const restartedApi = createFakeExtensionApi();
+	registerExtension(restartedApi);
+	await emit(restartedApi, "session_start", {}, ctx);
+	assert.ok(
+		restartedApi.sent.some((entry) => entry.message.customType === "squad-review-required"),
+		"restart must restore the failed review gate",
+	);
+	const modify = restartedApi.tools.get("squad_modify");
+	const bareResume = await modify.execute("bare-resume", { action: "resume", squadId }, undefined, undefined, ctx);
+	assert.match(bareResume.content[0].text, /resumed/);
+	assert.equal(store.loadSquad(squadId).review.status, "failed", "scheduler reconstruction alone cannot clear the gate");
+
+	const addResult = await modify.execute("add-rpc-rework", {
+		action: "add_task",
+		squadId,
+		task: {
+			id: "rpc-rework",
+			title: "Rework through fake Pi RPC",
+			description: "QA_RPC_AUTO_SETTLE. Verify fresh agent_settled review gating.",
+			agent: "backend",
+			depends: ["initial-work"],
+		},
+	}, undefined, undefined, ctx);
+	assert.match(addResult.content[0].text, /added to squad/);
+	assert.equal(store.loadSquad(squadId).status, "running");
+	assert.equal(store.loadSquad(squadId).review, undefined);
+	assert.deepEqual(store.loadSquad(squadId).reviewHistory, [failedReview]);
+
+	await waitFor(
+		() => store.loadSquad(squadId)?.review?.status === "pending",
+		"rework agent_settled did not create a fresh mandatory review",
+	);
+	assert.equal(store.loadTask(squadId, "rpc-rework").status, "done");
+	assert.deepEqual(store.loadSquad(squadId).reviewHistory, [failedReview]);
+
+	const passResult = await restartedApi.tools.get("squad_review").execute(
+		"pass-rework",
+		{ squadId, ...reviewEvidence("pass") },
+		undefined,
+		undefined,
+		ctx,
+	);
+	assert.match(passResult.content[0].text, /accepted as done/);
+	assert.equal(store.loadSquad(squadId).status, "done");
+	assert.equal(store.loadSquad(squadId).review.status, "passed");
+	assert.deepEqual(store.loadSquad(squadId).reviewHistory, [failedReview]);
+	assert.equal(store.loadSquad(unrelatedId).status, "done");
+
+	const rpcRecords = readRpcLog();
+	assert.ok(rpcRecords.filter((record) => record.kind === "rpc" && record.command.type === "prompt").length >= 3);
+	t.diagnostic(`authoritative squad: ${squadId}`);
+	t.diagnostic(`review history retained: ${store.loadSquad(squadId).reviewHistory.length}`);
+	await emit(restartedApi, "session_shutdown");
+});
+
+test("resume_task reconstructs the failed-review squad and reopens the exact durable task", async () => {
+	const squadId = "sq-extension-review-resume-task";
+	const taskId = "resume-original";
+	const originalSession = path.join(store.getTaskSessionDir(squadId, taskId), "resume-original.jsonl");
+	const failedReview = {
+		status: "failed",
+		requestedAt: "2026-07-16T10:40:00.000Z",
+		completedAt: "2026-07-16T10:41:00.000Z",
+		verdict: "fail",
+		contractChecks: ["Resume behavior failed"],
+		diffReview: "Inspected resume behavior.",
+		verificationEvidence: ["restart repro failed"],
+		integrationEvidence: "Public tool could not reopen the task.",
+		issues: ["Resume the exact task"],
+	};
+	store.saveSquad({
+		id: squadId,
+		goal: "resume exact same-squad task",
+		status: "review",
+		created: "2026-07-16T10:40:00.000Z",
+		cwd: tempHome,
+		agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+		review: failedReview,
+	});
+	store.createTask(squadId, {
+		id: taskId,
+		title: "Resume original",
+		description: "Continue in the original session",
+		agent: "backend",
+		status: "done",
+		depends: [],
+		created: "2026-07-16T10:40:00.000Z",
+		started: "2026-07-16T10:40:01.000Z",
+		completed: "2026-07-16T10:40:30.000Z",
+		output: "first rejected candidate",
+		error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 1 },
+	});
+	store.bindTaskSession(squadId, taskId, { file: originalSession, sessionId: "resume-original-session" });
+	const rpcBefore = readRpcLog().length;
+
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome };
+	await emit(api, "session_start", {}, ctx);
+	const result = await api.tools.get("squad_modify").execute("resume-task", {
+		action: "resume_task",
+		squadId,
+		taskId,
+	}, undefined, undefined, ctx);
+	assert.match(result.content[0].text, /resumed in squad/);
+	assert.equal(store.loadTask(squadId, taskId).status, "in_progress");
+	const squad = store.loadSquad(squadId);
+	assert.equal(squad.status, "running");
+	assert.equal(squad.review, undefined);
+	assert.deepEqual(squad.reviewHistory, [failedReview]);
+	const argv = readRpcLog().slice(rpcBefore).find((record) => record.kind === "argv")?.args;
+	assert.deepEqual(argv?.slice(0, 4), ["--mode", "rpc", "--session", originalSession]);
+
+	await emit(api, "session_shutdown");
+});
+
+test("slash resume reconstructs the exact failed-review squad when resumable work exists", async () => {
+	const squadId = "sq-extension-slash-resume";
+	const taskId = "suspended-rework";
+	const originalSession = path.join(store.getTaskSessionDir(squadId, taskId), "slash-resume.jsonl");
+	const failedReview = {
+		status: "failed",
+		requestedAt: "2026-07-16T10:50:00.000Z",
+		completedAt: "2026-07-16T10:51:00.000Z",
+		verdict: "fail",
+		contractChecks: ["Slash resume failed"],
+		diffReview: "Inspected slash behavior.",
+		verificationEvidence: ["slash repro failed"],
+		integrationEvidence: "Restarted extension could not resume rework.",
+		issues: ["Restore slash resume"],
+	};
+	store.saveSquad({
+		id: squadId,
+		goal: "resume failed-review rework from slash command",
+		status: "review",
+		created: "2026-07-16T10:50:00.000Z",
+		cwd: tempHome,
+		agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+		review: failedReview,
+	});
+	store.createTask(squadId, {
+		id: taskId,
+		title: "Suspended rework",
+		description: "Resume the interrupted same-squad fix",
+		agent: "backend",
+		status: "suspended",
+		depends: [],
+		created: "2026-07-16T10:50:00.000Z",
+		started: "2026-07-16T10:50:01.000Z",
+		completed: null,
+		output: null,
+		error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 1 },
+	});
+	store.bindTaskSession(squadId, taskId, { file: originalSession, sessionId: "slash-resume-session" });
+
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const notifications = [];
+	const ctx = { hasUI: false, cwd: tempHome, ui: { notify: (message, level) => notifications.push({ message, level }) } };
+	await emit(api, "session_start", {}, ctx);
+	await api.commands.get("squad").handler(`resume ${squadId}`, ctx);
+
+	assert.equal(store.loadTask(squadId, taskId).status, "in_progress");
+	const squad = store.loadSquad(squadId);
+	assert.equal(squad.status, "running");
+	assert.equal(squad.review, undefined);
+	assert.deepEqual(squad.reviewHistory, [failedReview]);
+	assert.ok(notifications.some(({ message }) => message.includes(`Resumed: ${squadId}`)));
+
+	await emit(api, "session_shutdown");
 });
 
 test("extension restart automatically reconstructs and delivers pending task mail", async () => {

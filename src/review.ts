@@ -11,6 +11,18 @@ export interface OrchestratorReviewInput {
 	issues: string[];
 }
 
+/**
+ * Start same-squad rework without discarding completed review evidence.
+ * The next all-tasks-done transition creates a new active pending review.
+ */
+export function beginOrchestratorRework(squad: Squad): void {
+	if (squad.review && squad.review.status !== "pending") {
+		squad.reviewHistory = [...(squad.reviewHistory ?? []), { ...squad.review }];
+	}
+	delete squad.review;
+	squad.status = "running";
+}
+
 /** Move a squad from agent execution into mandatory independent main-session review. */
 export function beginOrchestratorReview(squad: Squad): void {
 	squad.status = "review";
@@ -34,6 +46,9 @@ export function beginOrchestratorReview(squad: Squad): void {
 export function recordOrchestratorReview(squad: Squad, input: OrchestratorReviewInput): void {
 	if (squad.status !== "review" || !squad.review) {
 		throw new Error(`Squad '${squad.id}' is not awaiting orchestrator review`);
+	}
+	if (squad.review.status !== "pending") {
+		throw new Error(`Squad '${squad.id}' review attempt is already ${squad.review.status}; begin same-squad rework before submitting a fresh review`);
 	}
 
 	const contractChecks = cleanList(input.contractChecks);

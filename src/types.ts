@@ -112,8 +112,10 @@ export interface Squad {
 	/** Agent name → overrides. Keys must exist in .pi/squad/agents/ */
 	agents: Record<string, SquadAgentEntry>;
 	config: SquadConfig;
-	/** Mandatory independent main-session review; absent on legacy/running squads. */
+	/** Mandatory independent main-session review; absent while rework is running. */
 	review?: SquadReview;
+	/** Completed prior review attempts retained as same-squad audit evidence. */
+	reviewHistory?: SquadReview[];
 }
 
 // ============================================================================
