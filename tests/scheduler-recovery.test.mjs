@@ -123,7 +123,7 @@ test("substantive report-only output completes without a tool call", async () =>
 		data: { role: "assistant", content: [{ type: "text", text: report }] },
 	});
 	scheduler.handleAgentEvent({
-		type: "agent_end",
+		type: "agent_settled",
 		taskId: "planning-report",
 		agentName: "backend",
 		data: { exitCode: 0, turnCount: 1, toolCallCount: 0, stderr: "" },

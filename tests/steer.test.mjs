@@ -26,16 +26,29 @@ const store = await import("../src/store.ts");
 function attachFakeRunningAgent(pool, taskId = "qa-task", agentName = "qa") {
 	const writes = [];
 	const kills = [];
+	let agent;
 	const process = {
 		stdin: {
 			destroyed: false,
-			write: (data) => { writes.push(data.toString()); return true; },
+			write: (data) => {
+				writes.push(data.toString());
+				const command = JSON.parse(data.toString());
+				if (command.id) {
+					queueMicrotask(() => pool.handleRpcEvent(agent, {
+						type: "response",
+						id: command.id,
+						command: command.type,
+						success: true,
+					}));
+				}
+				return true;
+			},
 		},
 		exitCode: null,
 		killed: false,
 		kill: (signal) => { kills.push(signal); process.killed = true; return true; },
 	};
-	const agent = {
+	agent = {
 		taskId,
 		agentName,
 		process,
@@ -48,7 +61,7 @@ function attachFakeRunningAgent(pool, taskId = "qa-task", agentName = "qa") {
 			recentToolCalls: [],
 			modifiedFiles: new Set(),
 		},
-		pendingMessages: [],
+		session: { file: path.join(tempHome, `${taskId}.jsonl`) },
 		aborted: false,
 	};
 	pool.agents.set(taskId, agent);
@@ -63,7 +76,10 @@ test("main-session steer writes the documented Pi RPC command exactly", async ()
 	const sent = await pool.steer("qa-task", "[squad] Main orchestrator: use the completed contract");
 	assert.equal(sent, true);
 	assert.equal(writes.length, 1);
-	assert.deepEqual(JSON.parse(writes[0]), {
+	const command = JSON.parse(writes[0]);
+	assert.equal(typeof command.id, "string", "delivery acknowledgement must be correlated");
+	delete command.id;
+	assert.deepEqual(command, {
 		type: "steer",
 		message: "[squad] Main orchestrator: use the completed contract",
 	});
@@ -106,6 +122,7 @@ test("scheduler main-session message persists fully and steers the live task", a
 	assert.equal(await scheduler.sendHumanMessage("qa-task", message), true);
 	const command = JSON.parse(writes[0]);
 	assert.equal(command.type, "steer");
+	assert.equal(typeof command.id, "string");
 	assert.ok(command.message.startsWith("[squad] Main orchestrator requests a direct response:"));
 	assert.ok(command.message.includes(message));
 	assert.match(command.message, /forwarded automatically to the main session/);
@@ -136,7 +153,10 @@ test("scheduler main-session message persists fully and steers the live task", a
 	assert.equal(events.filter((event) => event.type === "orchestrator_reply").length, 1);
 
 	assert.equal(await scheduler.sendHumanMessage("qa-task", "fire-and-forget correction", false), true);
-	assert.deepEqual(JSON.parse(writes[1]), { type: "steer", message: "[squad] Main orchestrator message:\nfire-and-forget correction" });
+	const correction = JSON.parse(writes[1]);
+	assert.equal(typeof correction.id, "string");
+	delete correction.id;
+	assert.deepEqual(correction, { type: "steer", message: "[squad] Main orchestrator message:\nfire-and-forget correction" });
 	scheduler.handleAgentEvent({
 		type: "message_end",
 		taskId: "qa-task",
@@ -197,12 +217,12 @@ test("agent_end does not kill queued steer; only agent_settled finalizes the chi
 	pool.handleRpcEvent(agent, { type: "agent_end", messages: [], willRetry: false });
 	assert.equal(pool.isRunning("qa-task"), true, "agent_end is low-level and steer continuations may remain");
 	assert.deepEqual(kills, []);
-	assert.equal(events.filter((event) => event.type === "agent_end").length, 0);
+	assert.equal(events.filter((event) => event.type === "agent_settled").length, 0);
 
 	pool.handleRpcEvent(agent, { type: "agent_settled" });
 	assert.equal(pool.isRunning("qa-task"), false);
 	assert.deepEqual(kills, ["SIGTERM"]);
-	assert.equal(events.filter((event) => event.type === "agent_end").length, 1);
+	assert.equal(events.filter((event) => event.type === "agent_settled").length, 1);
 });
 
 test("steer reports false when child stdin is unavailable", async () => {

@@ -129,6 +129,14 @@ export interface TaskUsage {
 	turns: number;
 }
 
+/** Durable Pi session owned by one task. Once bound, the file identity is immutable. */
+export interface TaskSession {
+	/** Absolute Pi session JSONL path, suitable for `pi --session`. */
+	file: string;
+	/** Pi's session UUID from RPC get_state, when available. */
+	sessionId?: string;
+}
+
 export interface Task {
 	id: string;
 	title: string;
@@ -145,6 +153,8 @@ export interface Task {
 	output: string | null;
 	error: string | null;
 	usage: TaskUsage;
+	/** Durable Pi context for this task. Absent until its first process creates a session. */
+	session?: TaskSession;
 	/** If this is a rework task, the original task ID it's fixing */
 	retryOf?: string;
 	/** How many times this task chain has been retried */
@@ -160,6 +170,8 @@ export interface Task {
 export type MessageType = "status" | "text" | "tool" | "mention" | "reply" | "message" | "done" | "error";
 
 export interface TaskMessage {
+	/** Stable ID when the message participates in the durable task mailbox. */
+	id?: string;
 	ts: string;
 	from: string;
 	type: MessageType;
@@ -169,6 +181,18 @@ export interface TaskMessage {
 	expectsReply?: boolean;
 	name?: string;
 	args?: Record<string, unknown>;
+}
+
+/**
+ * Durable inbound delivery record owned by a task ID. Entries are retained
+ * after acknowledgement so task history remains available across restarts.
+ */
+export interface TaskMailboxEntry {
+	id: string;
+	taskId: string;
+	enqueuedAt: string;
+	deliveredAt: string | null;
+	message: TaskMessage;
 }
 
 // ============================================================================

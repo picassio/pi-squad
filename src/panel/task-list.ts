@@ -200,15 +200,25 @@ export class TaskListView {
 		const recent = messages.slice(-3);
 
 		for (const msg of recent) {
-			if (msg.type === "tool") {
+			const isConversation = msg.type === "text" || msg.type === "message" ||
+				msg.type === "reply" || msg.type === "mention";
+			if (msg.from === "orchestrator" && isConversation) {
+				const preview = msg.text.split("\n")[0];
+				lines.push(truncateToWidth(
+					` ${th.fg("accent", "ORCHESTRATOR")} ${th.fg("dim", `"${preview}"`)}`,
+					width,
+					"…",
+				));
+			} else if (msg.type === "tool") {
 				const toolStr = `→ ${msg.name || msg.text}`;
 				const rawArgs = (msg.args?.path || msg.args?.command || "").toString();
 				const argsStr = rawArgs.split("\n")[0]; // first line only
 				const preview = argsStr ? `${toolStr} ${argsStr}` : toolStr;
 				lines.push(truncateToWidth(` ${th.fg("muted", preview)}`, width, "…"));
-			} else if (msg.type === "text" && msg.from !== "system") {
+			} else if (isConversation && msg.from !== "system") {
 				const preview = msg.text.split("\n")[0];
-				lines.push(truncateToWidth(` ${th.fg("dim", `"${preview}"`)}`, width, "…"));
+				const sender = msg.from === "human" ? "YOU" : msg.from;
+				lines.push(truncateToWidth(` ${th.fg("dim", `${sender}: "${preview}"`)}`, width, "…"));
 			}
 		}
 

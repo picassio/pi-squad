@@ -90,12 +90,10 @@ test("mentioning a completed agent immediately returns its durable output and su
 	store.saveAgentDef({ name: "qa", role: "QA", description: "test", model: null, tools: null, tags: [], prompt: "" });
 
 	const steers = [];
-	const queued = [];
 	const pool = {
 		getTaskIdForAgent: () => null,
 		isRunning: (taskId) => taskId === "qa",
 		steer: async (taskId, message) => { steers.push({ taskId, message }); return true; },
-		queueMessage: (agent, message) => queued.push({ agent, message }),
 	};
 	const router = new Router(pool, id);
 	const escalations = [];
@@ -103,7 +101,6 @@ test("mentioning a completed agent immediately returns its durable output and su
 
 	router.processMessage("qa", "qa", "@architect Please send the completed contract; I am waiting for your input.");
 
-	assert.equal(queued.length, 0, "a completed agent must never receive an undeliverable future-spawn queue item");
 	assert.equal(steers.length, 1);
 	assert.equal(steers[0].taskId, "qa");
 	assert.ok(steers[0].message.includes(output), "source agent must receive the complete durable output");

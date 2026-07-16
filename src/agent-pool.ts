@@ -6,10 +6,11 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentDef, AgentActivity, Task, TaskMessage } from "./types.js";
+import type { AgentDef, AgentActivity, TaskSession } from "./types.js";
 import { buildAgentSystemPrompt, type ProtocolBuildOptions } from "./protocol.js";
 import { debug, logError } from "./logger.js";
 
@@ -22,8 +23,8 @@ export interface AgentProcess {
 	agentName: string;
 	process: ChildProcess;
 	activity: AgentActivity;
-	/** Queued messages for this agent (received while stopped, consumed on spawn) */
-	pendingMessages: TaskMessage[];
+	/** Durable Pi session owned by this task. */
+	session: TaskSession;
 	/** Abort controller for cleanup */
 	aborted: boolean;
 }
@@ -34,6 +35,7 @@ export type AgentEventType =
 	| "tool_execution_end"
 	| "turn_end"
 	| "agent_end"
+	| "agent_settled"
 	| "error";
 
 export interface AgentEvent {
@@ -77,7 +79,12 @@ function attachLineReader(
 export class AgentPool {
 	private agents = new Map<string, AgentProcess>();
 	private listeners: AgentEventListener[] = [];
-	private messageQueues = new Map<string, TaskMessage[]>();
+	private responseWaiters = new Map<string, {
+		process: ChildProcess;
+		resolve: (event: any) => void;
+		reject: (error: Error) => void;
+		timer: ReturnType<typeof setTimeout>;
+	}>();
 
 	/** Subscribe to agent events */
 	onEvent(listener: AgentEventListener): () => void {
@@ -124,20 +131,6 @@ export class AgentPool {
 			.map((a) => a.agentName);
 	}
 
-	/** Queue a message for an agent (delivered on next spawn or via steer if running) */
-	queueMessage(agentName: string, message: TaskMessage): void {
-		const queue = this.messageQueues.get(agentName) || [];
-		queue.push(message);
-		this.messageQueues.set(agentName, queue);
-	}
-
-	/** Consume queued messages for an agent */
-	consumeQueue(agentName: string): TaskMessage[] {
-		const queue = this.messageQueues.get(agentName) || [];
-		this.messageQueues.delete(agentName);
-		return queue;
-	}
-
 	/**
 	 * Spawn a pi process in RPC mode for a task.
 	 */
@@ -147,10 +140,14 @@ export class AgentPool {
 		protocolOptions: ProtocolBuildOptions;
 		cwd: string;
 		skillPaths: string[];
-		/** Fork the given session file so the agent inherits its conversation context */
+		/** Resume this task's already-bound durable Pi session. */
+		resumeSession?: TaskSession;
+		/** Create a new durable session here (new tasks only). */
+		sessionDir?: string;
+		/** Fork the given session file so a new task inherits main-session context. */
 		forkSession?: { file: string; sessionDir: string };
 	}): Promise<AgentProcess> {
-		const { taskId, agentDef, protocolOptions, cwd, skillPaths, forkSession } = options;
+		const { taskId, agentDef, protocolOptions, cwd, skillPaths, resumeSession, sessionDir, forkSession } = options;
 
 		// Kill existing process for this task if any
 		if (this.agents.has(taskId)) {
@@ -164,7 +161,7 @@ export class AgentPool {
 		fs.writeFileSync(promptFile, systemPrompt, "utf-8");
 
 		// Build pi CLI args
-		const args = buildPiArgs(agentDef, promptFile, skillPaths, forkSession);
+		const args = buildPiArgs(agentDef, promptFile, skillPaths, { resumeSession, sessionDir, forkSession });
 
 		// Spawn pi process — set env var to prevent recursive squad extension loading
 		const invocation = getPiInvocation(["--mode", "rpc", ...args]);
@@ -190,7 +187,8 @@ export class AgentPool {
 			agentName: agentDef.name,
 			process: proc,
 			activity,
-			pendingMessages: this.consumeQueue(agentDef.name),
+			// Replaced with the authoritative get_state values before spawn returns.
+			session: resumeSession ?? { file: "" },
 			aborted: false,
 		};
 
@@ -212,26 +210,31 @@ export class AgentPool {
 			}
 		});
 
-		let agentEndEmitted = false;
+		let terminalEventEmitted = false;
 		let stdoutLines = 0;
 		proc.on("exit", (code, signal) => {
+			this.rejectResponseWaiters(proc, new Error(`Agent ${agentDef.name} exited before RPC response`));
 			// Log diagnostic info for debugging spawn failures
 			if (code !== 0 && code !== null) {
 				logError("squad-pool", `${agentDef.name} exited: code=${code} signal=${signal} pid=${proc.pid} stdoutLines=${stdoutLines} stderr=${stderr || "(empty)"}`);
 			}
-			// Capture activity stats BEFORE deleting the agent
+			// Capture activity stats before cleanup. A delayed exit callback from an
+			// old child must never delete or mutate a replacement registered for the
+			// same task ID.
 			const finalActivity = agentProc.activity;
-			// Clean up agents map so getRunningAgents() doesn't count dead processes
-			this.agents.delete(taskId);
-			// Only emit if we haven't already emitted via RPC agent_end event
-			if (!agentEndEmitted) {
-				agentEndEmitted = true;
+			const isCurrentChild = this.agents.get(taskId) === agentProc;
+			if (isCurrentChild) this.agents.delete(taskId);
+			// Only the currently registered child may report an unexpected exit.
+			// Intentional shutdown must not reopen a suspended or cancelled task.
+			if (isCurrentChild && !terminalEventEmitted && !agentProc.aborted) {
+				terminalEventEmitted = true;
 				this.emit({
 					type: "agent_end",
 					taskId,
 					agentName: agentDef.name,
 					data: {
 						exitCode: code,
+						unexpectedExit: true,
 						// Preserve complete diagnostics for task failure reports and recovery.
 						stderr,
 						turnCount: finalActivity.turnCount,
@@ -247,8 +250,8 @@ export class AgentPool {
 			}, 500);
 		});
 
-		// Expose the guard so handleRpcEvent can set it
-		(agentProc as any)._agentEndEmitted = () => { agentEndEmitted = true; };
+		// Expose the guard so handleRpcEvent can mark final settlement.
+		(agentProc as any)._terminalEventEmitted = () => { terminalEventEmitted = true; };
 
 		// Wait for process to initialize — pi needs time to load extensions, models, etc.
 		await new Promise((resolve) => setTimeout(resolve, 1000));
@@ -259,25 +262,43 @@ export class AgentPool {
 			);
 		}
 
-		// Send initial prompt
-		const taskPrompt = `Your task: ${protocolOptions.task.title}\n\n${protocolOptions.task.description || ""}`;
-		this.sendRpcCommand(proc, { type: "prompt", message: taskPrompt });
+		// Persisted session identity is authoritative. Capture it before any prompt
+		// is sent so a crash/retry can only resume this task's original context.
+		const state = await this.requestRpc(proc, { type: "get_state" });
+		const rawSessionFile = state?.data?.sessionFile;
+		if (!state?.success || typeof rawSessionFile !== "string" || rawSessionFile.length === 0) {
+			await this.kill(taskId);
+			throw new Error(`Agent ${agentDef.name} did not expose a durable session file`);
+		}
+		agentProc.session = {
+			file: path.isAbsolute(rawSessionFile) ? path.normalize(rawSessionFile) : path.resolve(cwd, rawSessionFile),
+			...(typeof state.data?.sessionId === "string" && state.data.sessionId
+				? { sessionId: state.data.sessionId }
+				: {}),
+		};
 
 		return agentProc;
+	}
+
+	/** Start a turn in an initialized task session. */
+	async prompt(taskId: string, message: string): Promise<boolean> {
+		const agent = this.agents.get(taskId);
+		if (!agent || agent.aborted || agent.process.exitCode !== null) return false;
+		return this.requestAccepted(agent.process, { type: "prompt", message });
 	}
 
 	/** Inject a steering message into a running agent */
 	async steer(taskId: string, message: string): Promise<boolean> {
 		const agent = this.agents.get(taskId);
 		if (!agent || agent.aborted || agent.process.exitCode !== null) return false;
-		return this.sendRpcCommand(agent.process, { type: "steer", message });
+		return this.requestAccepted(agent.process, { type: "steer", message });
 	}
 
 	/** Queue a follow-up message for after the current turn */
 	async followUp(taskId: string, message: string): Promise<boolean> {
 		const agent = this.agents.get(taskId);
 		if (!agent || agent.aborted || agent.process.exitCode !== null) return false;
-		return this.sendRpcCommand(agent.process, { type: "follow_up", message });
+		return this.requestAccepted(agent.process, { type: "follow_up", message });
 	}
 
 	/** Abort the current operation */
@@ -348,7 +369,55 @@ export class AgentPool {
 		}
 	}
 
+	private async requestAccepted(proc: ChildProcess, command: Record<string, unknown>): Promise<boolean> {
+		try {
+			const response = await this.requestRpc(proc, command);
+			return response?.success === true;
+		} catch {
+			return false;
+		}
+	}
+
+	private requestRpc(proc: ChildProcess, command: Record<string, unknown>): Promise<any> {
+		const id = randomUUID();
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.responseWaiters.delete(id);
+				reject(new Error(`Timed out waiting for RPC ${String(command.type)}`));
+			}, 10_000);
+			timer.unref();
+			this.responseWaiters.set(id, { process: proc, resolve, reject, timer });
+			if (!this.sendRpcCommand(proc, { ...command, id })) {
+				clearTimeout(timer);
+				this.responseWaiters.delete(id);
+				reject(new Error(`Failed to send RPC ${String(command.type)}`));
+			}
+		});
+	}
+
+	private rejectResponseWaiters(proc: ChildProcess, error: Error): void {
+		for (const [id, waiter] of this.responseWaiters) {
+			if (waiter.process !== proc) continue;
+			clearTimeout(waiter.timer);
+			this.responseWaiters.delete(id);
+			waiter.reject(error);
+		}
+	}
+
 	private handleRpcEvent(agent: AgentProcess, event: any): void {
+		if (event.type === "response" && typeof event.id === "string") {
+			const waiter = this.responseWaiters.get(event.id);
+			if (waiter) {
+				clearTimeout(waiter.timer);
+				this.responseWaiters.delete(event.id);
+				waiter.resolve(event);
+			}
+			return;
+		}
+		// Process stdout can drain after a replacement has already been installed.
+		// Ignore every stale lifecycle/activity event so the old child cannot
+		// evict, settle, or complete the new task process.
+		if (this.agents.get(agent.taskId) !== agent) return;
 		// Only genuine agent activity advances the idle clock. Command acks
 		// (type=response) and echoes of injected user messages (steer messages
 		// recorded as user-role message events) must NOT reset it — otherwise the
@@ -407,14 +476,14 @@ export class AgentPool {
 		} else if (event.type === "agent_settled") {
 			debug("squad-pool", `agent_settled from RPC: ${agent.agentName} (task: ${agent.taskId})`);
 			// Mark the guard to prevent double-emit from proc.on("exit")
-			const guardFn = (agent as any)._agentEndEmitted;
+			const guardFn = (agent as any)._terminalEventEmitted;
 			if (guardFn) guardFn();
 			// Capture activity stats BEFORE deleting
 			const endActivity = agent.activity;
 			// Remove from agents map BEFORE emitting so getRunningAgents() doesn't count it
 			this.agents.delete(agent.taskId);
 			this.emit({
-				type: "agent_end",
+				type: "agent_settled",
 				taskId: agent.taskId,
 				agentName: agent.agentName,
 				data: {
@@ -450,13 +519,23 @@ function buildPiArgs(
 	agentDef: AgentDef,
 	promptFile: string,
 	skillPaths: string[],
-	forkSession?: { file: string; sessionDir: string },
+	sessionOptions: {
+		resumeSession?: TaskSession;
+		sessionDir?: string;
+		forkSession?: { file: string; sessionDir: string };
+	},
 ): string[] {
-	// --fork cannot combine with --no-session; forked child sessions are
-	// stored under the squad's data dir to keep the user's session list clean.
-	const sessionArgs = forkSession
-		? ["--fork", forkSession.file, "--session-dir", forkSession.sessionDir]
-		: ["--no-session"];
+	const { resumeSession, sessionDir, forkSession } = sessionOptions;
+	if (resumeSession && forkSession) throw new Error("Cannot resume and fork a task session simultaneously");
+	// Existing tasks always reopen the exact bound file. Only tasks without a
+	// binding create a new session (optionally as a main-session fork).
+	const sessionArgs = resumeSession
+		? ["--session", resumeSession.file]
+		: forkSession
+			? ["--fork", forkSession.file, "--session-dir", forkSession.sessionDir]
+			: sessionDir
+				? ["--session-dir", sessionDir]
+				: (() => { throw new Error("A durable task session is required"); })();
 	const args: string[] = [...sessionArgs, "--append-system-prompt", promptFile];
 
 	if (agentDef.model) {

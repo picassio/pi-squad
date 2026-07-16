@@ -2,8 +2,8 @@
  * router.ts — @mention parsing and cross-agent message delivery.
  *
  * Parses assistant text for @agentname patterns.
- * Routes messages to target agents via steer() if running,
- * or queues them for delivery on next spawn.
+ * Routes messages to exact target tasks via steer() if running,
+ * or a durable task-owned mailbox for delivery on next spawn.
  */
 
 import type { AgentPool } from "./agent-pool.js";
@@ -83,30 +83,41 @@ export class Router {
 			text: message,
 		});
 
-		// Find if target agent is running
-		const targetTaskId = this.pool.getTaskIdForAgent(targetAgent);
+		// Agent-name mentions are safe only when exactly one live task owns that
+		// role. Multiple concurrent same-role tasks must never receive guessed mail.
+		const liveTargets = store.loadAllTasks(this.squadId).filter(
+			(task) => task.agent === targetAgent && this.pool.isRunning(task.id),
+		);
+		const targetTaskId = liveTargets.length === 1 ? liveTargets[0].id : undefined;
 
-		if (targetTaskId && this.pool.isRunning(targetTaskId)) {
-			// Target is running — steer them
-			const steerMessage = `[squad] Message from @${fromAgent} (working on ${sourceTaskId}):\n${message}`;
-			this.pool.steer(targetTaskId, steerMessage);
-
-			// Log in target task too
-			store.appendMessage(this.squadId, targetTaskId, {
+		if (targetTaskId) {
+			const queued = store.queueTaskMessage(this.squadId, targetTaskId, {
 				ts: store.now(),
 				from: fromAgent,
 				type: "mention",
 				to: targetAgent,
 				text: message,
 			});
+			const steerMessage = `[squad] Message from @${fromAgent} (working on ${sourceTaskId}):\n${message}`;
+			void this.pool.steer(targetTaskId, steerMessage).then((delivered) => {
+				if (delivered) store.acknowledgeTaskMessages(this.squadId, targetTaskId, [queued.id]);
+			});
 			return false;
 		}
 
 		const targetTasks = store.loadAllTasks(this.squadId).filter((task) => task.agent === targetAgent);
-		const hasFutureRun = targetTasks.some((task) =>
-			task.status === "pending" || task.status === "blocked" || task.status === "suspended" || task.status === "in_progress",
+		const futureTasks = targetTasks.filter((task) =>
+			task.status === "in_progress" || task.status === "pending" || task.status === "suspended" || task.status === "blocked",
 		);
-		if (!hasFutureRun) {
+		const interrupted = futureTasks.filter((task) => task.status === "in_progress");
+		// Never guess between two tasks assigned to the same role. A uniquely
+		// interrupted task is authoritative; otherwise only one future task is safe.
+		const futureTask = interrupted.length === 1
+			? interrupted[0]
+			: futureTasks.length === 1
+				? futureTasks[0]
+				: undefined;
+		if (futureTasks.length === 0) {
 			const completed = targetTasks.filter((task) => task.status === "done" && task.output);
 			if (completed.length > 0) {
 				const durableReply = [
@@ -120,21 +131,20 @@ export class Router {
 					to: fromAgent,
 					text: durableReply,
 				};
-				store.appendMessage(this.squadId, sourceTaskId, reply);
+				const queued = store.queueTaskMessage(this.squadId, sourceTaskId, reply);
 				if (this.pool.isRunning(sourceTaskId)) {
-					this.pool.steer(sourceTaskId, durableReply);
-				} else {
-					this.pool.queueMessage(fromAgent, reply);
+					void this.pool.steer(sourceTaskId, durableReply).then((delivered) => {
+						if (delivered) store.acknowledgeTaskMessages(this.squadId, sourceTaskId, [queued.id]);
+					});
 				}
 				return true;
 			}
 		}
 
-		// Target has future work and may spawn again — queue for that run. If the
-		// target is terminal with no output, do not create an undeliverable queue;
-		// leave the blocker unresolved so it escalates to the main orchestrator.
-		if (hasFutureRun) {
-			this.pool.queueMessage(targetAgent, {
+		// Target has future work and may spawn again. Bind the message to exactly
+		// one durable task, never to the shared role name.
+		if (futureTask) {
+			store.queueTaskMessage(this.squadId, futureTask.id, {
 				ts: store.now(),
 				from: fromAgent,
 				type: "mention",
@@ -149,7 +159,7 @@ export class Router {
 	 * Route a human message to an agent.
 	 */
 	routeHumanMessage(taskId: string, message: string): void {
-		store.appendMessage(this.squadId, taskId, {
+		const queued = store.queueTaskMessage(this.squadId, taskId, {
 			ts: store.now(),
 			from: "human",
 			type: "message",
@@ -157,17 +167,9 @@ export class Router {
 		});
 
 		if (this.pool.isRunning(taskId)) {
-			this.pool.steer(taskId, `[squad] Human: ${message}`);
-		} else {
-			const task = store.loadTask(this.squadId, taskId);
-			if (task) {
-				this.pool.queueMessage(task.agent, {
-					ts: store.now(),
-					from: "human",
-					type: "message",
-					text: message,
-				});
-			}
+			void this.pool.steer(taskId, `[squad] Human: ${message}`).then((delivered) => {
+				if (delivered) store.acknowledgeTaskMessages(this.squadId, taskId, [queued.id]);
+			});
 		}
 	}
 

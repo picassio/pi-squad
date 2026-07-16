@@ -139,7 +139,7 @@ Bundled agent definitions are copied to `~/.pi/squad/agents/` on first run. Edit
 
 **@mention routing**: Agents write `@frontend what token format?` in their output. The router delivers it in real-time via RPC `steer()`.
 
-**Main-session request/reply**: `squad_message` resolves an agent name to its live task, durably records the full request, and writes the documented JSONL RPC command `{"type":"steer","message":"..."}` to the child. By default (`expectReply: true`), the next substantive agent response is durably marked as the reply, pushed into the main Pi session, and wakes it via follow-up delivery; ordinary later activity remains panel-only. The pending reply marker survives scheduler reconstruction. Use `expectReply: false` for fire-and-forget steering. pi-squad waits for Pi's final `agent_settled` event before closing the child; low-level `agent_end` never kills queued continuations.
+**Main-session request/reply**: `squad_message` addresses one exact task ID. An agent name is accepted only as shorthand for exactly one currently live task, so two tasks assigned to the same role never share or steal messages. Requests are written first to the task's durable mailbox, then delivered with correlated Pi RPC. A completed task is reopened and resumed with `pi --session <its-original-session-file>`; only a task without a session binding receives a new session. This also works after scheduler/main-process reconstruction. By default (`expectReply: true`), the next substantive response is durably marked as the reply, pushed into main Pi, and wakes it; use `expectReply: false` for fire-and-forget steering. pi-squad waits for Pi's final `agent_settled` event before marking the task done or closing the child; low-level `agent_end` never kills queued continuations.
 
 ### Smart Planner
 
@@ -171,7 +171,7 @@ Shows live squad progress. Truncated to terminal width — no wrapping, determin
 
 ### Panel (Ctrl+Q)
 
-Full overlay with task list, live activity preview, and scrollable message view.
+Full overlay with task list, live activity preview, and scrollable message view. The view opens at the live tail but can scroll back through the complete durable history, including acknowledged and older orchestrator/human messages; multiline bodies are not shortened. Main-Pi requests are labeled `ORCHESTRATOR` and panel/user input is labeled `YOU`.
 
 | Key | Action |
 |---|---|
@@ -191,7 +191,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `/squad list` | List project squads |
 | `/squad all` | List all squads |
 | `/squad agents` | Manage agent definitions |
-| `/squad msg [agent] text` | Send message to agent |
+| `/squad msg [task-id\|running-agent] text` | Message an exact task, or use an agent name only when it has one live task |
 | `/squad widget` | Toggle widget |
 | `/squad panel` | Toggle panel |
 | `/squad cancel` | Cancel running squad |
@@ -205,7 +205,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 |---|---|
 | `squad` | Start a squad with goal + optional tasks/config |
 | `squad_status` | Check progress, costs, task states |
-| `squad_message` | Send message to a running agent |
+| `squad_message` | Durably message an exact task; completed tasks reopen on their original session |
 | `squad_modify` | Add/cancel/complete/pause/resume tasks or squads |
 
 The main agent sees available agents in its system prompt and squad state when a squad is active.
@@ -245,7 +245,8 @@ squad({
 - **Cost**: the agent pays the entire conversation history as input tokens on every turn — use sparingly
 - **Context-window guard**: the fork is skipped automatically when the estimated session size exceeds 50% of the agent model's context window (agents on smaller-context models silently degrade to standard squad context; the skip is recorded in the task's message log and `debug.log`)
 - Requires the main session to have a session file (skipped under `--no-session`)
-- Forked child sessions are stored under `~/.pi/squad/<squad-id>/sessions/`, not in your project's session list
+- Each child session is stored under its task directory at `~/.pi/squad/<squad-id>/<task-id>/session/`, not in your project's session list
+- Once created, that task-to-session binding is immutable; later resumes pass the original file through `--session`
 - Prefer restating the 3-5 key decisions in the task description — reach for `inheritContext` only when that's impractical
 
 ### Custom Agents
@@ -298,14 +299,17 @@ Configure with `/squad advisor` (on/off, model, max calls per task, reasoning ef
 
 ### Meaningful Work Check
 
-Agents must complete at least 1 LLM turn AND make at least 1 tool call to be marked as "done". Agents that exit cleanly but did no work (rate limit, API error, model not found) are retried once, then failed — never silently marked successful.
+Agents must complete at least one LLM turn and produce either a tool call or a substantive assistant artifact before they can be marked `done`. This permits legitimate report-only planning/review work while rejecting empty exits. A child that exits before final `agent_settled`, or settles without meaningful work, is resumed once on the same task session and then failed if the retry is exhausted.
 
 ### Session Resilience
 
-- In-progress tasks are **suspended** on session crash, **resumed** on next startup
-- Failure is never terminal: `resume` recovers failed squads (failed tasks reset to pending), `complete_task` marks recovered work done and schedules dependents, and a 60s reconcile loop re-derives scheduling from persisted state so out-of-band store edits can't strand ready tasks
-- Squads are fully reconstructable from JSON files on disk
-- Spawn failures are retried once with a 2-second delay
+- Every task owns one durable Pi session. New tasks create it under their task directory; stale, suspended, failed, or explicitly reopened tasks resume that same session rather than starting over. A pre-prompt retry may refresh Pi's provisional session ID only while the bound file is the same and its JSONL has not materialized; afterward both file and ID are immutable.
+- Legacy tasks without a session binding migrate on first reopen by creating a task-owned session and seeding its first prompt with the complete persisted multiline message history and prior task output—without truncation.
+- In-progress tasks are **suspended** on orderly shutdown; ordinary orphaned work is paused for explicit resume. If a scheduler itself is reconstructed, stale `in_progress` state is resumed by reconciliation. Independently, extension startup always reconstructs any project squad with pending mailbox entries—including `review` or already accepted `done` squads—and resumes delivery without another user action.
+- A durable message to a completed task clears its prior completion/review state, reopens the squad, keeps the task `in_progress` while its agent is live, and requires a fresh orchestrator review after the final `agent_settled`. Every transitive descendant is re-blocked and reruns in dependency order, so results derived from the reopened dependency cannot remain falsely complete.
+- Failure is never terminal: `resume` recovers failed squads (failed tasks reset to pending), `complete_task` marks recovered work done and schedules dependents, and a 60s reconcile loop re-derives scheduling from persisted state so out-of-band store edits can't strand ready tasks.
+- Mail is acknowledged only after Pi accepts the correlated RPC command. Pending and acknowledged entries remain task-addressed on disk, survive process restart, and remain visible in history. Queue and acknowledgement read/modify/write operations are serialized across processes so concurrent mutations cannot overwrite messages or delivery state.
+- Squads are fully reconstructable from JSON files on disk. Unexpected child exits are retried once after 2 seconds on the same bound task session.
 - All errors logged to `~/.pi/squad/debug.log` (always for errors, `PI_SQUAD_DEBUG=1` for verbose)
 
 ### Health Monitoring
@@ -331,8 +335,10 @@ All state in `~/.pi/squad/`. No database, no daemon. Writes are atomic. JSONL re
     ├── squad.json       — goal, status, config, cwd
     ├── context.json     — live state snapshot
     └── {task-id}/
-        ├── task.json    — status, output, usage, retryOf, qaFeedback
-        └── messages.jsonl  — conversation log
+        ├── task.json      — status, output, usage, immutable session binding, retry metadata
+        ├── messages.jsonl — append-only conversation history
+        ├── mailbox.json   — task-addressed inbound mail, including delivery acknowledgements
+        └── session/       — this task's durable Pi session JSONL
 ```
 
 ## Architecture

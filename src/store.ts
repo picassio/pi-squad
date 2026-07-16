@@ -9,13 +9,16 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { randomUUID } from "node:crypto";
 import type {
 	AgentDef,
 	KnowledgeEntry,
 	Squad,
 	SquadContext,
 	Task,
+	TaskMailboxEntry,
 	TaskMessage,
+	TaskSession,
 	TaskUsage,
 	DEFAULT_SQUAD_CONFIG,
 } from "./types.js";
@@ -122,6 +125,15 @@ export function getMessagesFilePath(squadId: string, taskId: string, parentPath?
 	return path.join(getTaskDir(squadId, taskId, parentPath), "messages.jsonl");
 }
 
+export function getTaskMailboxFilePath(squadId: string, taskId: string, parentPath?: string): string {
+	return path.join(getTaskDir(squadId, taskId, parentPath), "mailbox.json");
+}
+
+/** Task-owned directory where Pi creates the task's durable session JSONL. */
+export function getTaskSessionDir(squadId: string, taskId: string, parentPath?: string): string {
+	return path.join(getTaskDir(squadId, taskId, parentPath), "session");
+}
+
 // ============================================================================
 // Atomic File Operations
 // ============================================================================
@@ -146,6 +158,52 @@ function readJson<T>(filePath: string): T | null {
 		return JSON.parse(content) as T;
 	} catch {
 		return null;
+	}
+}
+
+/**
+ * Serialize cross-process read/modify/write operations for one JSON file.
+ * Atomic rename prevents torn writes but does not prevent two writers from
+ * reading the same old value and overwriting each other. The adjacent lock is
+ * short-lived; an abandoned lock older than 30s is recoverable after a crash.
+ */
+function withJsonFileLock<T>(filePath: string, operation: () => T): T {
+	ensureDir(path.dirname(filePath));
+	const lockPath = `${filePath}.lock`;
+	const startedAt = Date.now();
+	let lockFd: number | null = null;
+	while (lockFd === null) {
+		try {
+			lockFd = fs.openSync(lockPath, "wx");
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - fs.statSync(lockPath).mtimeMs > 30_000) {
+					fs.unlinkSync(lockPath);
+					continue;
+				}
+			} catch {
+				continue;
+			}
+			if (Date.now() - startedAt > 10_000) {
+				throw new Error(`Timed out acquiring durable store lock: ${lockPath}`);
+			}
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+		}
+	}
+	try {
+		fs.writeFileSync(lockFd, `${process.pid}\n${Date.now()}\n`, "utf-8");
+	} catch (error) {
+		try { fs.closeSync(lockFd); } catch { /* ignore */ }
+		try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+		throw error;
+	}
+
+	try {
+		return operation();
+	} finally {
+		try { fs.closeSync(lockFd); } catch { /* ignore */ }
+		try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
 	}
 }
 
@@ -385,6 +443,64 @@ export function updateTaskUsage(squadId: string, taskId: string, usage: Partial<
 	saveTask(squadId, task);
 }
 
+/** Read the durable Pi session currently bound to a task. */
+export function loadTaskSession(squadId: string, taskId: string, parentPath?: string): TaskSession | null {
+	return loadTask(squadId, taskId, parentPath)?.session ?? null;
+}
+
+/**
+ * Bind a task to its durable Pi session. The file identity is write-once: a
+ * reconstructed scheduler may repeat the same binding, but cannot replace it
+ * with a fresh session and silently discard the task's conversation context.
+ */
+export function bindTaskSession(
+	squadId: string,
+	taskId: string,
+	session: TaskSession,
+	parentPath?: string,
+): TaskSession {
+	const task = loadTask(squadId, taskId, parentPath);
+	if (!task) throw new Error(`Task not found: ${taskId}`);
+	if (!path.isAbsolute(session.file)) {
+		throw new Error(`Task session file must be absolute: ${session.file}`);
+	}
+
+	const normalized: TaskSession = {
+		file: path.normalize(session.file),
+		...(session.sessionId ? { sessionId: session.sessionId } : {}),
+	};
+	const existing = task.session;
+	if (existing) {
+		if (path.normalize(existing.file) !== normalized.file) {
+			throw new Error(`Task ${taskId} is already bound to Pi session ${existing.file}`);
+		}
+		if (existing.sessionId && normalized.sessionId && existing.sessionId !== normalized.sessionId) {
+			// Before Pi accepts the first prompt, get_state reserves the eventual
+			// file path but the JSONL does not exist yet. Reopening that same path
+			// produces a new provisional sessionId. Permit only that pre-materialized
+			// same-file recovery; a real JSONL header makes the ID immutable.
+			let materialized = false;
+			try { materialized = fs.statSync(normalized.file).size > 0; } catch { /* not created yet */ }
+			if (materialized) {
+				throw new Error(`Task ${taskId} is already bound to Pi session ${existing.file}`);
+			}
+			task.session = normalized;
+			saveTask(squadId, task, parentPath);
+			return normalized;
+		}
+		if (!existing.sessionId && normalized.sessionId) {
+			task.session = normalized;
+			saveTask(squadId, task, parentPath);
+			return normalized;
+		}
+		return existing;
+	}
+
+	task.session = normalized;
+	saveTask(squadId, task, parentPath);
+	return normalized;
+}
+
 // ============================================================================
 // Messages
 // ============================================================================
@@ -394,7 +510,85 @@ export function appendMessage(squadId: string, taskId: string, message: TaskMess
 }
 
 export function loadMessages(squadId: string, taskId: string, parentPath?: string): TaskMessage[] {
-	return readJsonl<TaskMessage>(getMessagesFilePath(squadId, taskId, parentPath));
+	const history = readJsonl<TaskMessage>(getMessagesFilePath(squadId, taskId, parentPath));
+	const seen = new Set(history.flatMap((message) => message.id ? [message.id] : []));
+	for (const entry of loadTaskMailbox(squadId, taskId, parentPath)) {
+		if (!seen.has(entry.id)) {
+			history.push(entry.message);
+			seen.add(entry.id);
+		}
+	}
+	return history.sort((a, b) => a.ts.localeCompare(b.ts));
+}
+
+/** Load all task-addressed mailbox entries, including delivered history. */
+export function loadTaskMailbox(squadId: string, taskId: string, parentPath?: string): TaskMailboxEntry[] {
+	return readJson<TaskMailboxEntry[]>(getTaskMailboxFilePath(squadId, taskId, parentPath)) ?? [];
+}
+
+/** Load only mailbox entries still awaiting successful delivery to this task. */
+export function loadPendingTaskMessages(squadId: string, taskId: string, parentPath?: string): TaskMailboxEntry[] {
+	return loadTaskMailbox(squadId, taskId, parentPath).filter((entry) => entry.deliveredAt === null);
+}
+
+/**
+ * Durably queue one inbound message for a task. The mailbox is written before
+ * the append-only history; loadMessages merges both by stable ID, so the
+ * message remains visible even if a process stops between those writes.
+ */
+export function queueTaskMessage(
+	squadId: string,
+	taskId: string,
+	message: TaskMessage,
+	parentPath?: string,
+): TaskMailboxEntry {
+	if (!loadTask(squadId, taskId, parentPath)) throw new Error(`Task not found: ${taskId}`);
+
+	const mailboxPath = getTaskMailboxFilePath(squadId, taskId, parentPath);
+	return withJsonFileLock(mailboxPath, () => {
+		const mailbox = loadTaskMailbox(squadId, taskId, parentPath);
+		const id = message.id ?? randomUUID();
+		const existing = mailbox.find((entry) => entry.id === id);
+		if (existing) return existing;
+
+		const durableMessage: TaskMessage = { ...message, id };
+		const entry: TaskMailboxEntry = {
+			id,
+			taskId,
+			enqueuedAt: now(),
+			deliveredAt: null,
+			message: durableMessage,
+		};
+		mailbox.push(entry);
+		writeJsonAtomic(mailboxPath, mailbox);
+		appendJsonl(getMessagesFilePath(squadId, taskId, parentPath), durableMessage);
+		return entry;
+	});
+}
+
+/** Mark task mailbox entries delivered while retaining their durable history. */
+export function acknowledgeTaskMessages(
+	squadId: string,
+	taskId: string,
+	messageIds: string[],
+	parentPath?: string,
+): number {
+	if (messageIds.length === 0) return 0;
+	const wanted = new Set(messageIds);
+	const mailboxPath = getTaskMailboxFilePath(squadId, taskId, parentPath);
+	return withJsonFileLock(mailboxPath, () => {
+		const mailbox = loadTaskMailbox(squadId, taskId, parentPath);
+		const deliveredAt = now();
+		let count = 0;
+		for (const entry of mailbox) {
+			if (wanted.has(entry.id) && entry.deliveredAt === null) {
+				entry.deliveredAt = deliveredAt;
+				count++;
+			}
+		}
+		if (count > 0) writeJsonAtomic(mailboxPath, mailbox);
+		return count;
+	});
 }
 
 // ============================================================================

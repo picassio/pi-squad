@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentDef, Squad, SquadConfig, Task, TaskMessage, TaskStatus } from "./types.js";
+import type { AgentDef, Squad, SquadConfig, Task, TaskMailboxEntry, TaskMessage, TaskStatus } from "./types.js";
 import { AgentPool, type AgentEvent } from "./agent-pool.js";
 import { Monitor } from "./monitor.js";
 import { Router } from "./router.js";
@@ -241,6 +241,32 @@ export class Scheduler {
 
 		const tasks = store.loadAllTasks(this.squadId);
 
+		// 0. Mailbox recovery is level-triggered from disk. If the previous
+		// process stopped after queueTaskMessage's atomic write but before status
+		// mutation/RPC delivery, reopen exactly that task on reconstruction.
+		let recoveredMailbox = false;
+		for (const task of tasks) {
+			if (this.pool.isRunning(task.id)) continue;
+			if (store.loadPendingTaskMessages(this.squadId, task.id).length === 0) continue;
+			if (task.status === "done") await this.invalidateDescendants(task.id);
+			const dependenciesDone = task.depends.every(
+				(depId) => tasks.find((candidate) => candidate.id === depId)?.status === "done",
+			);
+			const nextStatus: TaskStatus = dependenciesDone ? "pending" : "blocked";
+			if (task.status !== nextStatus || task.completed !== null || task.error !== null) {
+				task.status = nextStatus;
+				task.completed = null;
+				task.error = null;
+				store.updateTaskStatus(this.squadId, task.id, nextStatus, { completed: null, error: null });
+			}
+			recoveredMailbox = true;
+		}
+		if (recoveredMailbox && squad.status !== "running") {
+			squad.status = "running";
+			delete squad.review;
+			store.saveSquad(squad);
+		}
+
 		// 1. Blocked → pending when all deps are done (respects autoUnblock config)
 		if (squad.config.autoUnblock) {
 			for (const task of tasks) {
@@ -323,7 +349,12 @@ export class Scheduler {
 	/** Get tasks that are ready to execute (pending + all deps done) */
 	private getReadyTasks(tasks: Task[]): Task[] {
 		return tasks.filter((task) => {
-			if (task.status !== "pending") return false;
+			// A reconstructed scheduler has an empty process pool. Persisted
+			// in_progress means the previous process stopped mid-task, so resume its
+			// bound session instead of stranding it or creating a fresh context.
+			const needsProcess = task.status === "pending" ||
+				(task.status === "in_progress" && !this.pool.isRunning(task.id));
+			if (!needsProcess) return false;
 			return task.depends.every((depId) => {
 				const dep = tasks.find((t) => t.id === depId);
 				return dep?.status === "done";
@@ -376,9 +407,24 @@ export class Scheduler {
 			}
 		}
 
-		// Update task status
+		const resumeSession = store.loadTaskSession(this.squadId, task.id) ?? undefined;
+		const pendingMailbox = store.loadPendingTaskMessages(this.squadId, task.id);
+		// Legacy tasks predate task-owned Pi sessions. Their first durable spawn
+		// must receive the complete persisted history/output as a migration seed;
+		// otherwise reopening silently discards all prior context.
+		const legacyHistory = !resumeSession && (task.started !== null || task.completed !== null || task.output !== null)
+			? store.loadMessages(this.squadId, task.id)
+			: [];
+		const legacySeed = legacyHistory.length > 0 || (!resumeSession && task.output !== null)
+			? { messages: legacyHistory, output: task.output }
+			: undefined;
+
+		// Keep the original start time across resumes. A resumed/live process owns
+		// in_progress until Pi emits final agent_settled.
 		store.updateTaskStatus(this.squadId, task.id, "in_progress", {
-			started: store.now(),
+			started: task.started ?? store.now(),
+			completed: null,
+			error: null,
 		});
 
 		store.appendMessage(this.squadId, task.id, {
@@ -395,11 +441,13 @@ export class Scheduler {
 			agentName: task.agent,
 		});
 
-		// Decide whether to fork the main session for context inheritance
-		const forkSessionFile = this.resolveForkSession(task, squad, agentDef);
+		// Context inheritance creates a session only on the task's first run.
+		// Every later run must reopen the immutable task binding.
+		const forkSessionFile = resumeSession ? undefined : this.resolveForkSession(task, squad, agentDef);
+		const taskSessionDir = store.getTaskSessionDir(this.squadId, task.id);
 
 		try {
-			await this.pool.spawn({
+			const agent = await this.pool.spawn({
 				taskId: task.id,
 				agentDef,
 				protocolOptions: {
@@ -408,19 +456,28 @@ export class Scheduler {
 					task,
 					agentDef,
 					modifiedFiles,
-					queuedMessages: this.pool.consumeQueue(task.agent),
+					queuedMessages: pendingMailbox.map((entry) => entry.message),
 				},
 				cwd: squad.cwd,
 				skillPaths: this.skillPaths,
-				...(forkSessionFile
-					? {
-							forkSession: {
-								file: forkSessionFile,
-								sessionDir: path.join(store.getSquadDir(this.squadId), "sessions"),
-							},
-						}
-					: {}),
+				...(resumeSession
+					? { resumeSession }
+					: forkSessionFile
+						? { forkSession: { file: forkSessionFile, sessionDir: taskSessionDir } }
+						: { sessionDir: taskSessionDir }),
 			});
+			store.bindTaskSession(this.squadId, task.id, agent.session);
+
+			const accepted = await this.pool.prompt(
+				task.id,
+				this.buildTaskPrompt(task, Boolean(resumeSession), pendingMailbox, legacySeed),
+			);
+			if (!accepted) throw new Error(`Agent ${task.agent} did not accept the task prompt`);
+			store.acknowledgeTaskMessages(
+				this.squadId,
+				task.id,
+				pendingMailbox.map((entry) => entry.id),
+			);
 		} catch (error) {
 			this.handleTaskFailed(task.id, (error as Error).message);
 		}
@@ -545,6 +602,77 @@ export class Scheduler {
 		return sessionFile;
 	}
 
+	private buildTaskPrompt(
+		task: Task,
+		resumed: boolean,
+		entries: TaskMailboxEntry[],
+		legacySeed?: { messages: TaskMessage[]; output: string | null },
+	): string {
+		const lines = resumed
+			? [
+					`Resume your existing task: ${task.title}`,
+					"Continue from the durable Pi session context. Do not restart the task from scratch.",
+				]
+			: [
+					`Your task: ${task.title}`,
+					"",
+					task.description || "",
+				];
+
+		if (legacySeed) {
+			const pendingIds = new Set(entries.map((entry) => entry.id));
+			lines.push("", "Legacy task migration: the following persisted history is the complete prior context. Preserve it and continue from it.");
+			for (const message of legacySeed.messages) {
+				if (message.id && pendingIds.has(message.id)) continue;
+				lines.push("", `[${message.ts}] ${message.from} (${message.type}):`, message.text);
+			}
+			if (legacySeed.output !== null) {
+				lines.push("", "Prior durable task output:", legacySeed.output);
+			}
+		}
+
+		if (entries.length > 0) {
+			lines.push("", "New durable messages for this task:");
+			for (const entry of entries) {
+				lines.push("", `[${entry.message.ts}] ${entry.message.from}:`, entry.message.text);
+				if (entry.message.expectsReply) {
+					lines.push("[Direct response required by main orchestrator]");
+				}
+			}
+			lines.push("", "Read and act on every complete message above.");
+		} else if (resumed) {
+			lines.push("", "The previous process ended before final settlement. Continue the unfinished work and report the final result.");
+		}
+		return lines.join("\n");
+	}
+
+	private handleUnexpectedAgentExit(event: AgentEvent): void {
+		const exitCode = event.data?.exitCode ?? 1;
+		const turnCount = event.data?.turnCount ?? 0;
+		const stderr = event.data?.stderr || "";
+		const retryKey = `spawn-retry:${event.taskId}`;
+		if (!this.spawnRetries.has(retryKey)) {
+			this.spawnRetries.add(retryKey);
+			const reason = turnCount === 0
+				? "exited with 0 turns (likely rate limit or API error)"
+				: `exited before final agent_settled after ${turnCount} turns`;
+			logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr}`);
+			store.updateTaskStatus(this.squadId, event.taskId, "pending");
+			store.appendMessage(this.squadId, event.taskId, {
+				ts: store.now(),
+				from: "system",
+				type: "status",
+				text: `Agent ${reason}. Resuming the same task session...`,
+			});
+			setTimeout(() => {
+				if (this.running) this.scheduleReadyTasks();
+			}, 2000);
+		} else {
+			this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode} before final agent_settled (retry exhausted). ${stderr}`);
+		}
+		this.updateContext();
+	}
+
 	// =========================================================================
 	// Event Handlers
 	// =========================================================================
@@ -638,50 +766,45 @@ export class Scheduler {
 				break;
 			}
 
-				case "agent_end": {
-				const exitCode = event.data?.exitCode ?? 1;
+			case "agent_end": {
+				// Pi's low-level agent_end is not completion. AgentPool normally keeps
+				// it internal; if observed here, preserve in_progress. Only an actual
+				// child-process exit carries unexpectedExit and enters retry handling.
+				if (!event.data?.unexpectedExit) break;
+				this.handleUnexpectedAgentExit(event);
+				return;
+			}
+
+			case "agent_settled": {
+				// A mailbox entry not acknowledged by Pi outranks this run's candidate
+				// completion. Reopen the same session so accepted-at-least-once delivery
+				// occurs before the task can become done.
+				if (store.loadPendingTaskMessages(this.squadId, event.taskId).length > 0) {
+					store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null });
+					store.appendMessage(this.squadId, event.taskId, {
+						ts: store.now(),
+						from: "system",
+						type: "status",
+						text: "Agent settled with pending durable messages; resuming the same task session",
+					});
+					if (this.running) void this.reconcile();
+					this.updateContext();
+					return;
+				}
+
 				const turnCount = event.data?.turnCount ?? 0;
 				const toolCallCount = event.data?.toolCallCount ?? 0;
-
-				// Tool use is strong evidence of work, but planning/review tasks can
-				// legitimately deliver a substantive report without calling a tool.
-				// Accept durable assistant output; the mandatory main-orchestrator
-				// review gate still decides whether the work satisfies the contract.
 				const hasSubstantiveOutput = store.loadMessages(this.squadId, event.taskId)
 					.some((message) => message.from === event.agentName && message.type === "text" && message.text.trim().length > 0);
 				const hadMeaningfulWork = turnCount > 0 && (toolCallCount > 0 || hasSubstantiveOutput);
 				if (hadMeaningfulWork) {
 					this.handleTaskCompleted(event.taskId).then(() => this.updateContext());
 				} else {
-					// Agent exited without a completed turn, tool work, or substantive
-					// assistant artifact. Common causes: rate limit/API/resource failure.
-					// Retry once before failing.
-					const retryKey = `spawn-retry:${event.taskId}`;
-					if (!this.spawnRetries.has(retryKey)) {
-						this.spawnRetries.add(retryKey);
-						const stderr = event.data?.stderr || "";
-						const reason = turnCount === 0
-							? `exited with 0 turns (likely rate limit or API error)`
-							: `exited with ${turnCount} turns but no tool calls or substantive output`;
-						logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr}`);
-						store.updateTaskStatus(this.squadId, event.taskId, "pending");
-						store.appendMessage(this.squadId, event.taskId, {
-							ts: store.now(),
-							from: "system",
-							type: "status",
-							text: `Agent ${reason}. Retrying...`,
-						});
-						// Delay retry to let resources settle
-						setTimeout(() => {
-							if (this.running) this.scheduleReadyTasks();
-						}, 2000);
-					} else {
-						const stderr = event.data?.stderr || "";
-						this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode} (retry exhausted). ${stderr}`);
-					}
-					this.updateContext();
+					this.handleUnexpectedAgentExit({
+						...event,
+						data: { ...event.data, unexpectedExit: true },
+					});
 				}
-				// Skip the updateContext() below — handled in the branches above
 				return;
 			}
 
@@ -1139,12 +1262,75 @@ export class Scheduler {
 	// External Actions
 	// =========================================================================
 
-	/** Send a main-orchestrator request to a task's agent and await its next reply. */
+	/**
+	 * A reopened dependency invalidates every transitive descendant, including
+	 * descendants that had already completed. They retain history/output for
+	 * audit and durable-session continuation, but must rerun in dependency order.
+	 */
+	private async invalidateDescendants(reopenedTaskId: string): Promise<void> {
+		const tasks = store.loadAllTasks(this.squadId);
+		const byDependency = new Map<string, Task[]>();
+		for (const task of tasks) {
+			for (const dependency of task.depends) {
+				const dependents = byDependency.get(dependency) ?? [];
+				dependents.push(task);
+				byDependency.set(dependency, dependents);
+			}
+		}
+
+		const queue = [...(byDependency.get(reopenedTaskId) ?? [])];
+		const seen = new Set<string>();
+		const kills: Promise<void>[] = [];
+		while (queue.length > 0) {
+			const descendant = queue.shift()!;
+			if (seen.has(descendant.id)) continue;
+			seen.add(descendant.id);
+			queue.push(...(byDependency.get(descendant.id) ?? []));
+			store.updateTaskStatus(this.squadId, descendant.id, "blocked", {
+				completed: null,
+				error: null,
+			});
+			store.appendMessage(this.squadId, descendant.id, {
+				ts: store.now(),
+				from: "system",
+				type: "status",
+				text: `Blocked — dependency ancestry reopened at ${reopenedTaskId}; prior result requires revalidation`,
+			});
+			if (this.pool.isRunning(descendant.id)) kills.push(this.pool.kill(descendant.id));
+		}
+		await Promise.all(kills);
+	}
+
+	private async reopenTaskForMessage(task: Task): Promise<void> {
+		if (task.status === "done") await this.invalidateDescendants(task.id);
+		const tasks = store.loadAllTasks(this.squadId);
+		const dependenciesDone = task.depends.every(
+			(depId) => tasks.find((candidate) => candidate.id === depId)?.status === "done",
+		);
+		const nextStatus: TaskStatus = dependenciesDone ? "pending" : "blocked";
+		store.updateTaskStatus(this.squadId, task.id, nextStatus, {
+			error: null,
+			completed: null,
+		});
+
+		const squad = store.loadSquad(this.squadId);
+		if (squad && squad.status !== "running") {
+			squad.status = "running";
+			// Any prior acceptance/review applies to the pre-resume result. The
+			// normal all-done path will require a fresh independent review.
+			delete squad.review;
+			store.saveSquad(squad);
+		}
+	}
+
+	/** Send a main-orchestrator request to one exact task and await its next reply. */
 	async sendHumanMessage(taskId: string, message: string, expectsReply = true): Promise<boolean> {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) return false;
 
-		store.appendMessage(this.squadId, taskId, {
+		// Mailbox-first: a process/scheduler crash can occur at any later point
+		// without losing or redirecting this message to another task of the role.
+		const queued = store.queueTaskMessage(this.squadId, taskId, {
 			ts: store.now(),
 			from: "orchestrator",
 			type: "message",
@@ -1155,19 +1341,23 @@ export class Scheduler {
 		const request = expectsReply
 			? `[squad] Main orchestrator requests a direct response:\n${message}\n\nReply directly in your next assistant message. That complete message will be forwarded automatically to the main session.`
 			: `[squad] Main orchestrator message:\n${message}`;
-		if (this.pool.isRunning(taskId) && await this.pool.steer(taskId, request)) {
-			return true;
+		if (this.pool.isRunning(taskId)) {
+			if (await this.pool.steer(taskId, request)) {
+				store.acknowledgeTaskMessages(this.squadId, taskId, [queued.id]);
+				return true;
+			}
+			// The process may still be completing its current run. Preserve
+			// in_progress while it is live; agent_settled will observe the pending
+			// mailbox and reopen the same session instead of marking done.
+			if (this.pool.isRunning(taskId)) return false;
 		}
 
-		// Queue for when the assigned agent starts/restarts. The durable request
-		// marker lets a reconstructed scheduler still forward the eventual reply.
-		this.pool.queueMessage(task.agent, {
-			ts: store.now(),
-			from: "orchestrator",
-			type: "message",
-			text: expectsReply ? `${message}\n\n[Direct response required by main orchestrator]` : message,
-			expectsReply,
-		});
+		await this.reopenTaskForMessage(task);
+		if (this.running) {
+			await this.reconcile();
+			return store.loadPendingTaskMessages(this.squadId, taskId)
+				.every((entry) => entry.id !== queued.id);
+		}
 		return false;
 	}
 

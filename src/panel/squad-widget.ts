@@ -13,7 +13,7 @@
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { TaskStatus } from "../types.js";
+import type { TaskMessage, TaskStatus } from "../types.js";
 import * as store from "../store.js";
 
 function statusIcon(status: TaskStatus, th: Theme): string {
@@ -76,14 +76,33 @@ export function setupSquadWidget(
 		const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 		const doneCount = tasks.filter((t) => t.status === "done").length;
 		const elapsed = Date.now() - new Date(squad.created).getTime();
+		const taskMessages = new Map<string, TaskMessage[]>();
+		const recentOrchestratorByTask = new Map<string, TaskMessage>();
+		const recentMessageKeys: string[] = [];
+		for (const task of tasks) {
+			if (task.status !== "in_progress") continue;
+			const messages = store.loadMessages(state.squadId, task.id);
+			taskMessages.set(task.id, messages);
+			const latest = messages.at(-1);
+			recentMessageKeys.push(`${task.id}:${messages.length}:${latest?.id || latest?.ts || "none"}`);
+			const recentOrchestrator = [...messages.slice(-5)].reverse().find((message) =>
+				message.from === "orchestrator" &&
+				(message.type === "text" || message.type === "message" ||
+					message.type === "reply" || message.type === "mention"),
+			);
+			if (recentOrchestrator) recentOrchestratorByTask.set(task.id, recentOrchestrator);
+		}
 
 		const sIcon = squad.status === "done" ? th.fg("success", "✓")
 			: squad.status === "failed" ? th.fg("error", "✗")
 			: squad.status === "review" ? th.fg("warning", "◆")
 			: th.fg("warning", "⏳");
 
+		const orchestratorSignal = recentOrchestratorByTask.size > 0
+			? ` ${th.fg("accent", `✉ ${recentOrchestratorByTask.size > 1 ? recentOrchestratorByTask.size + " " : ""}ORCH`)}`
+			: "";
 		lines.push(
-			`${sIcon} ${th.fg("accent", "squad")} ${th.fg("dim", squad.goal.slice(0, 35))} ` +
+			`${sIcon} ${th.fg("accent", "squad")}${orchestratorSignal} ${th.fg("dim", squad.goal.slice(0, 35))} ` +
 			`${th.fg("muted", `${doneCount}/${tasks.length}`)} ` +
 			`${th.fg("dim", `$${totalCost.toFixed(2)}`)} ` +
 			`${th.fg("dim", formatElapsed(elapsed))} ` +
@@ -111,13 +130,19 @@ export function setupSquadWidget(
 				const runningFor = task.started ? Date.now() - new Date(task.started).getTime() : 0;
 				const timeColor = runningFor > 180_000 ? "warning" : "dim";
 				line += ` ${th.fg(timeColor as any, formatElapsed(runningFor))}`;
-				const messages = store.loadMessages(state.squadId!, task.id);
-				const lastTool = [...messages].reverse().find(m => m.type === "tool");
-				if (lastTool) {
-					const rawDetail = (lastTool.args?.path || lastTool.args?.command || "").toString();
-					const detail = rawDetail.split("\n")[0]; // first line only
-					const toolStr = `→ ${lastTool.name || lastTool.text}`;
-					line += ` ${th.fg("dim", (detail ? `${toolStr} ${detail}` : toolStr).slice(0, 30))}`;
+				const messages = taskMessages.get(task.id) || [];
+				const recentOrchestrator = recentOrchestratorByTask.get(task.id);
+				if (recentOrchestrator) {
+					const preview = recentOrchestrator.text.split("\n")[0].slice(0, 24);
+					line += ` ${th.fg("accent", "← ORCH")} ${th.fg("dim", preview)}`;
+				} else {
+					const lastTool = [...messages].reverse().find(m => m.type === "tool");
+					if (lastTool) {
+						const rawDetail = (lastTool.args?.path || lastTool.args?.command || "").toString();
+						const detail = rawDetail.split("\n")[0]; // first line only
+						const toolStr = `→ ${lastTool.name || lastTool.text}`;
+						line += ` ${th.fg("dim", (detail ? `${toolStr} ${detail}` : toolStr).slice(0, 30))}`;
+					}
 				}
 			} else if (task.status === "blocked") {
 				const blockers = task.depends.filter((d) => {
@@ -136,7 +161,7 @@ export function setupSquadWidget(
 			lines.push(`  ${th.fg("dim", `  +${tasks.length - maxVisible} more · ^q detail`)}`);
 		}
 
-		const cacheKey = `${squad.status}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}`;
+		const cacheKey = `${squad.status}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}:${recentMessageKeys.join(",")}`;
 
 		const statusText = squad.status === "done"
 			? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)

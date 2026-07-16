@@ -504,7 +504,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_message",
 		label: "Squad Message",
-		description: "Send a request to a specific agent/task. The agent's next substantive assistant response is durably forwarded back to the main Pi session and wakes it.",
+		description: "Send a durable request to a specific task. Existing tasks reopen their original Pi session; only a currently running task may be selected by agent name.",
 		parameters: Type.Object({
 			message: Type.String({ description: "Message to send" }),
 			taskId: Type.Optional(Type.String({ description: "Target task ID" })),
@@ -513,23 +513,40 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const activeScheduler = getActiveScheduler();
-			if (!activeScheduler || !activeSquadId) {
+			if (!activeSquadId) {
 				return { content: [{ type: "text" as const, text: "No active squad." }], details: undefined };
 			}
 
+			let activeScheduler = getActiveScheduler();
 			let taskId = params.taskId;
 
-			// If agent specified but no taskId, find their current task
-			if (!taskId && params.agent) {
-				taskId = activeScheduler.getPool().getTaskIdForAgent(params.agent) || undefined;
+			// Agent name is safe shorthand only when it identifies one live task.
+			// Multiple concurrent tasks can share a role, so never guess between them.
+			if (!taskId && params.agent && activeScheduler) {
+				const liveMatches = store.loadAllTasks(activeSquadId).filter(
+					(task) => task.agent === params.agent && activeScheduler!.getPool().isRunning(task.id),
+				);
+				if (liveMatches.length === 1) taskId = liveMatches[0].id;
 			}
 
 			if (!taskId) {
 				return { content: [{ type: "text" as const, text: "Could not determine target task. Provide taskId or an agent name that is currently running." }], details: undefined };
 			}
+			if (!store.loadTask(activeSquadId, taskId)) {
+				return { content: [{ type: "text" as const, text: `Task not found: ${taskId}` }], details: undefined };
+			}
 
-			const sent = await activeScheduler!.sendHumanMessage(taskId, params.message, params.expectReply ?? true);
+			// Review/done squads have no live scheduler after a process restart. An
+			// exact task ID is enough to reconstruct it from disk and reopen only that
+			// task; the task's immutable session binding supplies --session.
+			if (!activeScheduler) {
+				activeScheduler = new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext);
+				schedulers.set(activeSquadId, activeScheduler);
+				wireSchedulerEvents(pi, activeScheduler, activeSquadId);
+				await activeScheduler.start();
+			}
+
+			const sent = await activeScheduler.sendHumanMessage(taskId, params.message, params.expectReply ?? true);
 			const status = sent ? "delivered" : "queued for when the agent starts";
 
 			return { content: [{ type: "text" as const, text: `Message ${status}: "${params.message}"` }], details: undefined };
@@ -595,57 +612,7 @@ export default function (pi: ExtensionAPI) {
 					widgetState.enabled = true;
 					widgetControls?.requestUpdate();
 
-					// Wire up events (same as startSquad)
-					scheduler.onEvent((event: SchedulerEvent) => {
-						forceWidgetUpdate();
-						switch (event.type) {
-							case "squad_review_required": {
-								const tasks = store.loadAllTasks(squadId);
-								const summary = buildCompletionSummary(tasks);
-								const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-								const s = schedulers.get(squadId); if (s) s.updateContext();
-								const squad = store.loadSquad(squadId)!;
-								// Wake the main agent into an explicit acceptance gate. Agent reports
-								// are untrusted inputs; only independent orchestrator evidence can pass it.
-								pi.sendMessage({
-									customType: "squad-review-required",
-									content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\nSquad claims (review inputs only):\n${summary}\n\nTotal cost: $${totalCost.toFixed(4)}\n\n${buildOrchestratorReviewGate(squad, tasks)}`,
-									display: true,
-								}, { triggerTurn: true, deliverAs: "followUp" });
-								schedulers.delete(squadId);
-								forceWidgetUpdate();
-								break;
-							}
-							case "squad_failed": {
-								const tasks = store.loadAllTasks(squadId);
-								const failed = tasks.filter((t) => t.status === "failed");
-								const done = tasks.filter((t) => t.status === "done");
-								pi.sendMessage({
-									customType: "squad-failed",
-									content: `[squad] Squad "${squadId}" has stalled. ${done.length}/${tasks.length} done, ${failed.length} failed.\nFailed: ${buildFailureSummary(tasks)}`,
-									display: true,
-								}, { triggerTurn: true, deliverAs: "followUp" });
-								forceWidgetUpdate();
-								break;
-							}
-							case "orchestrator_reply": {
-								pi.sendMessage({
-									customType: "squad-agent-reply",
-									content: `[squad] Direct reply from '${event.agentName}' on task '${event.taskId}':\n${event.message}`,
-									display: true,
-								}, { triggerTurn: true, deliverAs: "followUp" });
-								break;
-							}
-							case "escalation": {
-								pi.sendMessage({
-									customType: "squad-escalation",
-									content: `[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n${event.message}`,
-									display: true,
-								}, { triggerTurn: true });
-								break;
-							}
-						}
-					});
+					wireSchedulerEvents(pi, scheduler, squadId);
 				}
 
 				const resumeSched = schedulers.get(squadId)!;
@@ -795,6 +762,29 @@ export default function (pi: ExtensionAPI) {
 			}
 		}
 
+		// Mailbox recovery is automatic after extension/main-process restart. Scan
+		// every project squad (including accepted done squads) because a crash can
+		// occur after the mailbox-first write but before the squad/task is reopened.
+		const pendingMailSquads = store.listSquadsForProject(ctx.cwd)
+			.filter((squad) => store.loadAllTasks(squad.id)
+				.some((task) => store.loadPendingTaskMessages(squad.id, task.id).length > 0))
+			.sort((a, b) => b.created.localeCompare(a.created));
+		for (const squad of pendingMailSquads) {
+			let scheduler = schedulers.get(squad.id);
+			if (!scheduler) {
+				scheduler = new Scheduler(squad.id, squadSkillPaths, schedulerSpawnContext);
+				schedulers.set(squad.id, scheduler);
+				wireSchedulerEvents(pi, scheduler, squad.id);
+			}
+			await scheduler.start();
+		}
+		if (pendingMailSquads.length > 0) {
+			activeSquadId = pendingMailSquads[0].id;
+			widgetState.squadId = activeSquadId;
+			widgetState.enabled = true;
+			widgetControls?.requestUpdate();
+		}
+
 		// Notify about paused squads only if they have real completed work
 		const paused = store.findActiveSquads()
 			.filter((s) => s.cwd === ctx.cwd && s.status === "paused");
@@ -851,7 +841,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					if (activeSquadId) {
-						openPanel(ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext), activeSquadId);
+						openPanel(pi, ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext), activeSquadId);
 					}
 					return { consume: true };
 				}
@@ -885,7 +875,7 @@ export default function (pi: ExtensionAPI) {
 				{ value: "agents", label: "agents", description: "List, view, or edit agent definitions" },
 				{ value: "defaults", label: "defaults", description: "Default model/thinking for agents (follow main session, pi default, or fixed)" },
 				{ value: "advisor", label: "advisor", description: "Advisor-first rescue for stuck agents (on/off, model, limits)" },
-				{ value: "msg", label: "msg", description: "Send message to agent: /squad msg [agent] text" },
+				{ value: "msg", label: "msg", description: "Message a task: /squad msg [task-id|running-agent] text" },
 				{ value: "widget", label: "widget", description: "Toggle live widget" },
 				{ value: "panel", label: "panel", description: "Toggle overlay panel" },
 				{ value: "cancel", label: "cancel", description: "Cancel running squad" },
@@ -978,7 +968,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					if (activeSquadId) {
 						const sched = schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext);
-						openPanel(ctx, sched, activeSquadId);
+						openPanel(pi, ctx, sched, activeSquadId);
 					}
 					return;
 				}
@@ -989,11 +979,8 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const msgSquad = store.loadSquad(activeSquadId);
-					if (!msgSquad || msgSquad.status !== "running") {
-						ctx.ui.notify("Squad is not running — messages only reach running agents.", "info");
-						return;
-					}
-					// Parse: /squad msg [agent] message text
+					if (!msgSquad) return;
+					// Parse: /squad msg [task-id|running-agent] message text
 					const msgParts = parts.slice(1);
 					let targetAgent: string | undefined;
 					let msgText: string;
@@ -1014,40 +1001,51 @@ export default function (pi: ExtensionAPI) {
 						}
 					}
 
-					// Find target task
+					// Find one exact target task. A task ID can address completed or
+					// stopped work; an agent name remains shorthand for a live task only.
 					const msgTasks = store.loadAllTasks(activeSquadId);
 					let targetTaskId: string | undefined;
-
-					if (targetAgent) {
-						const agentTask = msgTasks.find((t) => t.agent === targetAgent && t.status === "in_progress");
-						targetTaskId = agentTask?.id;
+					const explicitTask = msgParts.length > 1
+						? msgTasks.find((task) => task.id === msgParts[0])
+						: undefined;
+					if (explicitTask) {
+						targetTaskId = explicitTask.id;
+						targetAgent = explicitTask.agent;
+						msgText = msgParts.slice(1).join(" ");
+					} else if (targetAgent) {
+						const liveMatches = msgTasks.filter(
+							(task) => task.agent === targetAgent && getActiveScheduler()?.getPool().isRunning(task.id),
+						);
+						if (liveMatches.length === 1) targetTaskId = liveMatches[0].id;
 						if (!targetTaskId) {
-							ctx.ui.notify(`Agent '${targetAgent}' has no running task`, "warning");
+							ctx.ui.notify(`Agent '${targetAgent}' is not working on exactly one live task; provide an exact task ID`, "warning");
 							return;
 						}
 					} else {
-						const runningTask = msgTasks.find((t) => t.status === "in_progress");
-						targetTaskId = runningTask?.id;
-						targetAgent = runningTask?.agent;
-						if (!targetTaskId) {
-							ctx.ui.notify("No running tasks to message", "warning");
+						const liveTasks = msgTasks.filter((task) =>
+							getActiveScheduler()?.getPool().isRunning(task.id),
+						);
+						if (liveTasks.length === 1) {
+							targetTaskId = liveTasks[0].id;
+							targetAgent = liveTasks[0].agent;
+						} else {
+							ctx.ui.notify("No unique live task to message; provide an exact task ID", "warning");
 							return;
 						}
 					}
 
-					const msgSched = getActiveScheduler();
-					if (msgSched) {
-						await msgSched.sendHumanMessage(targetTaskId, msgText);
-						ctx.ui.notify(`Sent to ${targetAgent}: "${msgText}"`, "info");
-					} else {
-						store.appendMessage(activeSquadId, targetTaskId, {
-							ts: store.now(),
-							from: "human",
-							type: "message",
-							text: msgText,
-						});
-						ctx.ui.notify(`Logged to ${targetTaskId} (agent not running)`, "info");
+					let msgSched = getActiveScheduler();
+					if (!msgSched) {
+						msgSched = new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext);
+						schedulers.set(activeSquadId, msgSched);
+						wireSchedulerEvents(pi, msgSched, activeSquadId);
+						await msgSched.start();
 					}
+					const delivered = await msgSched.sendHumanMessage(targetTaskId, msgText);
+					ctx.ui.notify(
+						delivered ? `Sent to ${targetAgent}: "${msgText}"` : `Queued durably for ${targetTaskId}`,
+						"info",
+					);
 					forceWidgetUpdate();
 					return;
 				}
@@ -1475,6 +1473,63 @@ function forceWidgetUpdate(): void {
 	widgetControls?.requestUpdate();
 }
 
+/** Wire one scheduler to durable main-session notifications. */
+function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squadId: string): void {
+	scheduler.onEvent((event: SchedulerEvent) => {
+		forceWidgetUpdate();
+		switch (event.type) {
+			case "squad_review_required": {
+				const tasks = store.loadAllTasks(squadId);
+				const summary = buildCompletionSummary(tasks);
+				const totalCost = tasks.reduce((sum, task) => sum + task.usage.cost, 0);
+				scheduler.updateContext();
+				const squad = store.loadSquad(squadId);
+				if (!squad) break;
+				pi.sendMessage({
+					customType: "squad-review-required",
+					content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` +
+						`Squad claims (review inputs only):\n${summary}\n\n` +
+						`Total cost: $${totalCost.toFixed(4)}\n\n` +
+						buildOrchestratorReviewGate(squad, tasks),
+					display: true,
+				}, { triggerTurn: true, deliverAs: "followUp" });
+				// Keep the settled scheduler addressable. A later exact-task message
+				// can reopen the task immediately on its bound durable Pi session.
+				break;
+			}
+			case "squad_failed": {
+				const tasks = store.loadAllTasks(squadId);
+				const failed = tasks.filter((task) => task.status === "failed");
+				const done = tasks.filter((task) => task.status === "done");
+				pi.sendMessage({
+					customType: "squad-failed",
+					content: `[squad] Squad "${squadId}" has stalled. ` +
+						`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
+						`Failed: ${buildFailureSummary(tasks)}\n` +
+						"Use squad_status for details or squad_modify to adjust.",
+					display: true,
+				}, { triggerTurn: true, deliverAs: "followUp" });
+				break;
+			}
+			case "orchestrator_reply":
+				pi.sendMessage({
+					customType: "squad-agent-reply",
+					content: `[squad] Direct reply from '${event.agentName}' on task '${event.taskId}':\n${event.message}`,
+					display: true,
+				}, { triggerTurn: true, deliverAs: "followUp" });
+				break;
+			case "escalation":
+				pi.sendMessage({
+					customType: "squad-escalation",
+					content: `[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n` +
+						`${event.message}\n\nReply to me and I'll forward your answer, or use the squad panel.`,
+					display: true,
+				}, { triggerTurn: true });
+				break;
+		}
+	});
+}
+
 // ============================================================================
 // Panel — overlay via ctx.ui.custom() with proper done() lifecycle
 // ============================================================================
@@ -1485,6 +1540,7 @@ function forceWidgetUpdate(): void {
  * that resolves when done() is called. The panel calls done() on close.
  */
 function openPanel(
+	pi: ExtensionAPI,
 	ctx: import("@earendil-works/pi-coding-agent").ExtensionContext,
 	scheduler: Scheduler,
 	squadId: string,
@@ -1502,18 +1558,19 @@ function openPanel(
 				const task = store.loadTask(squadId, taskId);
 				const agentName = task?.agent || taskId;
 				const input = await ctx.ui.input(`Message to ${agentName}`, "Type your message...");
-				const panelSched = schedulers.get(squadId);
-				if (input && panelSched) {
-					await panelSched.sendHumanMessage(taskId, input);
-					ctx.ui.notify(`Sent to ${agentName}: "${input}"`, "info");
-				} else if (input) {
-					store.appendMessage(squadId, taskId, {
-						ts: store.now(),
-						from: "human",
-						type: "message",
-						text: input,
-					});
-					ctx.ui.notify(`Logged to ${taskId}`, "info");
+				if (input) {
+					let panelSched = schedulers.get(squadId);
+					if (!panelSched) {
+						panelSched = scheduler;
+						schedulers.set(squadId, panelSched);
+						wireSchedulerEvents(pi, panelSched, squadId);
+						await panelSched.start();
+					}
+					const delivered = await panelSched.sendHumanMessage(taskId, input);
+					ctx.ui.notify(
+						delivered ? `Sent to ${agentName}: "${input}"` : `Queued durably for ${taskId}`,
+						"info",
+					);
 				}
 				tui.requestRender();
 			};
@@ -1666,82 +1723,8 @@ async function startSquad(
 	widgetState.enabled = true;
 	widgetControls?.requestUpdate();
 
-	// Wire up completion/escalation notifications to main agent
-	scheduler.onEvent((event: SchedulerEvent) => {
-		// Update widget on every scheduler event
-		forceWidgetUpdate();
-		switch (event.type) {
-				case "squad_review_required": {
-				const tasks = store.loadAllTasks(squadId);
-				const summary = buildCompletionSummary(tasks);
-				const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-
-				// Final context update before clearing scheduler
-				const completedSched = schedulers.get(squadId);
-				if (completedSched) {
-					completedSched.updateContext();
-				}
-				const squad = store.loadSquad(squadId)!;
-
-				// Wake the main agent into an explicit acceptance gate. Never frame
-				// agent execution or squad QA as trusted completion.
-				pi.sendMessage({
-					customType: "squad-review-required",
-					content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` +
-						`Squad claims (review inputs only):\n${summary}\n\n` +
-						`Total cost: $${totalCost.toFixed(4)}\n\n` +
-						buildOrchestratorReviewGate(squad, tasks),
-					display: true,
-				}, { triggerTurn: true, deliverAs: "followUp" });
-
-				// Clear scheduler but keep activeSquadId so squad_status still works
-				schedulers.delete(squadId);
-				forceWidgetUpdate(); // Final update showing done state
-				break;
-			}
-
-			case "squad_failed": {
-				const tasks = store.loadAllTasks(squadId);
-				const failed = tasks.filter((t) => t.status === "failed");
-				const done = tasks.filter((t) => t.status === "done");
-
-				pi.sendMessage({
-					customType: "squad-failed",
-					content: `[squad] Squad "${squadId}" has stalled. ` +
-						`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
-						`Failed: ${buildFailureSummary(tasks)}\n` +
-						`Use squad_status for details or squad_modify to adjust.`,
-					display: true,
-				}, { triggerTurn: true, deliverAs: "followUp" });
-				forceWidgetUpdate();
-				break;
-			}
-
-			case "orchestrator_reply": {
-				// Push the complete requested response back into the main session and
-				// wake it; ordinary task activity remains panel-only.
-				pi.sendMessage({
-					customType: "squad-agent-reply",
-					content: `[squad] Direct reply from '${event.agentName}' on task '${event.taskId}':\n${event.message}`,
-					display: true,
-				}, { triggerTurn: true, deliverAs: "followUp" });
-				break;
-			}
-
-			case "escalation": {
-				// Escalation — agent needs help. triggerTurn so the main agent
-				// can respond and relay help.
-				pi.sendMessage({
-					customType: "squad-escalation",
-					content: `[squad] Agent '${event.agentName}' on task '${event.taskId}' needs attention:\n` +
-						`${event.message}\n\n` +
-						`Reply to me and I'll forward your answer, or use the squad panel.`,
-					display: true,
-				}, { triggerTurn: true });
-				break;
-			}
-		}
-	});
+	// Wire up completion/escalation notifications to main agent.
+	wireSchedulerEvents(pi, scheduler, squadId);
 
 	// Start scheduling — fire and forget, don't block the tool call.
 	// scheduler.start() spawns agents which can take seconds per agent.

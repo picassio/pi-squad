@@ -1,18 +1,13 @@
 /**
  * message-view.ts — Scrollable message log for a task.
- * All lines truncated to width. Caps rendered messages to prevent
- * TUI corruption from large message histories.
+ * The durable history is never sliced; only the fixed-height viewport is
+ * collected for the TUI so large histories cannot change component height.
  */
 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { TaskMessage } from "../types.js";
 import * as store from "../store.js";
-
-/** Max messages to render (most recent). Older messages are skipped. */
-const MAX_MESSAGES = 30;
-/** Max lines per text message before truncation */
-const MAX_TEXT_LINES = 5;
 
 export class MessageView {
 	private theme: Theme;
@@ -79,21 +74,13 @@ export class MessageView {
 			return pad(header, maxLines);
 		}
 
-		// Only render recent messages to prevent TUI overload
-		const messages = allMessages.slice(-MAX_MESSAGES);
-		const skipped = allMessages.length - messages.length;
-
-		const msgLines: string[] = [];
-		if (skipped > 0) {
-			msgLines.push(fit(th.fg("dim", ` ··· ${skipped} older messages ···`), w));
-			msgLines.push("");
-		}
-		msgLines.push(...this.renderMessages(messages, w));
-
-		// Fixed layout: header + scrollable content + status line = maxLines exactly
+		// Fixed layout: header + scrollable content + status line = maxLines exactly.
+		// Count lazily, then collect only the visible window. This keeps the renderer
+		// bounded without dropping any durable message or body line.
 		const statusLines = 1; // always show status/scroll bar
 		const contentHeight = Math.max(1, maxLines - header.length - statusLines);
-		const maxScroll = Math.max(0, msgLines.length - contentHeight);
+		const messageLineCount = this.countMessageLines(allMessages, w);
+		const maxScroll = Math.max(0, messageLineCount - contentHeight);
 
 		// Auto-scroll to bottom unless user scrolled up
 		if (!this.userScrolled) {
@@ -108,10 +95,10 @@ export class MessageView {
 		// Build output — exact height every time
 		const lines = [...header];
 
-		// Content area: pad to exact contentHeight
-		const visible = msgLines.slice(this.scrollOffset, this.scrollOffset + contentHeight);
+		// Content area: collect and pad to exact contentHeight.
+		const visible = this.collectMessageLines(allMessages, w, this.scrollOffset, contentHeight);
 		while (visible.length < contentHeight) visible.push("");
-		lines.push(...visible.slice(0, contentHeight));
+		lines.push(...visible);
 
 		// Status bar (always present, keeps layout stable)
 		const pct = maxScroll > 0 ? Math.round((this.scrollOffset / maxScroll) * 100) : 100;
@@ -124,10 +111,32 @@ export class MessageView {
 		return lines.slice(0, maxLines);
 	}
 
-	private renderMessages(messages: TaskMessage[], width: number): string[] {
+	private countMessageLines(messages: TaskMessage[], width: number): number {
+		let count = 0;
+		for (const _line of this.iterMessageLines(messages, width)) count++;
+		return count;
+	}
+
+	private collectMessageLines(
+		messages: TaskMessage[],
+		width: number,
+		start: number,
+		limit: number,
+	): string[] {
+		const visible: string[] = [];
+		let index = 0;
+		for (const line of this.iterMessageLines(messages, width)) {
+			if (index++ < start) continue;
+			visible.push(line);
+			if (visible.length >= limit) break;
+		}
+		return visible;
+	}
+
+	private *iterMessageLines(messages: TaskMessage[], width: number): Generator<string> {
 		const th = this.theme;
-		const lines: string[] = [];
 		let lastFrom: string | null = null;
+		let hasOutput = false;
 
 		for (const msg of messages) {
 			if (msg.type === "status" && msg.from === "system" && msg.text === "Agent starting work") continue;
@@ -136,54 +145,47 @@ export class MessageView {
 			lastFrom = msg.from;
 
 			if (showHeader) {
-				if (lines.length > 0) lines.push("");
+				if (hasOutput) yield "";
 				const time = fmtTime(msg.ts);
-				const color = msg.from === "human" ? "accent" : msg.from === "system" ? "dim" : "success";
-				const name = msg.from === "human" ? "YOU" : msg.from;
-				lines.push(fit(` ${th.fg("dim", time)} ${th.fg(color as any, name)}`, width));
+				const color = msg.from === "human" || msg.from === "orchestrator"
+					? "accent"
+					: msg.from === "system" ? "dim" : "success";
+				const name = senderLabel(msg.from);
+				yield fit(` ${th.fg("dim", time)} ${th.fg(color as any, name)}`, width);
+				hasOutput = true;
 			}
 
 			switch (msg.type) {
 				case "tool": {
 					const name = msg.name || msg.text;
-					// Tool args can contain multi-line bash commands — take first line only
+					// Tool args can contain multi-line bash commands — take first line only.
 					const rawArg = (msg.args?.path || msg.args?.command || "").toString();
 					const arg = rawArg.split("\n")[0];
-					lines.push(fit(`   ${th.fg("muted", `→ ${name}${arg ? " " + arg : ""}`)}`, width));
+					yield fit(`   ${th.fg("muted", `→ ${name}${arg ? " " + arg : ""}`)}`, width);
 					break;
 				}
-				case "mention": {
-					lines.push(fit(`   ${th.fg("accent", `@${msg.to || "?"}`)} ${th.fg("dim", msg.text)}`, width));
+				case "mention":
+					yield fit(`   ${th.fg("accent", `@${msg.to || "?"}`)} ${th.fg("dim", msg.text)}`, width);
 					break;
-				}
 				case "text":
 				case "message":
-				case "reply": {
-					const textLines = msg.text.replace(/\r/g, "").split("\n");
-					const show = textLines.slice(0, MAX_TEXT_LINES);
-					for (const tl of show) {
-						// Wrap long lines instead of truncating
-						const wrapped = wrap(`   ${tl}`, width, "      ");
-						lines.push(...wrapped);
-					}
-					if (textLines.length > MAX_TEXT_LINES) {
-						lines.push(fit(`   ${th.fg("dim", `... +${textLines.length - MAX_TEXT_LINES} lines`)}`, width));
+				case "reply":
+					for (const textLine of msg.text.replace(/\r/g, "").split("\n")) {
+						for (const line of wrap(`   ${textLine}`, width, "      ")) yield line;
 					}
 					break;
-				}
 				case "done":
-					lines.push(...wrap(`   ✓ ${msg.text}`, width, "      "));
+					for (const line of wrap(`   ✓ ${msg.text}`, width, "      ")) yield line;
 					break;
 				case "error":
-					lines.push(...wrap(`   ✗ ${msg.text}`, width, "      "));
+					for (const line of wrap(`   ✗ ${msg.text}`, width, "      ")) yield line;
 					break;
 				case "status":
-					lines.push(fit(`   ${th.fg("dim", msg.text)}`, width));
+					yield fit(`   ${th.fg("dim", msg.text)}`, width);
 					break;
 			}
+			hasOutput = true;
 		}
-
-		return lines;
 	}
 }
 
@@ -233,6 +235,12 @@ function wrap(line: string, width: number, indent: string = "   "): string[] {
 
 function stripAnsi(str: string): string {
 	return str.replace(/\x1b\[[0-9;]*m/g, "");
+}
+
+function senderLabel(from: string): string {
+	if (from === "human") return "YOU";
+	if (from === "orchestrator") return "ORCHESTRATOR";
+	return from;
 }
 
 function pad(lines: string[], max: number): string[] {
