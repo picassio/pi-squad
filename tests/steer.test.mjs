@@ -98,15 +98,94 @@ test("scheduler main-session message persists fully and steers the live task", a
 	const scheduler = new Scheduler(id, []);
 	const pool = scheduler.getPool();
 	const { writes } = attachFakeRunningAgent(pool);
+	const events = [];
+	scheduler.onEvent((event) => events.push(event));
 	const message = `Use the complete contract\n${"detail\n".repeat(1000)}MESSAGE-END`;
 
 	assert.equal(pool.getTaskIdForAgent("qa"), "qa-task", "agent-name targeting resolves to live task");
 	assert.equal(await scheduler.sendHumanMessage("qa-task", message), true);
-	assert.deepEqual(JSON.parse(writes[0]), { type: "steer", message: `[squad] Human: ${message}` });
+	const command = JSON.parse(writes[0]);
+	assert.equal(command.type, "steer");
+	assert.ok(command.message.startsWith("[squad] Main orchestrator requests a direct response:"));
+	assert.ok(command.message.includes(message));
+	assert.match(command.message, /forwarded automatically to the main session/);
 	const durable = store.loadMessages(id, "qa-task").at(-1);
-	assert.equal(durable.from, "human");
+	assert.equal(durable.from, "orchestrator");
+	assert.equal(durable.expectsReply, true);
 	assert.equal(durable.text, message, "main message is persisted without truncation");
+
+	const reply = `STATUS\n${"result\n".repeat(1000)}REPLY-END`;
+	scheduler.handleAgentEvent({
+		type: "message_end",
+		taskId: "qa-task",
+		agentName: "qa",
+		data: { role: "assistant", content: [{ type: "text", text: reply }] },
+	});
+	const forwarded = events.filter((event) => event.type === "orchestrator_reply");
+	assert.equal(forwarded.length, 1);
+	assert.equal(forwarded[0].message, reply, "complete response must be pushed back without truncation");
+	assert.ok(store.loadMessages(id, "qa-task").some((entry) => entry.type === "reply" && entry.to === "orchestrator"));
+
+	// Further normal activity is panel-only until main asks another question.
+	scheduler.handleAgentEvent({
+		type: "message_end",
+		taskId: "qa-task",
+		agentName: "qa",
+		data: { role: "assistant", content: [{ type: "text", text: "later activity" }] },
+	});
+	assert.equal(events.filter((event) => event.type === "orchestrator_reply").length, 1);
+
+	assert.equal(await scheduler.sendHumanMessage("qa-task", "fire-and-forget correction", false), true);
+	assert.deepEqual(JSON.parse(writes[1]), { type: "steer", message: "[squad] Main orchestrator message:\nfire-and-forget correction" });
+	scheduler.handleAgentEvent({
+		type: "message_end",
+		taskId: "qa-task",
+		agentName: "qa",
+		data: { role: "assistant", content: [{ type: "text", text: "acknowledged correction" }] },
+	});
+	assert.equal(events.filter((event) => event.type === "orchestrator_reply").length, 1, "fire-and-forget must not wake main");
 	pool.agents.delete("qa-task");
+});
+
+test("pending orchestrator reply survives scheduler reconstruction", async () => {
+	const id = "sq-reply-restart";
+	store.saveSquad({
+		id,
+		goal: "persist reply request",
+		status: "running",
+		created: store.now(),
+		cwd: tempHome,
+		agents: { qa: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	store.createTask(id, {
+		id: "qa-restart",
+		title: "QA",
+		description: "Reply later",
+		agent: "qa",
+		status: "pending",
+		depends: [],
+		created: store.now(),
+		started: null,
+		completed: null,
+		output: null,
+		error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+	});
+	const first = new Scheduler(id, []);
+	assert.equal(await first.sendHumanMessage("qa-restart", "status after start"), false, "non-running task queues request");
+
+	const reconstructed = new Scheduler(id, []);
+	const events = [];
+	reconstructed.onEvent((event) => events.push(event));
+	reconstructed.handleAgentEvent({
+		type: "message_end",
+		taskId: "qa-restart",
+		agentName: "qa",
+		data: { role: "assistant", content: [{ type: "text", text: "reconstructed reply" }] },
+	});
+	assert.equal(events.filter((event) => event.type === "orchestrator_reply").length, 1);
+	assert.equal(events.find((event) => event.type === "orchestrator_reply").message, "reconstructed reply");
 });
 
 test("agent_end does not kill queued steer; only agent_settled finalizes the child", () => {

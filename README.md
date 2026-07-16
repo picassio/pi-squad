@@ -139,7 +139,7 @@ Bundled agent definitions are copied to `~/.pi/squad/agents/` on first run. Edit
 
 **@mention routing**: Agents write `@frontend what token format?` in their output. The router delivers it in real-time via RPC `steer()`.
 
-**Main-session steering**: `squad_message` resolves an agent name to its live task, durably records the full message, and writes the documented JSONL RPC command `{"type":"steer","message":"..."}` to the child. pi-squad waits for Pi's final `agent_settled` event before closing the child; low-level `agent_end` no longer kills queued steering/follow-up continuations.
+**Main-session request/reply**: `squad_message` resolves an agent name to its live task, durably records the full request, and writes the documented JSONL RPC command `{"type":"steer","message":"..."}` to the child. By default (`expectReply: true`), the next substantive agent response is durably marked as the reply, pushed into the main Pi session, and wakes it via follow-up delivery; ordinary later activity remains panel-only. The pending reply marker survives scheduler reconstruction. Use `expectReply: false` for fire-and-forget steering. pi-squad waits for Pi's final `agent_settled` event before closing the child; low-level `agent_end` never kills queued continuations.
 
 ### Smart Planner
 

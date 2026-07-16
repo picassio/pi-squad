@@ -504,11 +504,12 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_message",
 		label: "Squad Message",
-		description: "Send a message to a specific agent or task in the running squad.",
+		description: "Send a request to a specific agent/task. The agent's next substantive assistant response is durably forwarded back to the main Pi session and wakes it.",
 		parameters: Type.Object({
 			message: Type.String({ description: "Message to send" }),
 			taskId: Type.Optional(Type.String({ description: "Target task ID" })),
 			agent: Type.Optional(Type.String({ description: "Target agent name" })),
+			expectReply: Type.Optional(Type.Boolean({ description: "Forward the agent's next substantive response back to main Pi and wake it (default true)" })),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
@@ -528,7 +529,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: "Could not determine target task. Provide taskId or an agent name that is currently running." }], details: undefined };
 			}
 
-			const sent = await activeScheduler!.sendHumanMessage(taskId, params.message);
+			const sent = await activeScheduler!.sendHumanMessage(taskId, params.message, params.expectReply ?? true);
 			const status = sent ? "delivered" : "queued for when the agent starts";
 
 			return { content: [{ type: "text" as const, text: `Message ${status}: "${params.message}"` }], details: undefined };
@@ -625,6 +626,14 @@ export default function (pi: ExtensionAPI) {
 									display: true,
 								}, { triggerTurn: true, deliverAs: "followUp" });
 								forceWidgetUpdate();
+								break;
+							}
+							case "orchestrator_reply": {
+								pi.sendMessage({
+									customType: "squad-agent-reply",
+									content: `[squad] Direct reply from '${event.agentName}' on task '${event.taskId}':\n${event.message}`,
+									display: true,
+								}, { triggerTurn: true, deliverAs: "followUp" });
 								break;
 							}
 							case "escalation": {
@@ -1705,6 +1714,17 @@ async function startSquad(
 					display: true,
 				}, { triggerTurn: true, deliverAs: "followUp" });
 				forceWidgetUpdate();
+				break;
+			}
+
+			case "orchestrator_reply": {
+				// Push the complete requested response back into the main session and
+				// wake it; ordinary task activity remains panel-only.
+				pi.sendMessage({
+					customType: "squad-agent-reply",
+					content: `[squad] Direct reply from '${event.agentName}' on task '${event.taskId}':\n${event.message}`,
+					display: true,
+				}, { triggerTurn: true, deliverAs: "followUp" });
 				break;
 			}
 

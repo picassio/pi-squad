@@ -34,6 +34,7 @@ export type SchedulerEventType =
 	| "task_rework"
 	| "squad_review_required"
 	| "squad_failed"
+	| "orchestrator_reply"
 	| "escalation"
 	| "activity";
 
@@ -568,6 +569,26 @@ export class Scheduler {
 							// presentation layers may viewport them, but source data must never truncate.
 							text,
 						});
+
+						// A squad_message is a request/response channel, not fire-and-forget.
+						// Persist an acknowledgement marker before emitting so restart/focus
+						// changes cannot forward the same response twice.
+						if (this.hasPendingOrchestratorRequest(event.taskId)) {
+							store.appendMessage(this.squadId, event.taskId, {
+								ts: store.now(),
+								from: event.agentName,
+								type: "reply",
+								to: "orchestrator",
+								text: "Response forwarded to main orchestrator",
+							});
+							this.emit({
+								type: "orchestrator_reply",
+								squadId: this.squadId,
+								taskId: event.taskId,
+								agentName: event.agentName,
+								message: text,
+							});
+						}
 					}
 
 					// Track usage
@@ -1118,29 +1139,45 @@ export class Scheduler {
 	// External Actions
 	// =========================================================================
 
-	/** Send a human message to a task's agent */
-	async sendHumanMessage(taskId: string, message: string): Promise<boolean> {
+	/** Send a main-orchestrator request to a task's agent and await its next reply. */
+	async sendHumanMessage(taskId: string, message: string, expectsReply = true): Promise<boolean> {
+		const task = store.loadTask(this.squadId, taskId);
+		if (!task) return false;
+
 		store.appendMessage(this.squadId, taskId, {
 			ts: store.now(),
-			from: "human",
+			from: "orchestrator",
 			type: "message",
 			text: message,
+			expectsReply,
 		});
 
-		if (this.pool.isRunning(taskId)) {
-			return this.pool.steer(taskId, `[squad] Human: ${message}`);
+		const request = expectsReply
+			? `[squad] Main orchestrator requests a direct response:\n${message}\n\nReply directly in your next assistant message. That complete message will be forwarded automatically to the main session.`
+			: `[squad] Main orchestrator message:\n${message}`;
+		if (this.pool.isRunning(taskId) && await this.pool.steer(taskId, request)) {
+			return true;
 		}
-		// Queue for when agent spawns
-		const task = store.loadTask(this.squadId, taskId);
-		if (task) {
-			this.pool.queueMessage(task.agent, {
-				ts: store.now(),
-				from: "human",
-				type: "message",
-				text: message,
-			});
-		}
+
+		// Queue for when the assigned agent starts/restarts. The durable request
+		// marker lets a reconstructed scheduler still forward the eventual reply.
+		this.pool.queueMessage(task.agent, {
+			ts: store.now(),
+			from: "orchestrator",
+			type: "message",
+			text: expectsReply ? `${message}\n\n[Direct response required by main orchestrator]` : message,
+			expectsReply,
+		});
 		return false;
+	}
+
+	private hasPendingOrchestratorRequest(taskId: string): boolean {
+		let pending = false;
+		for (const message of store.loadMessages(this.squadId, taskId)) {
+			if (message.from === "orchestrator" && message.expectsReply) pending = true;
+			if (message.type === "reply" && message.to === "orchestrator") pending = false;
+		}
+		return pending;
 	}
 
 	/** Pause a running task */

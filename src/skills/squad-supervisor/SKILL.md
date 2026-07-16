@@ -130,7 +130,8 @@ Common escalation patterns:
 Use `squad_message` with:
 - `taskId` — target a specific task
 - `agent` — target whichever task an agent is working on
-- `message` — your instruction or answer
+- `message` — your instruction or question
+- `expectReply` — defaults to `true`; the agent's next substantive response is durably pushed back into the main Pi session and wakes you. Set `false` only for fire-and-forget steering.
 
 Keep messages **specific and actionable**:
 - Good: "Use RS256 for JWT signing. The secret is in env var JWT_SECRET."

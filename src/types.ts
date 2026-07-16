@@ -165,6 +165,8 @@ export interface TaskMessage {
 	type: MessageType;
 	text: string;
 	to?: string;
+	/** Main-orchestrator message expects the next substantive agent response. */
+	expectsReply?: boolean;
 	name?: string;
 	args?: Record<string, unknown>;
 }
