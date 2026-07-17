@@ -161,6 +161,33 @@ test("cancelled tasks stay visible with a neutral icon and active-task counts", 
 	}
 });
 
+test("refreshNow switches the installed widget to the exact focused squad synchronously", () => {
+	const firstId = "sq-widget-focus-first";
+	const secondId = "sq-widget-focus-second";
+	createFixture(firstId, "done");
+	createFixture(secondId, "done");
+	const first = store.loadSquad(firstId); first.goal = "FIRST_WIDGET_GOAL"; store.saveSquad(first);
+	const second = store.loadSquad(secondId); second.goal = "SECOND_WIDGET_GOAL"; store.saveSquad(second);
+	let widgetFactory;
+	const state = { squadId: firstId, enabled: true };
+	const controls = setupSquadWidget({ hasUI: true, ui: {
+		theme,
+		setWidget: (_id, value) => { if (typeof value === "function") widgetFactory = value; },
+		setStatus: () => {},
+	} }, state);
+	try {
+		const component = widgetFactory({ terminal: { columns: 160 } }, theme);
+		assert.ok(component.render(160)[0].includes("FIRST_WIDGET_GOAL"));
+		state.squadId = secondId;
+		controls.refreshNow();
+		const switched = component.render(160)[0];
+		assert.ok(switched.includes("SECOND_WIDGET_GOAL"));
+		assert.ok(!switched.includes("FIRST_WIDGET_GOAL"));
+	} finally {
+		controls.dispose();
+	}
+});
+
 test("pending and failed independent review render distinctly and invalidate widget cache", async () => {
 	const squadId = "sq-panel-review-presentation";
 	createFixture(squadId, "done");

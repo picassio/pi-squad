@@ -22,7 +22,7 @@ import { validatePlan, PLAN_STRUCTURE_RULES } from "./plan-rules.js";
 import { ADVISOR_SYSTEM_PROMPT, buildAdvisorConsultText, type AdvisorConsultInput } from "./advisor.js";
 import { completeSimple, type Message, type TextContent } from "@earendil-works/pi-ai";
 import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
-import { setupSquadWidget, type SquadWidgetState } from "./panel/squad-widget.js";
+import { setupSquadWidget, type SquadWidgetControls, type SquadWidgetState } from "./panel/squad-widget.js";
 import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
 import { buildCompletionSummary, buildFailureSummary } from "./report.js";
@@ -53,7 +53,15 @@ let overlayOpen = false;
 let uiCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null = null;
 /** Component-based widget state + controls */
 const widgetState: SquadWidgetState = { squadId: null, enabled: true };
-let widgetControls: { requestUpdate: () => void; dispose: () => void } | null = null;
+let widgetControls: SquadWidgetControls | null = null;
+
+/** Keep main-session focus, compact widget, and detail panel targeting identical. */
+function focusSquad(squadId: string | null): void {
+	activeSquadId = squadId;
+	widgetState.squadId = squadId;
+	if (squadId) widgetState.enabled = true;
+	widgetControls?.refreshNow();
+}
 
 /** Format completion against active work while retaining cancelled history. */
 function formatTaskProgress(tasks: Task[]): string {
@@ -197,11 +205,10 @@ function getActiveScheduler(): Scheduler | null {
 
 /** Restore the single focus/widget invariant after destructive exact cancellation. */
 function repairFocusAfterCancellation(cancelledId: string): void {
-	if (activeSquadId === cancelledId || (activeSquadId !== null && !store.loadSquad(activeSquadId))) {
-		activeSquadId = null;
-	}
-	widgetState.squadId = activeSquadId;
-	widgetControls?.requestUpdate();
+	const nextFocus = activeSquadId === cancelledId || (activeSquadId !== null && !store.loadSquad(activeSquadId))
+		? null
+		: activeSquadId;
+	focusSquad(nextFocus);
 }
 
 function activeSuspendedAttentionForProject(cwd: string): Array<{ squadId: string; attention: SuspendedStallAttention }> {
@@ -218,10 +225,7 @@ function ensureScheduler(pi: ExtensionAPI, squadId: string, skillPaths: string[]
 		schedulers.set(squadId, scheduler);
 		wireSchedulerEvents(pi, scheduler, squadId);
 	}
-	activeSquadId = squadId;
-	widgetState.squadId = squadId;
-	widgetState.enabled = true;
-	widgetControls?.requestUpdate();
+	focusSquad(squadId);
 	return scheduler;
 }
 
@@ -309,8 +313,7 @@ export default function (pi: ExtensionAPI) {
 		if (activeSquadId) {
 			const squad = store.loadSquad(activeSquadId);
 			if (!squad) {
-				activeSquadId = null;
-				widgetState.squadId = null;
+				focusSquad(null);
 				if (durablePrompts.length > 0) {
 					return { systemPrompt: event.systemPrompt + "\n\n" + durablePrompts.join("\n\n") };
 				}
@@ -756,7 +759,7 @@ export default function (pi: ExtensionAPI) {
 			if (!activeScheduler) {
 				return { content: [{ type: "text" as const, text: `Squad '${squadId}' has no active scheduler. Use resume, add_task, or resume_task to reconstruct it.` }], details: undefined };
 			}
-			activeSquadId = squadId;
+			focusSquad(squadId);
 
 			switch (params.action) {
 				case "add_task": {
@@ -882,6 +885,13 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		uiCtx = ctx;
 
+		// A session replacement may not deliver shutdown first. Never carry a
+		// focused squad across projects, and never seed a new widget from stale state.
+		widgetControls?.dispose();
+		widgetControls = null;
+		const focused = activeSquadId ? store.loadSquad(activeSquadId) : null;
+		focusSquad(focused?.cwd === ctx.cwd ? activeSquadId : null);
+
 		// Install component-based widget
 		if (ctx.hasUI) {
 			widgetControls = setupSquadWidget(ctx, widgetState);
@@ -948,12 +958,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			await scheduler.start();
 		}
-		if (pendingMailSquads.length > 0) {
-			activeSquadId = pendingMailSquads[0].id;
-			widgetState.squadId = activeSquadId;
-			widgetState.enabled = true;
-			widgetControls?.requestUpdate();
-		}
+		if (pendingMailSquads.length > 0) focusSquad(pendingMailSquads[0].id);
 
 		// Notify about paused squads only if they have real completed work
 		const paused = store.findActiveSquads()
@@ -979,10 +984,7 @@ export default function (pi: ExtensionAPI) {
 			.filter((s) => s.cwd === ctx.cwd && s.status === "review");
 		if (pendingReviews.length > 0) {
 			const squad = pendingReviews.sort((a, b) => b.created.localeCompare(a.created))[0];
-			activeSquadId = squad.id;
-			widgetState.squadId = squad.id;
-			widgetState.enabled = true;
-			widgetControls?.requestUpdate();
+			focusSquad(squad.id);
 			const tasks = store.loadAllTasks(squad.id);
 			pi.sendMessage({
 				customType: "squad-review-required",
@@ -1021,13 +1023,13 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		focusSquad(null);
 		widgetControls?.dispose();
 		widgetControls = null;
 		for (const [id, sched] of schedulers) {
 			await sched.stop();
 		}
 		schedulers.clear();
-		activeSquadId = null;
 		uiCtx = null;
 	});
 
@@ -1252,8 +1254,7 @@ export default function (pi: ExtensionAPI) {
 
 				case "clear": {
 					if (activeSquadId) schedulers.delete(activeSquadId);
-					activeSquadId = null;
-					widgetState.squadId = null;
+					focusSquad(null);
 					widgetControls?.dispose();
 					ctx.ui.notify("Squad view cleared", "info");
 					return;
@@ -1274,9 +1275,7 @@ export default function (pi: ExtensionAPI) {
 							await sched.stop();
 						}
 						schedulers.clear();
-						activeSquadId = null;
-						widgetState.squadId = null;
-						widgetControls?.requestUpdate();
+						focusSquad(null);
 
 						let count = 0;
 						for (const id of allSquadIds) {
@@ -1312,9 +1311,7 @@ export default function (pi: ExtensionAPI) {
 							await sched.stop();
 						}
 						schedulers.clear();
-						activeSquadId = null;
-						widgetState.squadId = null;
-						widgetControls?.requestUpdate();
+						focusSquad(null);
 						let count = 0;
 						for (const id of allSquadIds) {
 							fs.rmSync(store.getSquadDir(id), { recursive: true, force: true });
@@ -1332,11 +1329,7 @@ export default function (pi: ExtensionAPI) {
 								await sched.stop();
 								schedulers.delete(squad.id);
 							}
-							if (activeSquadId === squad.id) {
-								activeSquadId = null;
-								widgetState.squadId = null;
-								widgetControls?.requestUpdate();
-							}
+							if (activeSquadId === squad.id) focusSquad(null);
 							fs.rmSync(store.getSquadDir(squad.id), { recursive: true, force: true });
 							ctx.ui.notify(`Deleted: ${squad.id}`, "info");
 						}
@@ -1358,10 +1351,8 @@ export default function (pi: ExtensionAPI) {
 						await sched.stop();
 					}
 					schedulers.clear();
-					activeSquadId = null;
-					widgetState.squadId = null;
 					widgetState.enabled = false;
-					widgetControls?.requestUpdate();
+					focusSquad(null);
 					ctx.ui.notify("pi-squad disabled — all tools, widget, and system prompt injection stopped", "info");
 					return;
 				}
@@ -1633,13 +1624,9 @@ function activateSquadView(squadId: string, ctx: import("@earendil-works/pi-codi
 		return;
 	}
 
-	activeSquadId = squadId;
-
-	// Update widget to show the new squad. The widget reads squadId on each
-	// render, so just updating the state and requesting a render is enough.
-	widgetState.squadId = squadId;
-	widgetState.enabled = true;
-	widgetControls?.requestUpdate();
+	// Selection is one atomic focus operation: panel, widget, status, and tools
+	// must all target this exact squad before control returns to the caller.
+	focusSquad(squadId);
 
 	// Compact notification — widget already shows full task details.
 	// Avoid large multi-line notifications that can break TUI layout.
@@ -1743,6 +1730,9 @@ function openPanel(
 	squadId: string,
 ): void {
 	if (overlayOpen) return;
+	// Opening details also establishes authoritative focus. This covers callers
+	// that reconstructed or targeted a scheduler without going through selector UI.
+	focusSquad(squadId);
 	overlayOpen = true;
 
 	// The promise resolves when the panel calls done()
@@ -1914,12 +1904,8 @@ async function startSquad(
 	// Start scheduler
 	const scheduler = new Scheduler(squadId, skillPaths, schedulerSpawnContext);
 	schedulers.set(squadId, scheduler);
-	activeSquadId = squadId;
-
-	// Activate widget for this squad
-	widgetState.squadId = squadId;
-	widgetState.enabled = true;
-	widgetControls?.requestUpdate();
+	// Activate panel/widget/tool focus as one invariant.
+	focusSquad(squadId);
 
 	// Wire up completion/escalation notifications to main agent.
 	wireSchedulerEvents(pi, scheduler, squadId);

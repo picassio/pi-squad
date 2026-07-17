@@ -848,6 +848,48 @@ test("restart delivers one durable suspended-stall wake and exact resume clears 
 	await emit(restartedApi, "session_shutdown");
 });
 
+test("explicit tool targeting keeps widget and opened panel on the same exact squad", async () => {
+	const firstId = "sq-widget-panel-first";
+	const secondId = "sq-widget-panel-second";
+	store.saveSquad({
+		id: firstId, goal: "FIRST_WIDGET_PANEL_GOAL", status: "review", created: "2026-07-18T04:00:00.000Z", cwd: tempHome,
+		agents: { qa: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+		review: { status: "pending", requestedAt: "2026-07-18T04:00:01.000Z", completedAt: null, verdict: null, contractChecks: [], diffReview: "", verificationEvidence: [], integrationEvidence: "", issues: [] },
+	});
+	store.createTask(firstId, { id: "first-task", title: "first", description: "first", agent: "qa", status: "done", depends: [], created: store.now(), started: null, completed: store.now(), output: "done", error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 } });
+	store.saveSquad({
+		id: secondId, goal: "SECOND_WIDGET_PANEL_GOAL", status: "paused", created: "2026-07-18T03:00:00.000Z", cwd: tempHome,
+		agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	store.createTask(secondId, { id: "second-task", title: "second", description: "second", agent: "backend", status: "suspended", depends: [], created: store.now(), started: null, completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 } });
+
+	const api = createFakeExtensionApi(); registerExtension(api);
+	const theme = { fg: (_color, text) => text, bold: (text) => text };
+	let widgetFactory; let panel;
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const ctx = { hasUI: true, cwd: tempHome, ui: {
+		theme,
+		setWidget: (_id, value) => { if (typeof value === "function") widgetFactory = value; },
+		setStatus() {}, notify() {}, onTerminalInput() {}, input: async () => undefined,
+		custom: (factory) => new Promise((resolve) => { panel = factory(tui, theme, {}, resolve); }),
+	} };
+	await emit(api, "session_start", {}, ctx);
+	const widget = widgetFactory(tui, theme);
+	assert.ok(widget.render(160)[0].includes("FIRST_WIDGET_PANEL_GOAL"), "restored review owns initial focus");
+
+	const modified = await api.tools.get("squad_modify").execute("focus-second", {
+		action: "set_dependencies", squadId: secondId, taskId: "second-task", depends: [],
+	}, undefined, undefined, ctx);
+	assert.match(modified.content[0].text, new RegExp(secondId));
+	assert.ok(widget.render(160)[0].includes("SECOND_WIDGET_PANEL_GOAL"), "explicit tool target switches the already-installed widget immediately");
+
+	await api.commands.get("squad").handler("panel", ctx);
+	assert.ok(panel.render(120)[0].includes("SECOND_WIDGET_PANEL_GOAL"), "detail panel and widget share one authoritative focus");
+	panel.handleInput("\x11");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	await emit(api, "session_shutdown");
+});
+
 test("file-spec publication rejects inconsistent metadata and unsafe task paths without partial discovery", () => {
 	const raw = Buffer.from("{\"schemaVersion\":1}\n");
 	const id = "atomic-file-publish";

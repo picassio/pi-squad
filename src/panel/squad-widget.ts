@@ -43,6 +43,12 @@ export interface SquadWidgetState {
 	enabled: boolean;
 }
 
+export interface SquadWidgetControls {
+	requestUpdate: () => void;
+	refreshNow: () => void;
+	dispose: () => void;
+}
+
 /**
  * Set up the squad widget. Returns control functions.
  *
@@ -53,11 +59,8 @@ export interface SquadWidgetState {
 export function setupSquadWidget(
 	ctx: { ui: { setWidget: Function; setStatus: Function; [key: string]: any }; hasUI?: boolean },
 	state: SquadWidgetState,
-): {
-	requestUpdate: () => void;
-	dispose: () => void;
-} {
-	if (!ctx.hasUI) return { requestUpdate: () => {}, dispose: () => {} };
+): SquadWidgetControls {
+	if (!ctx.hasUI) return { requestUpdate: () => {}, refreshNow: () => {}, dispose: () => {} };
 
 	let durationTimer: ReturnType<typeof setInterval> | null = null;
 	let renderTimer: ReturnType<typeof setTimeout> | null = null;
@@ -269,9 +272,14 @@ export function setupSquadWidget(
 		}
 	}
 
+	function refreshNow(): void {
+		if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
+		render();
+		manageDurationTimer();
+	}
+
 	// Initial render
-	render();
-	manageDurationTimer();
+	refreshNow();
 
 	return {
 		requestUpdate(): void {
@@ -279,14 +287,17 @@ export function setupSquadWidget(
 			if (renderTimer) return;
 			renderTimer = setTimeout(() => {
 				renderTimer = null;
-				render();
-				manageDurationTimer();
+				refreshNow();
 			}, 50);
 		},
+		refreshNow,
 		dispose(): void {
 			if (durationTimer) { clearInterval(durationTimer); durationTimer = null; }
 			if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
 			lastCacheKey = "";
+			currentLines = [];
+			widgetInstalled = false;
+			widgetComponent = null;
 			ctx.ui.setWidget("squad-tasks", undefined);
 			ctx.ui.setStatus("squad", undefined);
 		},
