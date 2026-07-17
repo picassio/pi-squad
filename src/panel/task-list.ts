@@ -6,6 +6,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { Task, TaskStatus } from "../types.js";
 import type { Scheduler } from "../scheduler.js";
+import { formatSuspendedAttention, getReviewPresentation } from "../presentation.js";
 import * as store from "../store.js";
 
 // ============================================================================
@@ -89,6 +90,15 @@ export class TaskListView {
 		const bottomLines: string[] = [];
 		bottomLines.push("");
 		bottomLines.push(truncateToWidth(th.fg("border", " " + "─".repeat(width - 2)), width, ""));
+
+		const squad = store.loadSquad(this.squadId);
+		const review = squad ? getReviewPresentation(squad) : null;
+		if (review) bottomLines.push(truncateToWidth(` ${th.fg(review.tone, review.label)}`, width, ""));
+		if (squad) {
+			for (const line of formatSuspendedAttention(squad)) {
+				bottomLines.push(truncateToWidth(` ${th.fg("warning", line)}`, width, ""));
+			}
+		}
 
 		const runningTask = tasks.find((t) => t.status === "in_progress");
 		if (runningTask) {

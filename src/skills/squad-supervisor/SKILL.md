@@ -120,6 +120,7 @@ When you receive `[squad] Agent needs attention`:
 4. **If you can't**: ask the user, then relay their answer via `squad_message`
 
 Common escalation patterns:
+- **`SUSPENDED WORK NEEDS ACTION`** → Read every exact suspended task ID and blocked descendant. Do not assume consent and do not use whole-squad `resume`; resume only each intended task with `squad_modify { action: "resume_task", squadId: "<exact squad>", taskId: "<exact task>" }`. Nothing resumes automatically.
 - **"Which approach should I use?"** → Ask the user for preference, relay via `squad_message`
 - **"I need info from another agent"** → Check if that agent is done, relay their output
 - **"I'm blocked by a failing test"** → Check the error, suggest a fix via `squad_message`
@@ -152,11 +153,15 @@ Use `squad_modify` when:
 - **`cancel_task`**: A task is no longer needed. Cancellation is refused while any non-cancelled task directly depends on it. First call `set_dependencies` for every dependent named in the refusal, then retry `cancel_task`. Cancellation never cascades and never removes or rewrites dependencies automatically.
 - **`pause_task`** / **`resume_task`**: Temporarily halt or explicitly revive an agent; `resume_task` is also the only action that revives a cancelled task.
 - **`pause`** / **`resume`**: Stop/restart the entire squad
-- **`cancel`**: Abort everything (user changed their mind)
+- **`cancel`**: Abort everything (user changed their mind). This destructive tool action requires the exact `squadId`; never infer it from focus or recency. The result must name the affected squad. Interactive `/squad cancel` is the only cancellation shorthand that may use the visibly focused squad.
+
+A suspended task is an explicit pause. Scheduler restart, reconciliation, dependency edits, and attention delivery must not be treated as permission to resume it. When durable suspended-stall attention is active, use `squad_status` once to see the complete IDs and exact-squad guidance, then resume only the tasks deliberately chosen.
 
 ## After Agents Finish — Mandatory Independent Orchestrator Review
 
 Agent execution finishing is **not completion or acceptance**. When you receive `[squad] TASK EXECUTION FINISHED` / `<squad_review_required>`, every squad output—including QA PASS—is an untrusted claim. You are the independent acceptance authority.
+
+Read acceptance labels literally: `◆ REVIEW PENDING · independent review required` means review has not happened; `✗ REVIEW FAILED · awaiting same-squad rework` means review happened and rejected the candidate. Task progress such as `3/3` is execution progress only. A failed gate requires concrete rework in that same exact squad before a fresh review can exist; never overwrite the failed verdict or create a separate squad to evade it.
 
 You MUST do all of this before telling the user the work succeeded:
 1. **Re-read the original contract**: reconstruct every requirement, boundary, and later clarification from the user's main-session conversation. The squad goal/task plan is only a secondary aid and cannot narrow the original request.

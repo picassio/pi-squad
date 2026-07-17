@@ -178,6 +178,62 @@ test("a completed task reopens on its original session while a new task alone ge
 	assert.equal(store.loadSquad(id).status, "running");
 });
 
+test("message-reopened live task treats redundant resume as an idempotent no-op and settles once", async () => {
+	const id = createSquad([{ id: "reopen-live", status: "done" }], "review");
+	const originalFile = path.join(store.getTaskSessionDir(id, "reopen-live"), "original.jsonl");
+	store.bindTaskSession(id, "reopen-live", { file: originalFile, sessionId: "original-session" });
+	const scheduler = new Scheduler(id, []);
+	const { pool, spawns } = installFakeSpawner(scheduler, id);
+	scheduler.running = true;
+
+	assert.equal(await scheduler.sendHumanMessage("reopen-live", "perform exact rework"), true);
+	assert.equal(store.loadTask(id, "reopen-live").status, "in_progress");
+	assert.equal(spawns.length, 1);
+	const sessionBefore = store.loadTaskSession(id, "reopen-live");
+
+	assert.equal(await scheduler.resumeTask("reopen-live"), "already_running");
+	assert.equal(store.loadTask(id, "reopen-live").status, "in_progress");
+	assert.equal(spawns.length, 1, "redundant resume must not spawn a second child");
+	assert.deepEqual(store.loadTaskSession(id, "reopen-live"), sessionBefore);
+
+	const agent = pool.agents.get("reopen-live");
+	agent.activity.turnCount = 1;
+	agent.activity.recentToolCalls.push({ name: "read", ts: Date.now() });
+	pool.handleRpcEvent(agent, { type: "agent_settled" });
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(store.loadTask(id, "reopen-live").status, "done");
+	assert.equal(store.loadSquad(id).status, "review");
+	assert.equal(spawns.length, 1, "one settlement must produce one completion without a duplicate run");
+});
+
+test("late settlement and exit callbacks cannot overwrite an explicit task pause", async () => {
+	const id = createSquad([{ id: "pause-live", status: "in_progress" }]);
+	const scheduler = new Scheduler(id, []);
+	const pool = scheduler.getPool();
+	const agent = {
+		taskId: "pause-live",
+		agentName: "backend",
+		process: { exitCode: null, stdin: { destroyed: false, write: () => true }, kill: () => true },
+		activity: { taskId: "pause-live", agentName: "backend", lastOutputTs: Date.now(), startedAt: Date.now(), turnCount: 1, recentToolCalls: [], modifiedFiles: new Set() },
+		session: { file: path.join(tempHome, "pause-live.jsonl") },
+		aborted: false,
+	};
+	pool.agents.set("pause-live", agent);
+	pool.steer = async () => true;
+	pool.kill = async () => { pool.agents.delete("pause-live"); };
+
+	await scheduler.pauseTask("pause-live");
+	assert.equal(store.loadTask(id, "pause-live").status, "suspended");
+	pool.handleRpcEvent(agent, { type: "agent_settled", data: { turnCount: 1, toolCallCount: 1 } });
+	scheduler.handleAgentEvent({
+		type: "agent_end", taskId: "pause-live", agentName: "backend",
+		data: { unexpectedExit: true, exitCode: 1, turnCount: 1, stderr: "paused child exit" },
+	});
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	assert.equal(store.loadTask(id, "pause-live").status, "suspended");
+	assert.equal(store.loadTask(id, "pause-live").error, null);
+});
+
 test("mail queued before scheduler restart is delivered to only that task and then acknowledged", async () => {
 	const id = createSquad([
 		{ id: "first", status: "done" },

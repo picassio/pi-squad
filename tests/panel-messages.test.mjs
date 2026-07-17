@@ -161,6 +161,118 @@ test("cancelled tasks stay visible with a neutral icon and active-task counts", 
 	}
 });
 
+test("pending and failed independent review render distinctly and invalidate widget cache", async () => {
+	const squadId = "sq-panel-review-presentation";
+	createFixture(squadId, "done");
+	const squad = store.loadSquad(squadId);
+	squad.status = "review";
+	squad.review = {
+		status: "pending",
+		requestedAt: "2026-07-16T09:01:00.000Z",
+		completedAt: null,
+		verdict: null,
+		contractChecks: [],
+		diffReview: "",
+		verificationEvidence: [],
+		integrationEvidence: "",
+		issues: [],
+	};
+	store.saveSquad(squad);
+
+	let widgetFactory;
+	const statuses = [];
+	const ctx = {
+		hasUI: true,
+		ui: {
+			theme,
+			setWidget: (_id, value) => { if (typeof value === "function") widgetFactory = value; },
+			setStatus: (_id, value) => { statuses.push(value); },
+		},
+	};
+	const controls = setupSquadWidget(ctx, { squadId, enabled: true });
+	try {
+		const component = widgetFactory({ terminal: { columns: 160 } }, theme);
+		assert.ok(component.render(160)[0].includes("◆ REVIEW PENDING · independent review required"));
+		assert.ok(statuses.at(-1).includes("REVIEW PENDING"));
+
+		const failed = store.loadSquad(squadId);
+		failed.review = {
+			...failed.review,
+			status: "failed",
+			completedAt: "2026-07-16T09:02:00.000Z",
+			verdict: "fail",
+			issues: ["Candidate still violates the contract"],
+		};
+		store.saveSquad(failed);
+		const statusCountBefore = statuses.length;
+		controls.requestUpdate();
+		await new Promise((resolve) => setTimeout(resolve, 80));
+
+		assert.ok(component.render(160)[0].includes("✗ REVIEW FAILED · awaiting same-squad rework"));
+		assert.ok(statuses.at(-1).includes("REVIEW FAILED · awaiting same-squad rework"));
+		assert.equal(statuses.length, statusCountBefore + 1, "review.status changes the render cache key");
+
+		const scheduler = { getPool: () => ({ getActivity: () => null }) };
+		const detail = new TaskListView(theme, squadId).render(160, 0, 12, scheduler);
+		assert.ok(detail.some((line) => line.includes("REVIEW FAILED · awaiting same-squad rework")));
+		assert.ok(!detail.some((line) => line.includes("REVIEW PENDING")));
+	} finally {
+		controls.dispose();
+	}
+});
+
+test("suspended attention shows exact IDs and widget clears when focus is cleared", async () => {
+	const squadId = "sq-panel-suspended-attention";
+	createFixture(squadId, "suspended");
+	const squad = store.loadSquad(squadId);
+	squad.status = "paused";
+	squad.suspendedStallAttention = {
+		kind: "suspended_stall",
+		fingerprint: "ui-task|blocked-child|blocked-grandchild",
+		suspendedTaskIds: ["ui-task"],
+		blockedTaskIds: ["blocked-child", "blocked-grandchild"],
+		detectedAt: "2026-07-16T09:03:00.000Z",
+		delivery: "delivered",
+		deliveredAt: "2026-07-16T09:03:01.000Z",
+	};
+	store.saveSquad(squad);
+
+	let widgetFactory;
+	const widgetValues = [];
+	const statusValues = [];
+	const state = { squadId, enabled: true };
+	const ctx = {
+		hasUI: true,
+		ui: {
+			theme,
+			setWidget: (_id, value) => {
+				widgetValues.push(value);
+				if (typeof value === "function") widgetFactory = value;
+			},
+			setStatus: (_id, value) => { statusValues.push(value); },
+		},
+	};
+	const controls = setupSquadWidget(ctx, state);
+	try {
+		const component = widgetFactory({ terminal: { columns: 180 } }, theme);
+		assert.ok(component.render(180).some((line) => line.includes("SUSPENDED — explicit resume required")));
+
+		const scheduler = { getPool: () => ({ getActivity: () => null }) };
+		const detail = new TaskListView(theme, squadId).render(180, 0, 16, scheduler).join("\n");
+		assert.match(detail, /Suspended task IDs: ui-task/);
+		assert.match(detail, /Blocked by suspended work: blocked-child, blocked-grandchild/);
+		assert.match(detail, /squadId: "sq-panel-suspended-attention"/);
+
+		state.squadId = null;
+		controls.requestUpdate();
+		await new Promise((resolve) => setTimeout(resolve, 80));
+		assert.equal(widgetValues.at(-1), undefined, "cleared focus removes the compact widget");
+		assert.equal(statusValues.at(-1), undefined, "cleared focus removes the status line");
+	} finally {
+		controls.dispose();
+	}
+});
+
 test("live preview and compact widget visibly prioritize a recent orchestrator message", () => {
 	const squadId = "sq-panel-orchestrator-preview";
 	createFixture(squadId);

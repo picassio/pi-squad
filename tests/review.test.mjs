@@ -124,6 +124,10 @@ test("failed independent review remains gated until fixes and re-review", () => 
 	});
 	assert.equal(value.status, "review");
 	assert.equal(value.review.status, "failed");
+	const gate = buildOrchestratorReviewGate(value, []);
+	assert.match(gate, /✗ REVIEW FAILED · awaiting same-squad rework/);
+	assert.match(gate, new RegExp(`same exact squad.*squadId: "${value.id}"`));
+	assert.match(gate, /another verdict cannot overwrite the failed evidence/);
 	assert.throws(
 		() => recordOrchestratorReview(value, evidence),
 		/already failed; begin same-squad rework/,

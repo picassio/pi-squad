@@ -14,9 +14,9 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Squad, Task, SquadConfig, PlannerOutput } from "./types.js";
+import type { Squad, Task, SquadConfig, PlannerOutput, SuspendedStallAttention } from "./types.js";
 import { DEFAULT_SQUAD_CONFIG, THINKING_LEVELS } from "./types.js";
-import { Scheduler, type SchedulerEvent, type SchedulerSpawnContext } from "./scheduler.js";
+import { Scheduler, formatSuspendedStallAttention, type SchedulerEvent, type SchedulerSpawnContext } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
 import { validatePlan, PLAN_STRUCTURE_RULES } from "./plan-rules.js";
 import { ADVISOR_SYSTEM_PROMPT, buildAdvisorConsultText, type AdvisorConsultInput } from "./advisor.js";
@@ -27,6 +27,7 @@ import * as store from "./store.js";
 import { debug, logError } from "./logger.js";
 import { buildCompletionSummary, buildFailureSummary } from "./report.js";
 import { buildOrchestratorReviewGate, recordOrchestratorReview } from "./review.js";
+import { formatSuspendedAttention, getReviewPresentation } from "./presentation.js";
 
 // ============================================================================
 // State
@@ -186,6 +187,21 @@ function getActiveScheduler(): Scheduler | null {
 	return schedulers.get(activeSquadId) || null;
 }
 
+/** Restore the single focus/widget invariant after destructive exact cancellation. */
+function repairFocusAfterCancellation(cancelledId: string): void {
+	if (activeSquadId === cancelledId || (activeSquadId !== null && !store.loadSquad(activeSquadId))) {
+		activeSquadId = null;
+	}
+	widgetState.squadId = activeSquadId;
+	widgetControls?.requestUpdate();
+}
+
+function activeSuspendedAttentionForProject(cwd: string): Array<{ squadId: string; attention: SuspendedStallAttention }> {
+	return store.listSquadsForProject(cwd)
+		.filter((squad) => Boolean(squad.suspendedStallAttention))
+		.map((squad) => ({ squadId: squad.id, attention: squad.suspendedStallAttention! }));
+}
+
 /** Reconstruct and focus one exact persisted squad without creating/linking another. */
 function ensureScheduler(pi: ExtensionAPI, squadId: string, skillPaths: string[]): Scheduler {
 	let scheduler = schedulers.get(squadId);
@@ -244,6 +260,24 @@ export default function (pi: ExtensionAPI) {
 	const skillsDir = path.join(path.dirname(new URL(import.meta.url).pathname), "skills");
 	const squadSkillPaths = getSquadSkillPaths(skillsDir);
 
+	/** Cancel one persisted exact squad without ever inferring or changing focus. */
+	const cancelExactSquad = async (squadId: string): Promise<boolean> => {
+		const squad = store.loadSquad(squadId);
+		if (!squad) return false;
+		const live = schedulers.get(squadId);
+		if (live) await live.stop();
+		else await new Scheduler(squadId, squadSkillPaths, schedulerSpawnContext).stop();
+		const fresh = store.loadSquad(squadId);
+		if (fresh) {
+			fresh.status = "failed";
+			delete fresh.suspendedStallAttention;
+			store.saveSquad(fresh);
+		}
+		schedulers.delete(squadId);
+		repairFocusAfterCancellation(squadId);
+		return true;
+	};
+
 	// =========================================================================
 	// Context Injection — give main agent awareness of squad state
 	// =========================================================================
@@ -255,9 +289,12 @@ export default function (pi: ExtensionAPI) {
 		const pendingReviewGates = store.findActiveSquads()
 			.filter((s) => s.cwd === ctx.cwd && s.status === "review")
 			.map((s) => ({ squad: s, gate: buildOrchestratorReviewGate(s, store.loadAllTasks(s.id)) }));
+		const suspendedAttention = activeSuspendedAttentionForProject(ctx.cwd)
+			.map(({ squadId, attention }) => formatSuspendedStallAttention(squadId, attention));
+		const durablePrompts = [...pendingReviewGates.map(({ gate }) => gate), ...suspendedAttention];
 		if (!squadEnabled) {
-			if (pendingReviewGates.length === 0) return;
-			return { systemPrompt: event.systemPrompt + "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") };
+			if (durablePrompts.length === 0) return;
+			return { systemPrompt: event.systemPrompt + "\n\n" + durablePrompts.join("\n\n") };
 		}
 
 		// When a squad is active, inject its status
@@ -265,15 +302,16 @@ export default function (pi: ExtensionAPI) {
 			const squad = store.loadSquad(activeSquadId);
 			if (!squad) {
 				activeSquadId = null;
-				if (pendingReviewGates.length > 0) {
-					return { systemPrompt: event.systemPrompt + "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") };
+				widgetState.squadId = null;
+				if (durablePrompts.length > 0) {
+					return { systemPrompt: event.systemPrompt + "\n\n" + durablePrompts.join("\n\n") };
 				}
 				return;
 			}
 			const tasks = store.loadAllTasks(activeSquadId);
 			if (tasks.length === 0) {
-				if (pendingReviewGates.length > 0) {
-					return { systemPrompt: event.systemPrompt + "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") };
+				if (durablePrompts.length > 0) {
+					return { systemPrompt: event.systemPrompt + "\n\n" + durablePrompts.join("\n\n") };
 				}
 				return;
 			}
@@ -281,21 +319,24 @@ export default function (pi: ExtensionAPI) {
 			const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
 			const taskLines = tasks.map((t) => {
-				const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : t.status === "cancelled" ? "⊘" : "·";
+				const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : t.status === "suspended" ? "⏸" : t.status === "cancelled" ? "⊘" : "·";
 				let line = `  ${icon} ${t.id} (${t.agent}) [${t.status}]`;
 				if (t.output) line += ` — ${t.output}`;
 				if (t.error) line += ` ERROR: ${t.error}`;
 				return line;
 			}).join("\n");
 
+			const reviewPresentation = getReviewPresentation(squad);
 			const squadContext = [
 				`<squad_status>`,
 				`Squad: ${squad.id} — ${squad.goal}`,
 				`Status: ${squad.status} | ${formatTaskProgress(tasks)} | $${totalCost.toFixed(2)}`,
+				...(reviewPresentation ? [`Acceptance: ${reviewPresentation.label}`] : []),
 				taskLines,
 				`</squad_status>`,
 				...(squad.status === "review" ? [buildOrchestratorReviewGate(squad, tasks)] : []),
 				...pendingReviewGates.filter(({ squad: pending }) => pending.id !== squad.id).map(({ gate }) => gate),
+				...suspendedAttention,
 				`You have an active squad. Use squad_message to talk to agents, squad_status for details, squad_modify to change tasks.`,
 				`Do NOT poll squad_status in a loop or sleep-wait — the squad wakes you automatically on completion, failure, or escalation. Keep helping the user with other work, or end your turn and stay idle.`,
 			].join("\n");
@@ -323,7 +364,7 @@ export default function (pi: ExtensionAPI) {
 
 		return {
 			systemPrompt: event.systemPrompt + "\n\n" + squadNudge +
-				(pendingReviewGates.length > 0 ? "\n\n" + pendingReviewGates.map(({ gate }) => gate).join("\n\n") : ""),
+				(durablePrompts.length > 0 ? "\n\n" + durablePrompts.join("\n\n") : ""),
 		};
 	});
 
@@ -452,6 +493,7 @@ export default function (pi: ExtensionAPI) {
 						task.status === "in_progress" ? "⏳" :
 						task.status === "blocked" ? "◻" :
 						task.status === "failed" ? "✗" :
+						task.status === "suspended" ? "⏸" :
 						task.status === "cancelled" ? "⊘" :
 						"·";
 					let line = `${icon} ${taskId} (${task.agent}) — ${task.title} [${task.status}]`;
@@ -461,13 +503,16 @@ export default function (pi: ExtensionAPI) {
 				.join("\n");
 
 			const durableTasks = store.loadAllTasks(id!);
+			const squad = store.loadSquad(id!);
+			const review = squad ? getReviewPresentation(squad) : null;
 			const summary = [
 				`Squad: ${id}`,
 				`Status: ${context.status}`,
 				`Progress: ${formatTaskProgress(durableTasks)}`,
 				`Elapsed: ${context.elapsed}`,
 				`Cost: $${context.costs.total.toFixed(4)}`,
-				...(context.status === "review" ? ["Acceptance: BLOCKED — independent main-orchestrator review required via squad_review"] : []),
+				...(review ? [`Acceptance: ${review.label}`] : []),
+				...(squad ? formatSuspendedAttention(squad) : []),
 				"",
 				"Tasks:",
 				taskLines,
@@ -604,9 +649,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_modify",
 		label: "Squad Modify",
-		description: "Modify one exact squad: add_task, set_dependencies (top-level depends), cancel_task, complete_task (mark done + schedule dependents), pause, resume_task, resume (including failed-review rework), cancel. Task actions reconstruct the persisted scheduler after restart when needed.",
+		description: "Modify a squad. The destructive cancel action requires an exact squadId and never infers focus; task actions reconstruct the persisted scheduler after restart when needed.",
 		parameters: Type.Object({
-			squadId: Type.Optional(Type.String({ description: "Exact squad to modify (recommended for failed-review rework; default: focused/recoverable project squad)" })),
+			squadId: Type.Optional(Type.String({ description: "Exact squad to modify; required for cancel (other actions may use the focused/recoverable project squad)" })),
 			action: Type.Union(
 				[
 					Type.Literal("add_task"),
@@ -637,6 +682,22 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (params.action === "cancel") {
+				if (!params.squadId?.trim()) {
+					return { content: [{ type: "text" as const, text: "cancel requires exact squadId; no squad was changed." }], details: undefined };
+				}
+				const squadId = params.squadId.trim();
+				if (!store.loadSquad(squadId)) {
+					return { content: [{ type: "text" as const, text: `Squad '${squadId}' not found; no squad was changed.` }], details: undefined };
+				}
+				try {
+					await cancelExactSquad(squadId);
+				} catch (error) {
+					return { content: [{ type: "text" as const, text: `Cancel failed for squad '${squadId}': ${(error as Error).message}` }], details: undefined };
+				}
+				return { content: [{ type: "text" as const, text: `Squad '${squadId}' cancelled.` }], details: undefined };
+			}
+
 			if (params.action === "resume") {
 				const squad = resolveResumeSquad(ctx.cwd, params.squadId);
 				if (!squad) {
@@ -742,9 +803,12 @@ export default function (pi: ExtensionAPI) {
 				case "resume_task": {
 					if (!params.taskId) return { content: [{ type: "text" as const, text: "Provide taskId." }], details: undefined };
 					try {
-						await activeScheduler.resumeTask(params.taskId);
+						const result = await activeScheduler.resumeTask(params.taskId);
+						if (result === "already_running") {
+							return { content: [{ type: "text" as const, text: `Task '${params.taskId}' is already running in squad '${squadId}'; no duplicate resume was started.` }], details: undefined };
+						}
 					} catch (err) {
-						return { content: [{ type: "text" as const, text: `resume_task failed: ${(err as Error).message}` }], details: undefined };
+						return { content: [{ type: "text" as const, text: `resume_task failed for task '${params.taskId}' in squad '${squadId}': ${(err as Error).message}` }], details: undefined };
 					}
 					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' resumed in squad '${squadId}'.` }], details: undefined };
 				}
@@ -769,19 +833,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text" as const, text: "Squad paused. Use squad_modify with action 'resume' to continue." }], details: undefined };
 				}
 
-				// Note: "resume" is handled above, before the activeScheduler guard.
-
-				case "cancel": {
-					await activeScheduler.stop();
-					const squad = store.loadSquad(activeSquadId);
-					if (squad) {
-						squad.status = "failed";
-						store.saveSquad(squad);
-					}
-					schedulers.delete(activeSquadId);
-					activeSquadId = null;
-					return { content: [{ type: "text" as const, text: "Squad cancelled." }], details: undefined };
-				}
+				// Note: "resume" and exact-ID "cancel" are handled above.
 
 				default:
 					return { content: [{ type: "text" as const, text: `Unknown action: ${params.action}` }], details: undefined };
@@ -820,6 +872,21 @@ export default function (pi: ExtensionAPI) {
 				squad.status = "paused";
 				store.saveSquad(squad);
 			}
+		}
+
+		// Reconstruct schedulers for explicit-suspension stalls without resuming any
+		// task. Reconcile derives/persists a missing outbox record and emits only a
+		// pending fingerprint; delivered attention remains durable and silent.
+		const suspensionCandidates = store.listSquadsForProject(ctx.cwd)
+			.filter((squad) => Boolean(squad.suspendedStallAttention) || store.loadAllTasks(squad.id).some((task) => task.status === "suspended"));
+		for (const squad of suspensionCandidates) {
+			let scheduler = schedulers.get(squad.id);
+			if (!scheduler) {
+				scheduler = new Scheduler(squad.id, squadSkillPaths, schedulerSpawnContext);
+				schedulers.set(squad.id, scheduler);
+				wireSchedulerEvents(pi, scheduler, squad.id);
+			}
+			await scheduler.start();
 		}
 
 		// Mailbox recovery is automatic after extension/main-process restart. Scan
@@ -1130,17 +1197,13 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "cancel": {
-					const cancelSched = getActiveScheduler();
-					if (!cancelSched) {
-						ctx.ui.notify("No running squad to cancel", "info");
+					const cancelledId = activeSquadId;
+					if (!cancelledId) {
+						ctx.ui.notify("No focused squad to cancel", "info");
 						return;
 					}
-					await cancelSched.stop();
-					const squad = store.loadSquad(activeSquadId!);
-					if (squad) { squad.status = "failed"; store.saveSquad(squad); }
-					if (activeSquadId) schedulers.delete(activeSquadId);
-					forceWidgetUpdate();
-					ctx.ui.notify("Squad cancelled", "info");
+					await cancelExactSquad(cancelledId);
+					ctx.ui.notify(`Squad '${cancelledId}' cancelled`, "info");
 					return;
 				}
 
@@ -1501,9 +1564,11 @@ async function pickSquad(
 	const options = squads.map((s) => {
 		const tasks = store.loadAllTasks(s.id);
 		const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-		const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "review" ? "◆" : s.status === "failed" ? "✗" : "·";
+		const review = getReviewPresentation(s);
+		const icon = review?.icon ?? (s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "failed" ? "✗" : "·");
+		const acceptance = review ? ` ${review.label}` : ` [${s.status}]`;
 		const project = showProject ? ` — ${s.cwd.split("/").pop()}` : "";
-		return `${icon} ${s.id} [${s.status}] ${formatTaskProgress(tasks)} $${cost.toFixed(2)}${project}`;
+		return `${icon} ${s.id}${acceptance} · ${formatTaskProgress(tasks)} $${cost.toFixed(2)}${project}`;
 	});
 
 	const choice = await ctx.ui.select("Select a squad", options);
@@ -1571,6 +1636,20 @@ function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squadId: st
 				}, { triggerTurn: true, deliverAs: "followUp" });
 				// Keep the settled scheduler addressable. A later exact-task message
 				// can reopen the task immediately on its bound durable Pi session.
+				break;
+			}
+			case "suspended_stall": {
+				try {
+					const attention = event.data as SuspendedStallAttention;
+					pi.sendMessage({
+						customType: `squad-suspended-stall:${squadId}:${attention.fingerprint}`,
+						content: formatSuspendedStallAttention(squadId, attention),
+						display: true,
+					}, { triggerTurn: true, deliverAs: "followUp" });
+					scheduler.acknowledgeSuspendedStall(attention.fingerprint);
+				} catch (error) {
+					logError("squad-scheduler", `suspended-stall delivery failed for ${squadId}: ${(error as Error).message}`);
+				}
 				break;
 			}
 			case "squad_failed": {

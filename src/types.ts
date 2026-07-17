@@ -85,6 +85,17 @@ export interface SquadReview {
 	issues: string[];
 }
 
+export interface SuspendedStallAttention {
+	kind: "suspended_stall";
+	/** Canonical identity of the exact suspended/blocked task sets. */
+	fingerprint: string;
+	suspendedTaskIds: string[];
+	blockedTaskIds: string[];
+	detectedAt: string;
+	delivery: "pending" | "delivered";
+	deliveredAt: string | null;
+}
+
 export interface SquadConfig {
 	maxConcurrency: number;
 	autoUnblock: boolean;
@@ -116,6 +127,8 @@ export interface Squad {
 	review?: SquadReview;
 	/** Completed prior review attempts retained as same-squad audit evidence. */
 	reviewHistory?: SquadReview[];
+	/** Durable, level-triggered attention for an explicit-suspension stall. */
+	suspendedStallAttention?: SuspendedStallAttention;
 }
 
 // ============================================================================

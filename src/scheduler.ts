@@ -11,7 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { AgentDef, Squad, SquadConfig, Task, TaskMailboxEntry, TaskMessage, TaskStatus } from "./types.js";
+import type { AgentDef, Squad, SquadConfig, SuspendedStallAttention, Task, TaskMailboxEntry, TaskMessage, TaskStatus } from "./types.js";
 import { AgentPool, type AgentEvent } from "./agent-pool.js";
 import { Monitor } from "./monitor.js";
 import { Router } from "./router.js";
@@ -34,6 +34,7 @@ export type SchedulerEventType =
 	| "task_rework"
 	| "squad_review_required"
 	| "squad_failed"
+	| "suspended_stall"
 	| "orchestrator_reply"
 	| "escalation"
 	| "activity";
@@ -48,6 +49,61 @@ export interface SchedulerEvent {
 }
 
 export type SchedulerEventListener = (event: SchedulerEvent) => void;
+
+export interface SuspendedStallState {
+	fingerprint: string;
+	suspendedTaskIds: string[];
+	blockedTaskIds: string[];
+}
+
+/** Pure derivation of an explicit-suspension stall from one persisted DAG. */
+export function deriveSuspendedStall(tasks: Task[]): SuspendedStallState | null {
+	const relevant = tasks.filter((task) => task.status !== "cancelled");
+	const byId = new Map(relevant.map((task) => [task.id, task]));
+	const suspendedTaskIds = relevant
+		.filter((task) => task.status === "suspended")
+		.map((task) => task.id)
+		.sort((left, right) => left.localeCompare(right));
+	if (suspendedTaskIds.length === 0) return null;
+	const suspended = new Set(suspendedTaskIds);
+
+	const reachesSuspended = (taskId: string, seen = new Set<string>()): boolean => {
+		if (suspended.has(taskId)) return true;
+		if (seen.has(taskId)) return false;
+		seen.add(taskId);
+		const task = byId.get(taskId);
+		if (!task) return false;
+		return task.depends.some((dependencyId) => reachesSuspended(dependencyId, seen));
+	};
+	const suspensionBlocked = (task: Task): boolean => task.status === "blocked" && task.depends.some((dependencyId) => {
+		const dependency = byId.get(dependencyId);
+		return dependency?.status !== "done" && reachesSuspended(dependencyId);
+	});
+	const runnableOrLive = relevant.some((task) => task.status === "in_progress" || (
+		task.status === "pending" && task.depends.every((dependencyId) => byId.get(dependencyId)?.status === "done")
+	));
+	if (runnableOrLive) return null;
+
+	const blockedTaskIds = relevant.filter(suspensionBlocked).map((task) => task.id).sort((left, right) => left.localeCompare(right));
+	const blocked = new Set(blockedTaskIds);
+	const terminal = new Set<TaskStatus>(["done", "failed", "cancelled"]);
+	if (!relevant.every((task) => suspended.has(task.id) || terminal.has(task.status) || blocked.has(task.id))) return null;
+
+	return {
+		fingerprint: JSON.stringify([suspendedTaskIds, blockedTaskIds]),
+		suspendedTaskIds,
+		blockedTaskIds,
+	};
+}
+
+/** Complete, actionable wake text; semantic task IDs are never abbreviated. */
+export function formatSuspendedStallAttention(squadId: string, attention: Pick<SuspendedStallAttention, "suspendedTaskIds" | "blockedTaskIds">): string {
+	return `[squad] SUSPENDED WORK NEEDS ACTION in '${squadId}'.\n` +
+		`Suspended task IDs: ${attention.suspendedTaskIds.join(", ")}\n` +
+		`Blocked by suspended work: ${attention.blockedTaskIds.length > 0 ? attention.blockedTaskIds.join(", ") : "none"}\n` +
+		"No task was resumed automatically.\n" +
+		`Resume intentionally with squad_modify { action: "resume_task", squadId: "${squadId}", taskId: "<exact-task-id>" } for each task you choose.`;
+}
 
 /** Host-session capabilities passed in by the extension (index.ts) */
 export interface SchedulerSpawnContext {
@@ -76,6 +132,8 @@ export class Scheduler {
 	private spawnRetries = new Set<string>();
 	/** Periodic level-triggered reconcile (heals missed events / out-of-band store edits) */
 	private reconcileTimer: ReturnType<typeof setInterval> | null = null;
+	/** Suppress duplicate edge emission within one scheduler; disk remains the outbox. */
+	private attentionEmittedFingerprint: string | null = null;
 
 	/** Get the project cwd for this squad (from squad.json) */
 	getProjectCwd(): string | undefined {
@@ -258,7 +316,7 @@ export class Scheduler {
 		// mutation/RPC delivery, reopen exactly that task on reconstruction.
 		let recoveredMailbox = false;
 		for (const task of tasks) {
-			if (task.status === "cancelled") continue;
+			if (task.status === "cancelled" || task.status === "suspended") continue;
 			if (this.pool.isRunning(task.id)) continue;
 			if (store.loadPendingTaskMessages(this.squadId, task.id).length === 0) continue;
 			if (task.status === "done") await this.invalidateDescendants(task.id);
@@ -309,6 +367,7 @@ export class Scheduler {
 		}
 
 		await this.scheduleReadyTasks();
+		this.reconcileSuspendedStallAttention();
 
 		const freshSquad = store.loadSquad(this.squadId);
 		if (freshSquad && (freshSquad.status === "running" || freshSquad.status === "failed")) {
@@ -664,7 +723,8 @@ export class Scheduler {
 	}
 
 	private handleUnexpectedAgentExit(event: AgentEvent): void {
-		if (store.loadTask(this.squadId, event.taskId)?.status === "cancelled") return;
+		const status = store.loadTask(this.squadId, event.taskId)?.status;
+		if (status === "cancelled" || status === "suspended") return;
 		const exitCode = event.data?.exitCode ?? 1;
 		const turnCount = event.data?.turnCount ?? 0;
 		const stderr = event.data?.stderr || "";
@@ -794,7 +854,8 @@ export class Scheduler {
 			}
 
 			case "agent_settled": {
-				if (store.loadTask(this.squadId, event.taskId)?.status === "cancelled") return;
+				const status = store.loadTask(this.squadId, event.taskId)?.status;
+				if (status === "cancelled" || status === "suspended") return;
 				// A mailbox entry not acknowledged by Pi outranks this run's candidate
 				// completion. Reopen the same session so accepted-at-least-once delivery
 				// occurs before the task can become done.
@@ -846,8 +907,9 @@ export class Scheduler {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) return;
 
-		// Guard against double-completion and late callbacks after cancellation.
-		if (task.status === "done" || task.status === "cancelled") return;
+		// Guard against double-completion and late callbacks after cancellation or
+		// an explicit pause. Only exact resume_task may revive suspended work.
+		if (task.status === "done" || task.status === "cancelled" || task.status === "suspended") return;
 
 		// Extract output from last messages
 		const messages = store.loadMessages(this.squadId, taskId);
@@ -905,6 +967,11 @@ export class Scheduler {
 		debug("squad-scheduler", `handleTaskCompleted: scheduling next ready tasks`);
 		await this.scheduleReadyTasks();
 
+		// A completion can remove the last independent runnable task and expose a
+		// stall behind an explicitly suspended task. Derive/wake immediately rather
+		// than waiting for the periodic reconciliation timer.
+		this.reconcileSuspendedStallAttention();
+
 		// Re-check squad completion with fresh data AFTER scheduling
 		const freshTasks = store.loadAllTasks(this.squadId);
 		const freshSquad = store.loadSquad(this.squadId);
@@ -937,6 +1004,9 @@ export class Scheduler {
 
 		this.pool.kill(taskId);
 		this.updateContext();
+
+		// Failure can likewise expose a suspended-only cut in the remaining DAG.
+		this.reconcileSuspendedStallAttention();
 
 		// Check if squad should be marked failed
 		const tasks = store.loadAllTasks(this.squadId);
@@ -1409,6 +1479,7 @@ export class Scheduler {
 			setTimeout(() => this.pool.kill(taskId), 3000);
 		}
 		store.updateTaskStatus(this.squadId, taskId, "suspended");
+		this.reconcileSuspendedStallAttention();
 		this.updateContext();
 	}
 
@@ -1503,9 +1574,12 @@ export class Scheduler {
 
 	/** Resume one exact task. Reopening completed work invalidates descendants and
 	 * archives a completed active review before fresh scheduling begins. */
-	async resumeTask(taskId: string): Promise<void> {
+	async resumeTask(taskId: string): Promise<"resumed" | "already_running"> {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) throw new Error(`Task not found: ${taskId}`);
+		const live = this.pool.isRunning(taskId);
+		if (task.status === "in_progress" && live) return "already_running";
+		if (live) throw new Error(`Task '${taskId}' has a live child but durable status '${task.status}'; no duplicate resume was started.`);
 		if (task.status === "done") await this.invalidateDescendants(taskId);
 		const tasks = store.loadAllTasks(this.squadId);
 		const dependenciesDone = task.depends.every(
@@ -1518,6 +1592,18 @@ export class Scheduler {
 		this.reopenSquadForWork();
 		await this.start();
 		this.updateContext();
+		return "resumed";
+	}
+
+	/** Mark an exact pending outbox fingerprint delivered after host acceptance. */
+	acknowledgeSuspendedStall(fingerprint: string): boolean {
+		const squad = store.loadSquad(this.squadId);
+		const attention = squad?.suspendedStallAttention;
+		if (!squad || !attention || attention.fingerprint !== fingerprint || attention.delivery !== "pending") return false;
+		attention.delivery = "delivered";
+		attention.deliveredAt = store.now();
+		store.saveSquad(squad);
+		return true;
 	}
 
 	/**
@@ -1601,6 +1687,7 @@ export class Scheduler {
 				beginOrchestratorRework(squad);
 				store.saveSquad(squad);
 			}
+			this.reconcileSuspendedStallAttention();
 			this.checkSquadCompletion(store.loadAllTasks(this.squadId), squad);
 		}
 		this.updateContext();
@@ -1609,6 +1696,38 @@ export class Scheduler {
 	// =========================================================================
 	// Helpers
 	// =========================================================================
+
+	private reconcileSuspendedStallAttention(): void {
+		const squad = store.loadSquad(this.squadId);
+		if (!squad) return;
+		const derived = deriveSuspendedStall(store.loadAllTasks(this.squadId));
+		if (!derived) {
+			if (squad.suspendedStallAttention) {
+				delete squad.suspendedStallAttention;
+				store.saveSquad(squad);
+			}
+			this.attentionEmittedFingerprint = null;
+			return;
+		}
+
+		let attention = squad.suspendedStallAttention;
+		if (!attention || attention.fingerprint !== derived.fingerprint) {
+			attention = {
+				kind: "suspended_stall",
+				...derived,
+				detectedAt: store.now(),
+				delivery: "pending",
+				deliveredAt: null,
+			};
+			squad.suspendedStallAttention = attention;
+			store.saveSquad(squad);
+			this.attentionEmittedFingerprint = null;
+		}
+		if (attention.delivery === "pending" && this.attentionEmittedFingerprint !== attention.fingerprint) {
+			this.attentionEmittedFingerprint = attention.fingerprint;
+			this.emit({ type: "suspended_stall", squadId: this.squadId, data: attention });
+		}
+	}
 
 	private extractAssistantText(msg: any): string | null {
 		if (!msg.content) return null;

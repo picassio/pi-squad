@@ -25,7 +25,7 @@ process.env.HOME = tempHome;
 process.env.USERPROFILE = tempHome;
 
 const store = await import("../src/store.ts");
-const { Scheduler } = await import("../src/scheduler.ts");
+const { Scheduler, deriveSuspendedStall } = await import("../src/scheduler.ts");
 const { recordOrchestratorReview } = await import("../src/review.ts");
 
 let squadCounter = 0;
@@ -209,6 +209,156 @@ test("completeTask() routes recovery through the completion flow (unblock + sche
 	assert.deepEqual(spawned, ["crosscut"], "blocked dependent unblocked and scheduled");
 	assert.equal(store.loadSquad(id).status, "running", "squad healed from failed");
 	await scheduler.stop();
+});
+
+test("suspended-stall derivation covers suspended-only and transitive blocking without mislabeling unrelated work", () => {
+	const base = (id, status, depends = []) => ({ id, title: id, description: "", agent: "backend", status, depends });
+	assert.deepEqual(deriveSuspendedStall([base("only-suspended", "suspended")])?.suspendedTaskIds, ["only-suspended"]);
+	const transitive = deriveSuspendedStall([
+		base("root-z", "suspended"),
+		base("child-b", "blocked", ["root-z"]),
+		base("grandchild-a", "blocked", ["child-b"]),
+		base("history", "cancelled"),
+	]);
+	assert.deepEqual(transitive?.suspendedTaskIds, ["root-z"]);
+	assert.deepEqual(transitive?.blockedTaskIds, ["child-b", "grandchild-a"]);
+
+	assert.equal(deriveSuspendedStall([
+		base("root", "suspended"),
+		base("independent", "pending"),
+	]), null, "independent runnable work suppresses attention");
+	assert.equal(deriveSuspendedStall([
+		base("root", "suspended"),
+		base("unrelated-failure", "blocked", ["missing"]),
+	]), null, "an unrelated irreducible blocked component is not suspension-blocked");
+});
+
+test("restart mailbox recovery preserves explicit suspension and queued mail", async () => {
+	const { id, scheduler, spawned } = makeSquad({
+		squadStatus: "paused",
+		tasks: [{ id: "suspended-with-mail", status: "suspended" }],
+	});
+	store.queueTaskMessage(id, "suspended-with-mail", {
+		ts: store.now(),
+		from: "human",
+		type: "message",
+		text: "queued while explicitly suspended",
+	});
+
+	await scheduler.start();
+
+	assert.equal(store.loadTask(id, "suspended-with-mail").status, "suspended");
+	assert.equal(store.loadSquad(id).status, "paused");
+	assert.deepEqual(spawned, [], "mailbox recovery must not auto-resume suspended work");
+	assert.equal(store.loadPendingTaskMessages(id, "suspended-with-mail").length, 1, "queued mail remains durable");
+	assert.equal(store.loadSquad(id).suspendedStallAttention?.delivery, "pending");
+	await scheduler.stop();
+});
+
+test("pauseTask durably emits suspended-stall attention before returning", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "live-to-suspended", status: "pending" }],
+	});
+	const events = [];
+	scheduler.onEvent((event) => {
+		if (event.type === "suspended_stall") events.push(event);
+	});
+	await scheduler.start();
+	assert.equal(store.loadTask(id, "live-to-suspended").status, "in_progress");
+
+	await scheduler.pauseTask("live-to-suspended");
+
+	const attention = store.loadSquad(id).suspendedStallAttention;
+	assert.equal(store.loadTask(id, "live-to-suspended").status, "suspended");
+	assert.equal(attention?.delivery, "pending", "outbox must be durable when pauseTask resolves");
+	assert.deepEqual(attention?.suspendedTaskIds, ["live-to-suspended"]);
+	assert.equal(events.length, 1, "live transition emits one wake");
+	await scheduler.reconcile();
+	assert.equal(events.length, 1, "level-triggered reconciliation dedupes the same pending fingerprint");
+	await scheduler.stop();
+});
+
+test("completion of the last independent task immediately wakes a suspended stall", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [
+			{ id: "paused-root", status: "suspended" },
+			{ id: "independent-live", status: "in_progress" },
+			{ id: "blocked-child", status: "blocked", depends: ["paused-root"] },
+		],
+	});
+	const events = [];
+	scheduler.onEvent((event) => { if (event.type === "suspended_stall") events.push(event); });
+	assert.equal(store.loadSquad(id).suspendedStallAttention, undefined, "independent live work suppresses early attention");
+
+	await scheduler.handleTaskCompleted("independent-live");
+
+	const attention = store.loadSquad(id).suspendedStallAttention;
+	assert.equal(store.loadTask(id, "independent-live").status, "done");
+	assert.equal(attention?.delivery, "pending", "completion transition persists attention immediately");
+	assert.deepEqual(attention?.suspendedTaskIds, ["paused-root"]);
+	assert.deepEqual(attention?.blockedTaskIds, ["blocked-child"]);
+	assert.equal(events.length, 1, "orchestrator wake must not wait for the periodic reconcile timer");
+});
+
+test("suspended-stall outbox persists before emit, dedupes reconcile, survives restart, and clears on resume", async () => {
+	const { id, scheduler, spawned } = makeSquad({
+		squadStatus: "paused",
+		tasks: [
+			{ id: "suspended-root", status: "suspended" },
+			{ id: "blocked-child", status: "blocked", depends: ["suspended-root"] },
+		],
+	});
+	const events = [];
+	scheduler.onEvent((event) => {
+		if (event.type !== "suspended_stall") return;
+		const persisted = store.loadSquad(id).suspendedStallAttention;
+		assert.equal(persisted?.delivery, "pending", "outbox must exist before the edge event");
+		events.push(event);
+		scheduler.acknowledgeSuspendedStall(persisted.fingerprint);
+	});
+	await scheduler.start();
+	await scheduler.reconcile();
+	assert.equal(events.length, 1);
+	const delivered = store.loadSquad(id).suspendedStallAttention;
+	assert.equal(delivered.delivery, "delivered");
+	const detectedAt = delivered.detectedAt;
+	await scheduler.stop();
+
+	// Simulate a crash before host acknowledgement: the persisted pending outbox
+	// must deliver once when a new scheduler reconstructs it.
+	const pendingSquad = store.loadSquad(id);
+	pendingSquad.suspendedStallAttention.delivery = "pending";
+	pendingSquad.suspendedStallAttention.deliveredAt = null;
+	store.saveSquad(pendingSquad);
+	const restarted = new Scheduler(id, []);
+	restarted.monitor.start = () => {};
+	restarted.spawnAgentForTask = scheduler.spawnAgentForTask;
+	let restartEvents = 0;
+	restarted.onEvent((event) => {
+		if (event.type !== "suspended_stall") return;
+		restartEvents++;
+		restarted.acknowledgeSuspendedStall(event.data.fingerprint);
+	});
+	await restarted.start();
+	await restarted.reconcile();
+	assert.equal(restartEvents, 1, "pending fingerprint is emitted once after reconstruction");
+	assert.equal(store.loadSquad(id).suspendedStallAttention.detectedAt, detectedAt);
+	await restarted.stop();
+
+	const deliveredRestart = new Scheduler(id, []);
+	deliveredRestart.monitor.start = () => {};
+	deliveredRestart.spawnAgentForTask = scheduler.spawnAgentForTask;
+	let deliveredRestartEvents = 0;
+	deliveredRestart.onEvent((event) => { if (event.type === "suspended_stall") deliveredRestartEvents++; });
+	await deliveredRestart.start();
+	assert.equal(deliveredRestartEvents, 0, "delivered fingerprint is silent after reconstruction");
+	await deliveredRestart.resumeTask("suspended-root");
+	assert.deepEqual(spawned, ["suspended-root"]);
+	assert.equal(store.loadTask(id, "blocked-child").status, "blocked");
+	assert.equal(store.loadSquad(id).suspendedStallAttention, undefined, "progress clears active attention");
+	await deliveredRestart.stop();
 });
 
 test("reconcile() leaves genuinely stalled squads failed (no runnable work)", async () => {

@@ -92,6 +92,13 @@ export function recordOrchestratorReview(squad: Squad, input: OrchestratorReview
 
 /** Persistent system-prompt contract shown until squad_review accepts the work. */
 export function buildOrchestratorReviewGate(squad: Squad, tasks: Task[]): string {
+	const failed = squad.review?.status === "failed";
+	const reviewLabel = failed
+		? "✗ REVIEW FAILED · awaiting same-squad rework"
+		: "◆ REVIEW PENDING · independent review required";
+	const reviewAction = failed
+		? `This candidate was rejected. Do not submit another verdict yet. Start concrete rework in this same exact squad with squad_modify and squadId: "${squad.id}"; the failed evidence remains immutable history. After rework settles, a fresh REVIEW PENDING gate will require a new independent review.`
+		: `This candidate is awaiting its first verdict. Complete the checks below, then call squad_review for squadId: "${squad.id}".`;
 	const delegatedPlan = tasks
 		.map((task) => `- ${task.id} (${task.agent}): ${task.title}\n  ${task.description || "(no description)"}`)
 		.join("\n");
@@ -101,6 +108,8 @@ UNTRUSTED CANDIDATE WORK — INDEPENDENT ORCHESTRATOR REVIEW IS MANDATORY.
 
 Authoritative contract: re-read the user's ORIGINAL request and all later clarifications in this main-session conversation. The squad report and delegated task descriptions are claims, not proof and not substitutes for that contract.
 Recorded squad goal (secondary reference): ${squad.goal}
+Acceptance: ${reviewLabel}
+${reviewAction}
 
 Delegated plan (non-authoritative):
 ${delegatedPlan}
@@ -111,9 +120,9 @@ Before reporting success, completion, or acceptance to the user, YOU (the main P
 3. Independently run the original Verify commands and appropriate build/tests. Do not rely on pasted squad output.
 4. Run integration/E2E in the real target or production-like environment when the request affects runtime behavior. If genuinely not applicable or impossible, record the precise reason and mark it unverified.
 5. Fix discovered defects and repeat checks. Squad QA PASS does not override your findings.
-6. Call squad_review with contract checks, diff review, actual command/result evidence, integration/E2E evidence, and remaining issues.
+6. When the active gate is REVIEW PENDING, call squad_review with contract checks, diff review, actual command/result evidence, integration/E2E evidence, and remaining issues. When it is REVIEW FAILED, route same-squad rework first; another verdict cannot overwrite the failed evidence.
 
-Do not ask the user whether you should verify. Do not merely summarize the squad report. Until squad_review records PASS/PASS_WITH_ISSUES, the work is not accepted.
+Do not ask the user whether you should verify. Do not merely summarize the squad report. Until fresh rework is independently reviewed and squad_review records PASS/PASS_WITH_ISSUES, the work is not accepted.
 </squad_review_required>`;
 }
 

@@ -737,3 +737,108 @@ test("real Pi RPC resume_task revives a cancelled task on its exact session and 
 
 	await emit(api, "session_shutdown");
 });
+
+test("destructive cancel requires an exact squad and never retargets the focused live squad", async () => {
+	const squadA = "sq-exact-cancel-a";
+	const squadB = "sq-exact-cancel-b";
+	const squadC = "sq-exact-cancel-no-scheduler";
+	for (const [id, created] of [
+		[squadA, "2026-07-18T01:00:00.000Z"],
+		[squadB, "2026-07-18T01:01:00.000Z"],
+		[squadC, "2026-07-18T01:02:00.000Z"],
+	]) {
+		const suspended = id !== squadC;
+		store.saveSquad({
+			id, goal: id, status: suspended ? "paused" : "running", created, cwd: tempHome,
+			agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+		});
+		store.createTask(id, {
+			id: `${id}-task`, title: id, description: id, agent: "backend", status: suspended ? "suspended" : "pending", depends: [],
+			created, started: null, completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+		});
+	}
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome };
+	await emit(api, "session_start", {}, ctx);
+	const modify = api.tools.get("squad_modify");
+	await modify.execute("start-b", { action: "resume_task", squadId: squadB, taskId: `${squadB}-task` }, undefined, undefined, ctx);
+	await waitFor(() => store.loadTask(squadB, `${squadB}-task`).status === "in_progress", "B should also have a live scheduler");
+	const rpcBefore = readRpcLog().length;
+	await modify.execute("focus-a", { action: "resume_task", squadId: squadA, taskId: `${squadA}-task` }, undefined, undefined, ctx);
+	await waitFor(() => store.loadTask(squadA, `${squadA}-task`).status === "in_progress", "A should be live and focused");
+	const redundant = await modify.execute("redundant-resume-a", { action: "resume_task", squadId: squadA, taskId: `${squadA}-task` }, undefined, undefined, ctx);
+	assert.match(redundant.content[0].text, new RegExp(`already running in squad '${squadA}'.*no duplicate`));
+	assert.equal(readRpcLog().slice(rpcBefore).filter((record) => record.kind === "argv").length, 1, "redundant exact resume must not spawn another child");
+
+	const omitted = await modify.execute("cancel-omitted", { action: "cancel" }, undefined, undefined, ctx);
+	assert.match(omitted.content[0].text, /requires exact squadId/);
+	assert.equal(store.loadSquad(squadA).status, "running");
+	assert.equal(store.loadSquad(squadB).status, "running");
+	assert.equal(store.loadSquad(squadC).status, "running");
+	const cancelB = await modify.execute("cancel-b", { action: "cancel", squadId: squadB }, undefined, undefined, ctx);
+	assert.equal(cancelB.content[0].text, `Squad '${squadB}' cancelled.`);
+	assert.equal(store.loadSquad(squadB).status, "failed");
+	assert.equal(store.loadTask(squadB, `${squadB}-task`).status, "suspended", "only B's live child is stopped");
+	assert.equal(store.loadSquad(squadA).status, "running");
+	assert.equal(store.loadTask(squadA, `${squadA}-task`).status, "in_progress", "cancelling B must not stop A");
+	const cancelC = await modify.execute("cancel-c", { action: "cancel", squadId: squadC }, undefined, undefined, ctx);
+	assert.equal(cancelC.content[0].text, `Squad '${squadC}' cancelled.`);
+	assert.equal(store.loadSquad(squadC).status, "failed", "persisted squad without a scheduler is cancelled exactly");
+	assert.equal(store.loadTask(squadA, `${squadA}-task`).status, "in_progress");
+	const unknown = await modify.execute("cancel-unknown", { action: "cancel", squadId: "missing-exact-squad" }, undefined, undefined, ctx);
+	assert.equal(unknown.content[0].text, "Squad 'missing-exact-squad' not found; no squad was changed.");
+	assert.equal(store.loadSquad(squadA).status, "running");
+	const cancelA = await modify.execute("cancel-a", { action: "cancel", squadId: squadA }, undefined, undefined, ctx);
+	assert.equal(cancelA.content[0].text, `Squad '${squadA}' cancelled.`);
+	assert.equal(store.loadSquad(squadA).status, "failed");
+	assert.equal(store.loadTask(squadA, `${squadA}-task`).status, "suspended");
+	assert.equal(store.loadSquad(squadB).status, "failed");
+	await emit(api, "session_shutdown");
+});
+
+test("restart delivers one durable suspended-stall wake and exact resume clears it without auto-resuming descendants", async () => {
+	const squadId = "sq-extension-suspended-stall";
+	store.saveSquad({
+		id: squadId, goal: "wake suspended work", status: "paused", created: "2026-07-18T02:00:00.000Z", cwd: tempHome,
+		agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	for (const task of [
+		{ id: "suspended-root-exact", status: "suspended", depends: [] },
+		{ id: "blocked-child-exact", status: "blocked", depends: ["suspended-root-exact"] },
+		{ id: "blocked-grandchild-exact", status: "blocked", depends: ["blocked-child-exact"] },
+	]) {
+		store.createTask(squadId, {
+			...task, title: task.id, description: task.id, agent: "backend", created: store.now(), started: null,
+			completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+		});
+	}
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome };
+	await emit(api, "session_start", {}, ctx);
+	const wakes = api.sent.filter((entry) => entry.message.customType?.startsWith(`squad-suspended-stall:${squadId}:`));
+	assert.equal(wakes.length, 1);
+	assert.match(wakes[0].message.content, /Suspended task IDs: suspended-root-exact/);
+	assert.match(wakes[0].message.content, /Blocked by suspended work: blocked-child-exact, blocked-grandchild-exact/);
+	assert.match(wakes[0].message.content, new RegExp(`squadId: "${squadId}"`));
+	assert.match(wakes[0].message.content, /No task was resumed automatically/);
+	assert.equal(store.loadSquad(squadId).suspendedStallAttention.delivery, "delivered");
+	assert.equal(store.loadTask(squadId, "suspended-root-exact").status, "suspended");
+
+	await emit(api, "session_shutdown");
+	const restartedApi = createFakeExtensionApi();
+	registerExtension(restartedApi);
+	await emit(restartedApi, "session_start", {}, ctx);
+	assert.equal(restartedApi.sent.filter((entry) => entry.message.customType?.startsWith(`squad-suspended-stall:${squadId}:`)).length, 0,
+		"delivered attention must not storm after restart");
+	const resumed = await restartedApi.tools.get("squad_modify").execute("resume-root", {
+		action: "resume_task", squadId, taskId: "suspended-root-exact",
+	}, undefined, undefined, ctx);
+	assert.match(resumed.content[0].text, /resumed in squad/);
+	await waitFor(() => store.loadTask(squadId, "suspended-root-exact").status === "in_progress", "exact root should resume");
+	assert.equal(store.loadTask(squadId, "blocked-child-exact").status, "blocked");
+	assert.equal(store.loadTask(squadId, "blocked-grandchild-exact").status, "blocked");
+	assert.equal(store.loadSquad(squadId).suspendedStallAttention, undefined);
+	await emit(restartedApi, "session_shutdown");
+});

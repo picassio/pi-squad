@@ -56,6 +56,7 @@ Squad agents—including QA/reviewer agents—produce candidate work and evidenc
 - Failed review is reworked in the **same authoritative squad**: use `squad_modify` with that `squadId` and `add_task` or `resume_task` (or `resume` when interrupted work exists). These operations reconstruct the scheduler after restart. `/squad resume <squad-id>` provides the same resume path.
 - When rework begins, the failed attempt moves to `reviewHistory`, the squad returns to `running`, and its evidence remains auditable. After every rework task settles, a fresh pending review becomes the active gate and `squad_review` is required again.
 - Pending and failed review gates survive Pi restarts and are restored on the next session. A separate squad never links to, remediates, or accepts the failed gate.
+- Every UI/status surface keeps execution progress adjacent to an explicit acceptance state: `◆ REVIEW PENDING · independent review required` means no verdict exists yet; `✗ REVIEW FAILED · awaiting same-squad rework` means the candidate was rejected. A truthful `3/3` task count never means a failed candidate was accepted.
 
 The completion report is explicitly labeled **untrusted and not yet accepted**. Main Pi must never merely relay it or ask whether verification should be run.
 
@@ -76,6 +77,18 @@ architect → frontend ─┘
 ```
 
 Architect runs first. Backend and frontend run in parallel after architect completes. QA waits for both.
+
+### Suspended Work Requires Explicit Action
+
+Suspension is an explicit pause, not a retry signal. If every remaining non-cancelled task is suspended or transitively blocked by suspended work, pi-squad durably wakes the main orchestrator once for that exact stall state. The widget shows `⚠ SUSPENDED — explicit resume required`; `squad_status` and the detail panel list every exact suspended task ID and blocked descendant.
+
+Nothing resumes automatically. Choose each task intentionally with an exact squad and task ID:
+
+```javascript
+squad_modify({ action: "resume_task", squadId: "<exact-squad-id>", taskId: "<exact-task-id>" })
+```
+
+Repeated reconciliation and restart do not create notification storms. A delivered stall remains visible until explicit resumption changes the state; a different suspended/blocked set is a new actionable episode.
 
 ### QA Rework Loop
 
@@ -156,9 +169,13 @@ When the main agent provides tasks directly (via the `tasks` parameter), unknown
 
 ### Widget (above editor)
 
-Shows live squad progress. Truncated to terminal width — no wrapping, deterministic height.
+Shows live execution progress plus a distinct acceptance/attention state. Truncation is viewport-only: no wrapping, deterministic height, with complete IDs and evidence retained for detail/status output.
 
 ```
+◆ squad Build task API 3/3 · ◆ REVIEW PENDING · independent review required
+✗ squad Build task API 3/3 · ✗ REVIEW FAILED · awaiting same-squad rework
+⚠ SUSPENDED — explicit resume required · ^q detail
+
 ⏳ squad Build task API 2/3 $0.58 3m12s  ^q detail · /squad msg
   ✓ api (backend) 2m12s Created CRUD REST API with validation
   ⏳ tests (qa) 45s → bash npm test
@@ -197,7 +214,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `/squad msg [task-id\|running-agent] text` | Message an exact task, or use an agent name only when it has one live task |
 | `/squad widget` | Toggle widget |
 | `/squad panel` | Toggle panel |
-| `/squad cancel` | Cancel running squad |
+| `/squad cancel` | Cancel the visibly focused squad; the notification names it and the focused widget/status clear |
 | `/squad clear` | Dismiss widget |
 | `/squad cleanup` | Delete squad data |
 | `/squad enable/disable` | Enable/disable the extension |
@@ -209,7 +226,9 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `squad` | Start a squad with goal + optional tasks/config |
 | `squad_status` | Check progress, costs, task states |
 | `squad_message` | Durably message an exact task; completed tasks reopen on their original session |
-| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads, or replace a task's dependencies with `set_dependencies`; accepts `squadId` for exact same-squad failed-review rework |
+| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads, or replace a task's dependencies with `set_dependencies`; exact `squadId` is required for destructive whole-squad `cancel` and recommended for all task actions |
+
+Tool-level whole-squad cancellation never infers a target: `squad_modify({ action: "cancel", squadId: "<exact-squad-id>" })` affects only that persisted squad and names it in the result. Omitting `squadId` is rejected without changing any squad. Interactive `/squad cancel` instead uses the squad visibly focused in the current UI and names the affected squad.
 
 Dependency repair uses top-level `taskId` and `depends`, for example `squad_modify({ action: "set_dependencies", taskId: "publish", depends: ["build"] })`. The replacement is validated atomically (known IDs, no self-reference, duplicates, or cycles) and is allowed only while the task is not running or done.
 

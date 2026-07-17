@@ -14,6 +14,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Component, TUI } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { TaskMessage, TaskStatus } from "../types.js";
+import { getReviewPresentation, getSuspendedAttention, SUSPENDED_ATTENTION_LABEL } from "../presentation.js";
 import * as store from "../store.js";
 
 function statusIcon(status: TaskStatus, th: Theme): string {
@@ -99,21 +100,25 @@ export function setupSquadWidget(
 			if (recentOrchestrator) recentOrchestratorByTask.set(task.id, recentOrchestrator);
 		}
 
-		const sIcon = squad.status === "done" ? th.fg("success", "✓")
+		const review = getReviewPresentation(squad);
+		const attention = getSuspendedAttention(squad);
+		const sIcon = review ? th.fg(review.tone, review.icon)
+			: squad.status === "done" ? th.fg("success", "✓")
 			: squad.status === "failed" ? th.fg("error", "✗")
-			: squad.status === "review" ? th.fg("warning", "◆")
 			: th.fg("warning", "⏳");
 
 		const orchestratorSignal = recentOrchestratorByTask.size > 0
 			? ` ${th.fg("accent", `✉ ${recentOrchestratorByTask.size > 1 ? recentOrchestratorByTask.size + " " : ""}ORCH`)}`
 			: "";
+		const acceptanceText = review ? ` · ${th.fg(review.tone, review.label)}` : "";
 		lines.push(
 			`${sIcon} ${th.fg("accent", "squad")}${orchestratorSignal} ${th.fg("dim", squad.goal.slice(0, 35))} ` +
-			`${th.fg("muted", progressText)} ` +
+			`${th.fg("muted", progressText)}${acceptanceText} ` +
 			`${th.fg("dim", `$${totalCost.toFixed(2)}`)} ` +
 			`${th.fg("dim", formatElapsed(elapsed))} ` +
 			`${th.fg("dim", "^q detail · /squad msg")}`
 		);
+		if (attention) lines.push(`  ${th.fg("warning", SUSPENDED_ATTENTION_LABEL)} ${th.fg("dim", "· ^q detail")}`);
 
 		// Cap visible tasks based on total count
 		const maxVisible = tasks.length > 6 ? 4 : tasks.length;
@@ -169,14 +174,16 @@ export function setupSquadWidget(
 			lines.push(`  ${th.fg("dim", `  +${tasks.length - maxVisible} more · ^q detail`)}`);
 		}
 
-		const cacheKey = `${squad.status}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}:${recentMessageKeys.join(",")}`;
+		const cacheKey = `${state.squadId}:${squad.status}:${squad.review?.status ?? "none"}:${attention?.fingerprint ?? "no-attention"}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}:${recentMessageKeys.join(",")}`;
 
-		const statusText = squad.status === "done"
+		const statusText = review
+			? th.fg(review.tone, `${review.label} · ${progressText}`)
+			: attention
+			? th.fg("warning", `${SUSPENDED_ATTENTION_LABEL} · ${progressText}`)
+			: squad.status === "done"
 			? th.fg("success", `✓ squad ${progressText}`)
 			: squad.status === "failed"
 			? th.fg("error", `✗ squad ${progressText}`)
-			: squad.status === "review"
-			? th.fg("warning", `◆ squad review required`)
 			: th.fg("accent", `⏳ squad ${progressText} $${totalCost.toFixed(2)}`);
 
 		return { lines, cacheKey, statusText };
@@ -216,6 +223,8 @@ export function setupSquadWidget(
 			ctx.ui.setWidget("squad-tasks", undefined);
 			ctx.ui.setStatus("squad", undefined);
 			widgetInstalled = false;
+			widgetComponent = null;
+			lastCacheKey = "";
 			return;
 		}
 
