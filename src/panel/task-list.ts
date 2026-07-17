@@ -24,6 +24,8 @@ function statusIcon(status: TaskStatus, th: Theme): string {
 			return th.fg("error", "✗");
 		case "suspended":
 			return th.fg("muted", "⏸");
+		case "cancelled":
+			return th.fg("muted", "⊘");
 		case "pending":
 		default:
 			return th.fg("dim", "·");
@@ -42,6 +44,8 @@ function statusLabel(status: TaskStatus): string {
 			return "FAILED";
 		case "suspended":
 			return "paused";
+		case "cancelled":
+			return "cancelled";
 		case "pending":
 			return "pending";
 	}
@@ -241,11 +245,15 @@ export class TaskListView {
 	private renderSummary(tasks: Task[], width: number): string {
 		const th = this.theme;
 		const done = tasks.filter((t) => t.status === "done").length;
+		const cancelled = tasks.filter((t) => t.status === "cancelled").length;
 		const total = tasks.length;
+		const activeTotal = total - cancelled;
 		const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
 		const parts: string[] = [];
-		parts.push(th.fg("accent", `${done}/${total}`));
+		parts.push(th.fg("accent", cancelled > 0
+			? `${done}/${activeTotal} active tasks done · ${cancelled} cancelled · ${total} total`
+			: `${done}/${total}`));
 		if (totalCost > 0) parts.push(th.fg("dim", `$${totalCost.toFixed(4)}`));
 
 		// Find squad creation time for elapsed

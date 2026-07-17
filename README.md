@@ -209,7 +209,11 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `squad` | Start a squad with goal + optional tasks/config |
 | `squad_status` | Check progress, costs, task states |
 | `squad_message` | Durably message an exact task; completed tasks reopen on their original session |
-| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads; accepts `squadId` for exact same-squad failed-review rework |
+| `squad_modify` | Add/cancel/complete/pause/resume tasks or squads, or replace a task's dependencies with `set_dependencies`; accepts `squadId` for exact same-squad failed-review rework |
+
+Dependency repair uses top-level `taskId` and `depends`, for example `squad_modify({ action: "set_dependencies", taskId: "publish", depends: ["build"] })`. The replacement is validated atomically (known IDs, no self-reference, duplicates, or cycles) and is allowed only while the task is not running or done.
+
+`cancel_task` is refused while any non-cancelled task directly depends on the target. Update every listed dependent explicitly with `set_dependencies`, then retry cancellation. Cancellation never cascades to dependents and never rewrites their dependency lists automatically; cancelled tasks remain visible in squad history and can be revived only with explicit `resume_task`.
 
 The main agent sees available agents in its system prompt and squad state when a squad is active.
 

@@ -142,14 +142,15 @@ Send small, scoped corrections instead of restarting the task:
 - Name exactly what to change and what to keep: "Change only the header component — keep the layout and routes as they are."
 - Add missing information the moment you learn it — don't wait for the agent to get stuck
 - If the user manually edited or reverted files the agent touched, tell the agent immediately so it doesn't overwrite the human's changes
-- If an agent starts doing work that's no longer needed, narrow its scope via `squad_message` or stop it with `squad_modify` `cancel_task` — don't let it burn tokens on obsolete work
+- If an agent starts doing work that's no longer needed, narrow its scope via `squad_message`. Before using `squad_modify` `cancel_task`, repair every direct dependent explicitly as described below.
 
 ## Modifying a Running Squad
 
 Use `squad_modify` when:
 - **`add_task`**: User requests something not in the original plan
-- **`cancel_task`**: A task is no longer needed
-- **`pause_task`** / **`resume_task`**: Temporarily halt an agent
+- **`set_dependencies`**: Replace a task's dependency list with top-level `taskId` and `depends`, e.g. `{ action: "set_dependencies", taskId: "publish", depends: ["build"] }`. This is allowed only for tasks that are not running or done; the complete replacement is validated atomically for unknown IDs, self-dependencies, duplicates, and cycles.
+- **`cancel_task`**: A task is no longer needed. Cancellation is refused while any non-cancelled task directly depends on it. First call `set_dependencies` for every dependent named in the refusal, then retry `cancel_task`. Cancellation never cascades and never removes or rewrites dependencies automatically.
+- **`pause_task`** / **`resume_task`**: Temporarily halt or explicitly revive an agent; `resume_task` is also the only action that revives a cancelled task.
 - **`pause`** / **`resume`**: Stop/restart the entire squad
 - **`cancel`**: Abort everything (user changed their mind)
 

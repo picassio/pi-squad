@@ -356,8 +356,15 @@ export function findLatestSquad(projectCwd?: string): Squad | null {
 // Tasks
 // ============================================================================
 
+function normalizeLegacyCancelledTask(task: Task | null): Task | null {
+	if (task?.status === "failed" && task.error === "Cancelled by user") {
+		return { ...task, status: "cancelled", error: null };
+	}
+	return task;
+}
+
 export function loadTask(squadId: string, taskId: string, parentPath?: string): Task | null {
-	return readJson<Task>(getTaskFilePath(squadId, taskId, parentPath));
+	return normalizeLegacyCancelledTask(readJson<Task>(getTaskFilePath(squadId, taskId, parentPath)));
 }
 
 export function saveTask(squadId: string, task: Task, parentPath?: string): void {
@@ -377,7 +384,7 @@ export function loadAllTasks(squadId: string): Task[] {
 		if (!entry.isDirectory()) continue;
 		if (entry.name === "knowledge") continue;
 		const taskFile = path.join(squadDir, entry.name, "task.json");
-		const task = readJson<Task>(taskFile);
+		const task = normalizeLegacyCancelledTask(readJson<Task>(taskFile));
 		if (task && !seen.has(task.id)) {
 			seen.add(task.id);
 			tasks.push(task);
@@ -401,7 +408,7 @@ function collectSubtasks(squadDir: string, parentPath: string, tasks: Task[], se
 	for (const entry of entries) {
 		if (!entry.isDirectory()) continue;
 		const taskFile = path.join(parentDir, entry.name, "task.json");
-		const task = readJson<Task>(taskFile);
+		const task = normalizeLegacyCancelledTask(readJson<Task>(taskFile));
 		if (task && !seen.has(task.id)) {
 			seen.add(task.id);
 			tasks.push(task);

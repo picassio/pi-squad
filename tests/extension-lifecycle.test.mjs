@@ -626,3 +626,114 @@ test("extension restart automatically reconstructs and delivers pending task mai
 
 	await emit(api, "session_shutdown");
 });
+
+test("squad_modify RPC repairs dependencies then durably cancels obsolete work after restart", async () => {
+	const squadId = "sq-extension-cancel-repair";
+	store.saveSquad({
+		id: squadId,
+		goal: "repair obsolete QA dependency",
+		status: "failed",
+		created: "2026-07-17T04:00:00.000Z",
+		cwd: tempHome,
+		agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	for (const task of [
+		{ id: "old-qa", status: "failed", depends: [], error: "obsolete failure" },
+		{ id: "replacement-qa", status: "done", depends: [], error: null },
+		{ id: "final-check", status: "blocked", depends: ["old-qa"], error: null },
+	]) {
+		store.createTask(squadId, {
+			...task, title: task.id, description: task.id, agent: "backend",
+			created: store.now(), started: null, completed: task.status === "done" ? store.now() : null,
+			output: task.status === "done" ? "replacement passed" : null,
+			usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+		});
+	}
+
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome };
+	await emit(api, "session_start", {}, ctx);
+	const modify = api.tools.get("squad_modify");
+
+	const refused = await modify.execute("cancel-refused", {
+		action: "cancel_task", squadId, taskId: "old-qa",
+	}, undefined, undefined, ctx);
+	assert.match(refused.content[0].text, /Cannot cancel task 'old-qa'/);
+	assert.match(refused.content[0].text, /final-check \[blocked\]/);
+	assert.equal(store.loadTask(squadId, "old-qa").status, "failed");
+
+	const repaired = await modify.execute("repair-dependency", {
+		action: "set_dependencies", squadId, taskId: "final-check", depends: ["replacement-qa"],
+	}, undefined, undefined, ctx);
+	assert.match(repaired.content[0].text, /dependencies updated/);
+	await waitFor(() => store.loadTask(squadId, "final-check").status === "in_progress", "repaired task should schedule in the same squad");
+	assert.equal(store.loadSquad(squadId).status, "running");
+	assert.deepEqual(store.loadTask(squadId, "final-check").depends, ["replacement-qa"]);
+
+	const cancelled = await modify.execute("cancel-safe", {
+		action: "cancel_task", squadId, taskId: "old-qa",
+	}, undefined, undefined, ctx);
+	assert.match(cancelled.content[0].text, /cancelled/);
+	assert.equal(store.loadTask(squadId, "old-qa").status, "cancelled");
+	assert.equal(store.loadTask(squadId, "old-qa").error, null);
+
+	const status = await api.tools.get("squad_status").execute("status-after-cancel", {
+		squadId,
+	}, undefined, undefined, ctx);
+	assert.match(status.content[0].text, /⊘ old-qa .*\[cancelled\]/);
+	assert.match(status.content[0].text, /Progress: 1\/2 active tasks done · 1 cancelled · 3 total/);
+
+	await emit(api, "session_shutdown");
+	assert.equal(store.loadTask(squadId, "old-qa").status, "cancelled");
+});
+
+test("real Pi RPC resume_task revives a cancelled task on its exact session and durable mailbox", async () => {
+	const squadId = "sq-extension-cancelled-resume";
+	const taskId = "cancelled-work";
+	const originalSession = path.join(store.getTaskSessionDir(squadId, taskId), "cancelled-original.jsonl");
+	store.saveSquad({
+		id: squadId,
+		goal: "resume cancelled durable session",
+		status: "review",
+		created: "2026-07-17T04:10:00.000Z",
+		cwd: tempHome,
+		agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	store.createTask(squadId, {
+		id: taskId, title: taskId, description: taskId, agent: "backend", status: "cancelled", depends: [],
+		created: store.now(), started: store.now(), completed: store.now(), output: "preserved prior output", error: null,
+		usage: { inputTokens: 4, outputTokens: 5, cost: 0.02, turns: 1 },
+	});
+	store.bindTaskSession(squadId, taskId, { file: originalSession, sessionId: "original-session-id" });
+	const pending = store.queueTaskMessage(squadId, taskId, {
+		ts: store.now(), from: "orchestrator", type: "message", text: "resume cancelled mailbox EXACT-END", expectsReply: true,
+	});
+	const rpcBefore = readRpcLog().length;
+
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome };
+	await emit(api, "session_start", {}, ctx);
+	assert.equal(store.loadTask(squadId, taskId).status, "cancelled", "restart mailbox recovery must not revive cancelled work");
+	assert.equal(store.loadPendingTaskMessages(squadId, taskId).length, 1);
+
+	const resumed = await api.tools.get("squad_modify").execute("resume-cancelled", {
+		action: "resume_task", squadId, taskId,
+	}, undefined, undefined, ctx);
+	assert.match(resumed.content[0].text, /resumed/);
+	await waitFor(() => store.loadTask(squadId, taskId).status === "in_progress", "cancelled task should resume on explicit resume_task");
+	assert.deepEqual(store.loadTaskSession(squadId, taskId), { file: originalSession, sessionId: "original-session-id" });
+	assert.equal(store.loadPendingTaskMessages(squadId, taskId).length, 0);
+	assert.ok(store.loadTaskMailbox(squadId, taskId).some((entry) => entry.id === pending.id), "acknowledgement retains mailbox history");
+
+	const records = readRpcLog().slice(rpcBefore);
+	const argv = records.find((record) => record.kind === "argv")?.args;
+	assert.deepEqual(argv?.slice(0, 4), ["--mode", "rpc", "--session", originalSession]);
+	const prompt = records.find((record) => record.kind === "rpc" && record.command.type === "prompt")?.command.message;
+	assert.ok(prompt?.includes("resume cancelled mailbox EXACT-END"));
+
+	await emit(api, "session_shutdown");
+});

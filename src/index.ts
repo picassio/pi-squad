@@ -46,6 +46,16 @@ let uiCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null = n
 const widgetState: SquadWidgetState = { squadId: null, enabled: true };
 let widgetControls: { requestUpdate: () => void; dispose: () => void } | null = null;
 
+/** Format completion against active work while retaining cancelled history. */
+function formatTaskProgress(tasks: Task[]): string {
+	const done = tasks.filter((task) => task.status === "done").length;
+	const cancelled = tasks.filter((task) => task.status === "cancelled").length;
+	const active = tasks.length - cancelled;
+	return cancelled > 0
+		? `${done}/${active} active tasks done · ${cancelled} cancelled · ${tasks.length} total`
+		: `${done}/${tasks.length} tasks done`;
+}
+
 /**
  * Resolve a model string (or null = session default) to its context window.
  * Reads uiCtx lazily so it always uses the live session's registry.
@@ -268,11 +278,10 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const doneCount = tasks.filter((t) => t.status === "done").length;
 			const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 
 			const taskLines = tasks.map((t) => {
-				const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : "·";
+				const icon = t.status === "done" ? "✓" : t.status === "in_progress" ? "⏳" : t.status === "failed" ? "✗" : t.status === "blocked" ? "◻" : t.status === "cancelled" ? "⊘" : "·";
 				let line = `  ${icon} ${t.id} (${t.agent}) [${t.status}]`;
 				if (t.output) line += ` — ${t.output}`;
 				if (t.error) line += ` ERROR: ${t.error}`;
@@ -282,7 +291,7 @@ export default function (pi: ExtensionAPI) {
 			const squadContext = [
 				`<squad_status>`,
 				`Squad: ${squad.id} — ${squad.goal}`,
-				`Status: ${squad.status} | ${doneCount}/${tasks.length} tasks | $${totalCost.toFixed(2)}`,
+				`Status: ${squad.status} | ${formatTaskProgress(tasks)} | $${totalCost.toFixed(2)}`,
 				taskLines,
 				`</squad_status>`,
 				...(squad.status === "review" ? [buildOrchestratorReviewGate(squad, tasks)] : []),
@@ -443,6 +452,7 @@ export default function (pi: ExtensionAPI) {
 						task.status === "in_progress" ? "⏳" :
 						task.status === "blocked" ? "◻" :
 						task.status === "failed" ? "✗" :
+						task.status === "cancelled" ? "⊘" :
 						"·";
 					let line = `${icon} ${taskId} (${task.agent}) — ${task.title} [${task.status}]`;
 					if (task.blockedBy?.length) line += ` blocked by: ${task.blockedBy.join(", ")}`;
@@ -450,9 +460,11 @@ export default function (pi: ExtensionAPI) {
 				})
 				.join("\n");
 
+			const durableTasks = store.loadAllTasks(id!);
 			const summary = [
 				`Squad: ${id}`,
 				`Status: ${context.status}`,
+				`Progress: ${formatTaskProgress(durableTasks)}`,
 				`Elapsed: ${context.elapsed}`,
 				`Cost: $${context.costs.total.toFixed(4)}`,
 				...(context.status === "review" ? ["Acceptance: BLOCKED — independent main-orchestrator review required via squad_review"] : []),
@@ -592,12 +604,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "squad_modify",
 		label: "Squad Modify",
-		description: "Modify one exact squad: add_task, cancel_task, complete_task (mark done + schedule dependents), pause, resume_task, resume (including failed-review rework), cancel. add_task/resume_task/resume reconstruct the persisted scheduler after restart.",
+		description: "Modify one exact squad: add_task, set_dependencies (top-level depends), cancel_task, complete_task (mark done + schedule dependents), pause, resume_task, resume (including failed-review rework), cancel. Task actions reconstruct the persisted scheduler after restart when needed.",
 		parameters: Type.Object({
 			squadId: Type.Optional(Type.String({ description: "Exact squad to modify (recommended for failed-review rework; default: focused/recoverable project squad)" })),
 			action: Type.Union(
 				[
 					Type.Literal("add_task"),
+					Type.Literal("set_dependencies"),
 					Type.Literal("cancel_task"),
 					Type.Literal("pause_task"),
 					Type.Literal("resume_task"),
@@ -609,6 +622,7 @@ export default function (pi: ExtensionAPI) {
 				{ description: "Action to perform" },
 			),
 			taskId: Type.Optional(Type.String({ description: "Task ID for task-specific actions" })),
+			depends: Type.Optional(Type.Array(Type.String(), { description: "Complete replacement dependency list; required at top level for set_dependencies" })),
 			output: Type.Optional(Type.String({ description: "Result summary for complete_task (what was accomplished)" })),
 			task: Type.Optional(
 				Type.Object({
@@ -638,8 +652,7 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text" as const, text: `Resume failed: ${(err as Error).message}` }], details: undefined };
 				}
 				const tasks = store.loadAllTasks(squad.id);
-				const done = tasks.filter((task) => task.status === "done").length;
-				return { content: [{ type: "text" as const, text: `Squad "${squad.id}" resumed (${done}/${tasks.length} done). Agents restarting in background.` }], details: undefined };
+				return { content: [{ type: "text" as const, text: `Squad "${squad.id}" resumed (${formatTaskProgress(tasks)}). Agents restarting in background.` }], details: undefined };
 			}
 
 			const squadId = params.squadId || activeSquadId;
@@ -647,7 +660,7 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text" as const, text: params.squadId ? `Squad '${params.squadId}' not found.` : "No active squad. Provide squadId, select the squad, or start a new one." }], details: undefined };
 			}
 			let activeScheduler = schedulers.get(squadId) || null;
-			if (!activeScheduler && (params.action === "add_task" || params.action === "resume_task")) {
+			if (!activeScheduler && (params.action === "add_task" || params.action === "set_dependencies" || params.action === "cancel_task" || params.action === "resume_task" || params.action === "complete_task" || params.action === "pause_task")) {
 				activeScheduler = ensureScheduler(pi, squadId, squadSkillPaths);
 			}
 			if (!activeScheduler) {
@@ -699,9 +712,24 @@ export default function (pi: ExtensionAPI) {
 					return { content: [{ type: "text" as const, text: `Task '${task.id}' added to squad '${squadId}'.` }], details: undefined };
 				}
 
+				case "set_dependencies": {
+					if (!params.taskId) return { content: [{ type: "text" as const, text: "Provide taskId." }], details: undefined };
+					if (!params.depends) return { content: [{ type: "text" as const, text: "Provide top-level depends for set_dependencies (use [] to remove all dependencies)." }], details: undefined };
+					try {
+						await activeScheduler.setDependencies(params.taskId, params.depends);
+					} catch (err) {
+						return { content: [{ type: "text" as const, text: `set_dependencies failed: ${(err as Error).message}` }], details: undefined };
+					}
+					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' dependencies updated in squad '${squadId}'.` }], details: undefined };
+				}
+
 				case "cancel_task": {
 					if (!params.taskId) return { content: [{ type: "text" as const, text: "Provide taskId." }], details: undefined };
-					await activeScheduler.cancelTask(params.taskId);
+					try {
+						await activeScheduler.cancelTask(params.taskId);
+					} catch (err) {
+						return { content: [{ type: "text" as const, text: `cancel_task failed: ${(err as Error).message}` }], details: undefined };
+					}
 					return { content: [{ type: "text" as const, text: `Task '${params.taskId}' cancelled.` }], details: undefined };
 				}
 
@@ -799,7 +827,7 @@ export default function (pi: ExtensionAPI) {
 		// occur after the mailbox-first write but before the squad/task is reopened.
 		const pendingMailSquads = store.listSquadsForProject(ctx.cwd)
 			.filter((squad) => store.loadAllTasks(squad.id)
-				.some((task) => store.loadPendingTaskMessages(squad.id, task.id).length > 0))
+				.some((task) => task.status !== "cancelled" && store.loadPendingTaskMessages(squad.id, task.id).length > 0))
 			.sort((a, b) => b.created.localeCompare(a.created));
 		for (const squad of pendingMailSquads) {
 			let scheduler = schedulers.get(squad.id);
@@ -828,7 +856,7 @@ export default function (pi: ExtensionAPI) {
 			if (done > 0) {
 				pi.sendMessage({
 					customType: "squad-paused",
-					content: `[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${done}/${tasks.length} done. ` +
+					content: `[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${formatTaskProgress(tasks)}. ` +
 						`Use squad_modify with action "resume" to continue, or start a new squad.`,
 					display: true,
 				});
@@ -988,8 +1016,7 @@ export default function (pi: ExtensionAPI) {
 						return;
 					}
 					const tasks = store.loadAllTasks(squad.id);
-					const done = tasks.filter((task) => task.status === "done").length;
-					ctx.ui.notify(`Resumed: ${squad.id} (${done}/${tasks.length} done)`, "info");
+					ctx.ui.notify(`Resumed: ${squad.id} (${formatTaskProgress(tasks)})`, "info");
 					return;
 				}
 
@@ -1164,10 +1191,9 @@ export default function (pi: ExtensionAPI) {
 						"🗑  Delete ALL squads",
 						...squads.map((s) => {
 							const tasks = store.loadAllTasks(s.id);
-							const done = tasks.filter((t) => t.status === "done").length;
 							const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 							const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "review" ? "◆" : s.status === "failed" ? "✗" : "·";
-							return `${icon} ${s.id} [${s.status}] ${done}/${tasks.length} $${cost.toFixed(2)}`;
+							return `${icon} ${s.id} [${s.status}] ${formatTaskProgress(tasks)} $${cost.toFixed(2)}`;
 						}),
 					];
 
@@ -1474,11 +1500,10 @@ async function pickSquad(
 
 	const options = squads.map((s) => {
 		const tasks = store.loadAllTasks(s.id);
-		const done = tasks.filter((t) => t.status === "done").length;
 		const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 		const icon = s.status === "done" ? "✓" : s.status === "running" ? "⏳" : s.status === "review" ? "◆" : s.status === "failed" ? "✗" : "·";
 		const project = showProject ? ` — ${s.cwd.split("/").pop()}` : "";
-		return `${icon} ${s.id} [${s.status}] ${done}/${tasks.length} $${cost.toFixed(2)}${project}`;
+		return `${icon} ${s.id} [${s.status}] ${formatTaskProgress(tasks)} $${cost.toFixed(2)}${project}`;
 	});
 
 	const choice = await ctx.ui.select("Select a squad", options);
@@ -1511,9 +1536,8 @@ function activateSquadView(squadId: string, ctx: import("@earendil-works/pi-codi
 	// Compact notification — widget already shows full task details.
 	// Avoid large multi-line notifications that can break TUI layout.
 	const tasks = store.loadAllTasks(squadId);
-	const done = tasks.filter((t) => t.status === "done").length;
 	const cost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
-	ctx.ui.notify(`Viewing: ${squad.id} [${squad.status}] ${done}/${tasks.length} $${cost.toFixed(2)}`, "info");
+	ctx.ui.notify(`Viewing: ${squad.id} [${squad.status}] ${formatTaskProgress(tasks)} $${cost.toFixed(2)}`, "info");
 }
 
 // ============================================================================
@@ -1552,11 +1576,10 @@ function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squadId: st
 			case "squad_failed": {
 				const tasks = store.loadAllTasks(squadId);
 				const failed = tasks.filter((task) => task.status === "failed");
-				const done = tasks.filter((task) => task.status === "done");
 				pi.sendMessage({
 					customType: "squad-failed",
 					content: `[squad] Squad "${squadId}" has stalled. ` +
-						`${done.length}/${tasks.length} tasks done, ${failed.length} failed.\n` +
+						`${formatTaskProgress(tasks)}, ${failed.length} failed.\n` +
 						`Failed: ${buildFailureSummary(tasks)}\n` +
 						"Use squad_status for details or squad_modify to adjust.",
 					display: true,

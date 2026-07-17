@@ -117,6 +117,50 @@ test("task panel labels human and orchestrator messages unambiguously", () => {
 	assert.ok(lines.some((line) => line.includes("YOU")));
 });
 
+test("cancelled tasks stay visible with a neutral icon and active-task counts", () => {
+	const squadId = "sq-panel-cancelled-status";
+	createFixture(squadId, "done");
+	store.createTask(squadId, {
+		id: "obsolete-qa",
+		title: "Obsolete QA",
+		description: "Retain cancellation in history",
+		agent: "qa",
+		status: "cancelled",
+		depends: [],
+		created: "2026-07-16T09:00:00.000Z",
+		started: null,
+		completed: "2026-07-16T09:00:02.000Z",
+		output: null,
+		error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+	});
+
+	const scheduler = { getPool: () => ({ getActivity: () => null }) };
+	const taskLines = new TaskListView(theme, squadId).render(100, 0, 12, scheduler);
+	assert.ok(taskLines.some((line) => line.includes("⊘ obsolete-qa (qa) cancelled")));
+	assert.ok(taskLines.some((line) => line.includes("1/1 active tasks done · 1 cancelled · 2 total")));
+
+	let widgetFactory;
+	let statusText;
+	const ctx = {
+		hasUI: true,
+		ui: {
+			theme,
+			setWidget: (_id, value) => { if (typeof value === "function") widgetFactory = value; },
+			setStatus: (_id, value) => { statusText = value; },
+		},
+	};
+	const controls = setupSquadWidget(ctx, { squadId, enabled: true });
+	try {
+		const widgetLines = widgetFactory({ terminal: { columns: 120 } }, theme).render(120);
+		assert.ok(widgetLines.some((line) => line.includes("⊘ obsolete-qa (qa) cancelled")));
+		assert.ok(widgetLines[0].includes("1/1 active tasks done · 1 cancelled · 2 total"));
+		assert.ok(statusText.includes("1/1 active tasks done · 1 cancelled · 2 total"));
+	} finally {
+		controls.dispose();
+	}
+});
+
 test("live preview and compact widget visibly prioritize a recent orchestrator message", () => {
 	const squadId = "sq-panel-orchestrator-preview";
 	createFixture(squadId);

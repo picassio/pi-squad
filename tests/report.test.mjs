@@ -33,6 +33,18 @@ test("completion report preserves all 15 long task handoffs without truncation",
 	assert.ok(report.length > 45_000, "fixture must exceed the former 2,000-character limit by a wide margin");
 });
 
+test("completion report preserves cancelled tasks in a distinct neutral section", () => {
+	const report = buildCompletionSummary([
+		task("done-work", "done", "done-work output"),
+		task("obsolete-qa", "cancelled"),
+	]);
+
+	assert.match(report, /- done-work \(role-done-work\): done-work output/);
+	assert.match(report, /CANCELLED TASKS \(neutral; not successful output\)/);
+	assert.match(report, /- obsolete-qa \(role-obsolete-qa\): cancelled/);
+	assert.doesNotMatch(report, /obsolete-qa.*done/);
+});
+
 test("failure report preserves complete diagnostics", () => {
 	const error = `failure-start\n${"diagnostic\n".repeat(1000)}failure-end`;
 	const report = buildFailureSummary([task("broken", "failed", null, error)]);

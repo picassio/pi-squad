@@ -23,6 +23,7 @@ function statusIcon(status: TaskStatus, th: Theme): string {
 		case "blocked": return th.fg("muted", "◻");
 		case "failed": return th.fg("error", "✗");
 		case "suspended": return th.fg("muted", "⏸");
+		case "cancelled": return th.fg("muted", "⊘");
 		default: return th.fg("dim", "·");
 	}
 }
@@ -75,6 +76,11 @@ export function setupSquadWidget(
 		const lines: string[] = [];
 		const totalCost = tasks.reduce((sum, t) => sum + t.usage.cost, 0);
 		const doneCount = tasks.filter((t) => t.status === "done").length;
+		const cancelledCount = tasks.filter((t) => t.status === "cancelled").length;
+		const activeCount = tasks.length - cancelledCount;
+		const progressText = cancelledCount > 0
+			? `${doneCount}/${activeCount} active tasks done · ${cancelledCount} cancelled · ${tasks.length} total`
+			: `${doneCount}/${tasks.length}`;
 		const elapsed = Date.now() - new Date(squad.created).getTime();
 		const taskMessages = new Map<string, TaskMessage[]>();
 		const recentOrchestratorByTask = new Map<string, TaskMessage>();
@@ -103,7 +109,7 @@ export function setupSquadWidget(
 			: "";
 		lines.push(
 			`${sIcon} ${th.fg("accent", "squad")}${orchestratorSignal} ${th.fg("dim", squad.goal.slice(0, 35))} ` +
-			`${th.fg("muted", `${doneCount}/${tasks.length}`)} ` +
+			`${th.fg("muted", progressText)} ` +
 			`${th.fg("dim", `$${totalCost.toFixed(2)}`)} ` +
 			`${th.fg("dim", formatElapsed(elapsed))} ` +
 			`${th.fg("dim", "^q detail · /squad msg")}`
@@ -144,6 +150,8 @@ export function setupSquadWidget(
 						line += ` ${th.fg("dim", (detail ? `${toolStr} ${detail}` : toolStr).slice(0, 30))}`;
 					}
 				}
+			} else if (task.status === "cancelled") {
+				line += ` ${th.fg("muted", "cancelled")}`;
 			} else if (task.status === "blocked") {
 				const blockers = task.depends.filter((d) => {
 					const dep = tasks.find((t) => t.id === d);
@@ -164,12 +172,12 @@ export function setupSquadWidget(
 		const cacheKey = `${squad.status}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}:${recentMessageKeys.join(",")}`;
 
 		const statusText = squad.status === "done"
-			? th.fg("success", `✓ squad ${doneCount}/${tasks.length}`)
+			? th.fg("success", `✓ squad ${progressText}`)
 			: squad.status === "failed"
-			? th.fg("error", `✗ squad ${doneCount}/${tasks.length}`)
+			? th.fg("error", `✗ squad ${progressText}`)
 			: squad.status === "review"
 			? th.fg("warning", `◆ squad review required`)
-			: th.fg("accent", `⏳ squad ${doneCount}/${tasks.length} $${totalCost.toFixed(2)}`);
+			: th.fg("accent", `⏳ squad ${progressText} $${totalCost.toFixed(2)}`);
 
 		return { lines, cacheKey, statusText };
 	}

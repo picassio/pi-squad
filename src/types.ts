@@ -122,7 +122,7 @@ export interface Squad {
 // Tasks
 // ============================================================================
 
-export type TaskStatus = "pending" | "blocked" | "in_progress" | "done" | "failed" | "suspended";
+export type TaskStatus = "pending" | "blocked" | "in_progress" | "done" | "failed" | "suspended" | "cancelled";
 
 export interface TaskUsage {
 	inputTokens: number;

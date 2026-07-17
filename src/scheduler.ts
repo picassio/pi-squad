@@ -258,6 +258,7 @@ export class Scheduler {
 		// mutation/RPC delivery, reopen exactly that task on reconstruction.
 		let recoveredMailbox = false;
 		for (const task of tasks) {
+			if (task.status === "cancelled") continue;
 			if (this.pool.isRunning(task.id)) continue;
 			if (store.loadPendingTaskMessages(this.squadId, task.id).length === 0) continue;
 			if (task.status === "done") await this.invalidateDescendants(task.id);
@@ -308,6 +309,11 @@ export class Scheduler {
 		}
 
 		await this.scheduleReadyTasks();
+
+		const freshSquad = store.loadSquad(this.squadId);
+		if (freshSquad && (freshSquad.status === "running" || freshSquad.status === "failed")) {
+			this.checkSquadCompletion(store.loadAllTasks(this.squadId), freshSquad);
+		}
 	}
 
 	// =========================================================================
@@ -658,6 +664,7 @@ export class Scheduler {
 	}
 
 	private handleUnexpectedAgentExit(event: AgentEvent): void {
+		if (store.loadTask(this.squadId, event.taskId)?.status === "cancelled") return;
 		const exitCode = event.data?.exitCode ?? 1;
 		const turnCount = event.data?.turnCount ?? 0;
 		const stderr = event.data?.stderr || "";
@@ -787,6 +794,7 @@ export class Scheduler {
 			}
 
 			case "agent_settled": {
+				if (store.loadTask(this.squadId, event.taskId)?.status === "cancelled") return;
 				// A mailbox entry not acknowledged by Pi outranks this run's candidate
 				// completion. Reopen the same session so accepted-at-least-once delivery
 				// occurs before the task can become done.
@@ -838,8 +846,8 @@ export class Scheduler {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) return;
 
-		// Guard against double-completion
-		if (task.status === "done") return;
+		// Guard against double-completion and late callbacks after cancellation.
+		if (task.status === "done" || task.status === "cancelled") return;
 
 		// Extract output from last messages
 		const messages = store.loadMessages(this.squadId, taskId);
@@ -907,6 +915,7 @@ export class Scheduler {
 	}
 
 	private handleTaskFailed(taskId: string, error: string): void {
+		if (store.loadTask(this.squadId, taskId)?.status === "cancelled") return;
 		store.updateTaskStatus(this.squadId, taskId, "failed", {
 			error,
 			completed: store.now(),
@@ -1148,10 +1157,11 @@ export class Scheduler {
 	private checkSquadCompletion(tasks: Task[], squad: Squad): void {
 		if (tasks.length === 0) return;
 
-		const allDone = tasks.every((t) => t.status === "done");
-		const anyFailed = tasks.some((t) => t.status === "failed");
-		const anyInProgress = tasks.some(
-			(t) => t.status === "in_progress" || t.status === "pending",
+		const relevant = tasks.filter((task) => task.status !== "cancelled");
+		const allDone = relevant.every((task) => task.status === "done");
+		const anyFailed = relevant.some((task) => task.status === "failed");
+		const anyInProgress = relevant.some(
+			(task) => task.status === "in_progress" || task.status === "pending",
 		);
 
 		if (allDone) {
@@ -1163,9 +1173,9 @@ export class Scheduler {
 			this.emit({ type: "squad_review_required", squadId: this.squadId });
 		} else if (anyFailed && !anyInProgress) {
 			// All remaining tasks are blocked/failed with no way forward
-			const blockedCount = tasks.filter((t) => t.status === "blocked").length;
-			const failedCount = tasks.filter((t) => t.status === "failed").length;
-			if (blockedCount + failedCount === tasks.filter((t) => t.status !== "done").length) {
+			const blockedCount = relevant.filter((task) => task.status === "blocked").length;
+			const failedCount = relevant.filter((task) => task.status === "failed").length;
+			if (blockedCount + failedCount === relevant.filter((task) => task.status !== "done").length) {
 				squad.status = "failed";
 				store.saveSquad(squad);
 				this.emit({ type: "squad_failed", squadId: this.squadId });
@@ -1297,6 +1307,7 @@ export class Scheduler {
 			if (seen.has(descendant.id)) continue;
 			seen.add(descendant.id);
 			queue.push(...(byDependency.get(descendant.id) ?? []));
+			if (descendant.status === "cancelled") continue;
 			store.updateTaskStatus(this.squadId, descendant.id, "blocked", {
 				completed: null,
 				error: null,
@@ -1353,6 +1364,8 @@ export class Scheduler {
 			expectsReply,
 		});
 
+		if (task.status === "cancelled") return false;
+
 		const request = expectsReply
 			? `[squad] Main orchestrator requests a direct response:\n${message}\n\nReply directly in your next assistant message. That complete message will be forwarded automatically to the main session.`
 			: `[squad] Main orchestrator message:\n${message}`;
@@ -1387,6 +1400,9 @@ export class Scheduler {
 
 	/** Pause a running task */
 	async pauseTask(taskId: string): Promise<void> {
+		const task = store.loadTask(this.squadId, taskId);
+		if (!task) throw new Error(`Task not found: ${taskId}`);
+		if (task.status === "cancelled") throw new Error(`Task '${taskId}' is cancelled; use resume_task to revive it.`);
 		if (this.pool.isRunning(taskId)) {
 			await this.pool.steer(taskId, "[squad] Task paused by user. Summarize your current state.");
 			// Give agent a moment to respond, then kill
@@ -1402,6 +1418,86 @@ export class Scheduler {
 		store.createTask(this.squadId, task);
 		this.reopenSquadForWork();
 		await this.start();
+		this.updateContext();
+	}
+
+	/** Atomically replace one task's dependency list after validating the complete historical DAG. */
+	async setDependencies(taskId: string, depends: string[]): Promise<void> {
+		const tasks = store.loadAllTasks(this.squadId);
+		const target = tasks.find((task) => task.id === taskId);
+		if (!target) throw new Error(`Task not found: ${taskId}`);
+		if (target.status === "in_progress") {
+			throw new Error(`Cannot edit dependencies for in_progress task '${taskId}'; pause or cancel it first.`);
+		}
+		if (target.status === "done") {
+			throw new Error(`Cannot edit dependencies for done task '${taskId}'; resume it first so descendant invalidation remains authoritative.`);
+		}
+
+		const duplicate = depends.find((dependency, index) => depends.indexOf(dependency) !== index);
+		if (duplicate) throw new Error(`Duplicate dependency '${duplicate}' for task '${taskId}'.`);
+		if (depends.includes(taskId)) throw new Error(`Task '${taskId}' cannot depend on itself.`);
+		const known = new Set(tasks.map((task) => task.id));
+		const unknown = depends.filter((dependency) => !known.has(dependency));
+		if (unknown.length > 0) throw new Error(`Unknown dependency task(s): ${unknown.join(", ")}.`);
+
+		const wasRunnable = target.status === "pending" && target.depends.every(
+			(dependency) => tasks.find((candidate) => candidate.id === dependency)?.status === "done",
+		);
+		const graph = new Map(tasks.map((task) => [task.id, [...task.depends]]));
+		graph.set(taskId, [...depends]);
+		for (const [id, dependencies] of graph) {
+			const seen = new Set<string>();
+			for (const dependency of dependencies) {
+				if (!known.has(dependency)) throw new Error(`Task '${id}' depends on unknown task '${dependency}'.`);
+				if (dependency === id) throw new Error(`Task '${id}' cannot depend on itself.`);
+				if (seen.has(dependency)) throw new Error(`Duplicate dependency '${dependency}' for task '${id}'.`);
+				seen.add(dependency);
+			}
+		}
+		const color = new Map<string, 0 | 1 | 2>();
+		const stack: string[] = [];
+		const visit = (id: string): void => {
+			const state = color.get(id) ?? 0;
+			if (state === 2) return;
+			if (state === 1) {
+				const start = stack.indexOf(id);
+				const cycle = [...stack.slice(start), id];
+				throw new Error(`Dependency cycle detected: ${cycle.join(" -> ")}`);
+			}
+			color.set(id, 1);
+			stack.push(id);
+			for (const dependency of graph.get(id) ?? []) visit(dependency);
+			stack.pop();
+			color.set(id, 2);
+		};
+		for (const id of graph.keys()) visit(id);
+
+		target.depends = [...depends];
+		if (target.status === "pending" || target.status === "blocked") {
+			target.status = depends.every(
+				(dependency) => tasks.find((candidate) => candidate.id === dependency)?.status === "done",
+			) ? "pending" : "blocked";
+		}
+		store.saveTask(this.squadId, target);
+		store.appendMessage(this.squadId, taskId, {
+			ts: store.now(),
+			from: "system",
+			type: "status",
+			text: `Dependencies updated: ${depends.length > 0 ? depends.join(", ") : "none"}`,
+		});
+
+		this.killBlockedAgents();
+		const squad = store.loadSquad(this.squadId);
+		const runnable = target.status === "pending" && target.depends.every(
+			(dependency) => tasks.find((candidate) => candidate.id === dependency)?.status === "done",
+		);
+		const createdRunnableWork = runnable && !wasRunnable;
+		if (createdRunnableWork && squad && squad.status !== "paused" && squad.status !== "running") {
+			this.reopenSquadForWork();
+			await this.start();
+		} else if (squad?.status === "running") {
+			await this.start();
+		}
 		this.updateContext();
 	}
 
@@ -1434,6 +1530,7 @@ export class Scheduler {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) throw new Error(`Task not found: ${taskId}`);
 		if (task.status === "done") return;
+		if (task.status === "cancelled") throw new Error(`Task '${taskId}' is cancelled; resume it before marking it done.`);
 
 		if (this.pool.isRunning(taskId)) {
 			await this.pool.kill(taskId);
@@ -1467,14 +1564,45 @@ export class Scheduler {
 		this.updateContext();
 	}
 
-	/** Cancel a task */
+	/** Cancel one task after ensuring no live historical task still depends on it. */
 	async cancelTask(taskId: string): Promise<void> {
-		if (this.pool.isRunning(taskId)) {
-			await this.pool.kill(taskId);
+		const task = store.loadTask(this.squadId, taskId);
+		if (!task) throw new Error(`Task not found: ${taskId}`);
+		if (task.status === "cancelled") return;
+
+		const dependents = store.loadAllTasks(this.squadId)
+			.filter((candidate) => candidate.status !== "cancelled" && candidate.depends.includes(taskId))
+			.sort((left, right) => left.id.localeCompare(right.id));
+		if (dependents.length > 0) {
+			throw new Error([
+				`Cannot cancel task '${taskId}': it is still required by:`,
+				...dependents.map((dependent) => `- ${dependent.id} [${dependent.status}]`),
+				"",
+				'Update each dependent first with squad_modify action "set_dependencies",',
+				"then retry cancel_task. Cancellation does not rewrite or cascade dependencies.",
+			].join("\n"));
 		}
-		store.updateTaskStatus(this.squadId, taskId, "failed", {
-			error: "Cancelled by user",
+
+		if (this.pool.isRunning(taskId)) await this.pool.kill(taskId);
+		store.updateTaskStatus(this.squadId, taskId, "cancelled", {
+			error: null,
+			completed: store.now(),
 		});
+		store.appendMessage(this.squadId, taskId, {
+			ts: store.now(),
+			from: "system",
+			type: "status",
+			text: "Task cancelled by orchestrator",
+		});
+
+		const squad = store.loadSquad(this.squadId);
+		if (squad) {
+			if (squad.status === "done" || (squad.status === "review" && squad.review?.status !== "pending")) {
+				beginOrchestratorRework(squad);
+				store.saveSquad(squad);
+			}
+			this.checkSquadCompletion(store.loadAllTasks(this.squadId), squad);
+		}
 		this.updateContext();
 	}
 
