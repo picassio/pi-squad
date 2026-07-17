@@ -59,6 +59,19 @@ test("review gate names the original contract as authoritative and distrusts squ
 	assert.ok(gate.includes(value.goal));
 });
 
+test("file-spec review gate references exact durable bytes without reinlining the large contract", () => {
+	const value = squad();
+	value.goal = "SECRET_LARGE_GOAL";
+	value.spec = { schemaVersion: 1, sha256: "a".repeat(64), bytes: 500000, path: "/tmp/sq-review/spec/spec.v1.json", chunkBytes: 32768, chunkCount: 16 };
+	beginOrchestratorReview(value);
+	const gate = buildOrchestratorReviewGate(value, [{
+		id: "qa", title: "SECRET_TASK_TITLE", description: "SECRET_LARGE_DESCRIPTION", agent: "qa", status: "done", depends: [], created: value.created, started: null, completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+	}]);
+	assert.match(gate, /\/tmp\/sq-review\/spec\/spec\.v1\.json/);
+	assert.match(gate, /sha256=a{64}/);
+	assert.doesNotMatch(gate, /SECRET_LARGE_GOAL|SECRET_TASK_TITLE|SECRET_LARGE_DESCRIPTION/);
+});
+
 test("only evidence-backed orchestrator pass changes review to done", () => {
 	const value = squad();
 	beginOrchestratorReview(value);

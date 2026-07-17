@@ -395,3 +395,7 @@ src/
 ## License
 
 MIT
+
+## File-based squad specifications
+
+Large contracts may be started without inlining them: `squad({ specFile, specSha256 })`. The strict v1 JSON contract, size/artifact policy, canonical-byte publication, child-only `squad_spec_read` protocol, tool guard, durable task attestation, and legacy compatibility are specified in [`docs/file-spec-and-full-read-attestation-contract.md`](docs/file-spec-and-full-read-attestation-contract.md). The SHA-256 must be lowercase and match the exact file bytes; malformed, oversized, or artifact-integrity failures are rejected before scheduling.

@@ -1,3 +1,4 @@
+import * as path from "node:path";
 import type { Squad, Task } from "./types.js";
 
 export type OrchestratorReviewVerdict = "pass" | "pass_with_issues" | "fail";
@@ -99,15 +100,18 @@ export function buildOrchestratorReviewGate(squad: Squad, tasks: Task[]): string
 	const reviewAction = failed
 		? `This candidate was rejected. Do not submit another verdict yet. Start concrete rework in this same exact squad with squad_modify and squadId: "${squad.id}"; the failed evidence remains immutable history. After rework settles, a fresh REVIEW PENDING gate will require a new independent review.`
 		: `This candidate is awaiting its first verdict. Complete the checks below, then call squad_review for squadId: "${squad.id}".`;
-	const delegatedPlan = tasks
-		.map((task) => `- ${task.id} (${task.agent}): ${task.title}\n  ${task.description || "(no description)"}`)
-		.join("\n");
+	const goalReference = squad.spec
+		? `Canonical file spec at ${squad.spec.path} (sha256=${squad.spec.sha256}, bytes=${squad.spec.bytes}). Read and hash the exact file during review; its contract is intentionally not duplicated into this prompt.`
+		: squad.goal;
+	const delegatedPlan = squad.spec
+		? tasks.map((task) => `- ${task.id} (${task.agent}) [${task.status}] — task state: ${path.join(path.dirname(path.dirname(squad.spec!.path)), task.id, "task.json")}`).join("\n")
+		: tasks.map((task) => `- ${task.id} (${task.agent}): ${task.title}\n  ${task.description || "(no description)"}`).join("\n");
 
 	return `<squad_review_required>
 UNTRUSTED CANDIDATE WORK — INDEPENDENT ORCHESTRATOR REVIEW IS MANDATORY.
 
 Authoritative contract: re-read the user's ORIGINAL request and all later clarifications in this main-session conversation. The squad report and delegated task descriptions are claims, not proof and not substitutes for that contract.
-Recorded squad goal (secondary reference): ${squad.goal}
+Recorded squad goal (secondary reference): ${goalReference}
 Acceptance: ${reviewLabel}
 ${reviewAction}
 

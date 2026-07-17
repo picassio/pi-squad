@@ -14,7 +14,7 @@ import * as path from "node:path";
 import * as fs from "node:fs";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { Squad, Task, SquadConfig, PlannerOutput, SuspendedStallAttention } from "./types.js";
+import type { Squad, Task, SquadConfig, SquadAgentEntry, PlannerOutput, SuspendedStallAttention } from "./types.js";
 import { DEFAULT_SQUAD_CONFIG, THINKING_LEVELS } from "./types.js";
 import { Scheduler, formatSuspendedStallAttention, type SchedulerEvent, type SchedulerSpawnContext } from "./scheduler.js";
 import { runPlanner } from "./planner.js";
@@ -28,10 +28,18 @@ import { debug, logError } from "./logger.js";
 import { buildCompletionSummary, buildFailureSummary } from "./report.js";
 import { buildOrchestratorReviewGate, recordOrchestratorReview } from "./review.js";
 import { formatSuspendedAttention, getReviewPresentation } from "./presentation.js";
+import { prepareSpec, chunkRanges, isFileSpecTaskId, registerChildSpecReader, type PreparedSpec } from "./file-spec.js";
 
 // ============================================================================
 // State
 // ============================================================================
+
+interface InlineSquadStart {
+	goal: string;
+	agents?: Record<string, SquadAgentEntry>;
+	tasks?: Array<{ id: string; title: string; description?: string; agent: string; depends?: string[]; inheritContext?: boolean }>;
+	config?: { maxConcurrency?: number; autoUnblock?: boolean; maxRetries?: number };
+}
 
 /** Master switch — when false, all squad tools, hooks, and widget are disabled */
 let squadEnabled = true;
@@ -240,8 +248,8 @@ function resolveResumeSquad(cwd: string, explicitId?: string): Squad | null {
 // ============================================================================
 
 export default function (pi: ExtensionAPI) {
-	// Don't load in child agent processes (prevent recursive squad-in-squad)
-	if (process.env.PI_SQUAD_CHILD === "1") return;
+	// File-spec children load only the non-recursive reader and fail-closed guard.
+	if (process.env.PI_SQUAD_CHILD === "1") { registerChildSpecReader(pi); return; }
 
 	// Wire main-session thinking lookup (needs `pi`, guarded against stale API)
 	getMainSessionThinking = () => {
@@ -327,9 +335,12 @@ export default function (pi: ExtensionAPI) {
 			}).join("\n");
 
 			const reviewPresentation = getReviewPresentation(squad);
+			const squadReference = squad.spec
+				? `file spec sha256=${squad.spec.sha256} bytes=${squad.spec.bytes} path=${squad.spec.path}`
+				: squad.goal;
 			const squadContext = [
 				`<squad_status>`,
-				`Squad: ${squad.id} — ${squad.goal}`,
+				`Squad: ${squad.id} — ${squadReference}`,
 				`Status: ${squad.status} | ${formatTaskProgress(tasks)} | $${totalCost.toFixed(2)}`,
 				...(reviewPresentation ? [`Acceptance: ${reviewPresentation.label}`] : []),
 				taskLines,
@@ -388,16 +399,18 @@ export default function (pi: ExtensionAPI) {
 			PLAN_STRUCTURE_RULES.replace(/\n- /g, " ").replace(/^- /, ""),
 			"Plans are validated on submission — structural errors are rejected, rule violations come back as warnings.",
 		].join(" "),
-		promptSnippet: "squad({ goal, tasks?, agents? }): decompose complex work into parallel specialist agents → non-blocking, monitor via squad_status",
+		promptSnippet: "squad({ goal, tasks?, agents? } | { specFile, specSha256 }): start inline or canonical file-based squad → non-blocking",
 		promptGuidelines: [
 			"Use squad when work spans 2+ concerns (backend+frontend+tests+docs) or has natural parallelism",
+			"For large contracts, use only specFile + exact lowercase specSha256; never inline the same contract or large artifacts",
 			"Skip squad for single-file changes, quick fixes, or anything one agent finishes in minutes",
 			"Providing tasks yourself makes you the planner — follow the planner rules (contract task first, final QA task, 3-7 tasks)",
 			"Act on ⚠️ plan warnings in the response — fix with squad_modify or address at review",
 			"After starting a squad: report the plan and END YOUR TURN — never poll squad_status or sleep-wait; squad events wake you automatically",
 			"When agents finish, treat every squad report and QA verdict as untrusted; independently inspect the diff/source and rerun contract verification + integration/E2E, then call squad_review before reporting success",
 		],
-		parameters: Type.Object({
+		parameters: Type.Union([
+		Type.Object({
 			goal: Type.String({ description: "Complete original user outcome/acceptance contract the squad should accomplish. Preserve requirements and boundaries; this is shown during mandatory main-orchestrator review." }),
 			agents: Type.Optional(
 				Type.Record(
@@ -427,7 +440,12 @@ export default function (pi: ExtensionAPI) {
 					maxConcurrency: Type.Optional(Type.Number({ description: "Max parallel agents (default: 2)" })),
 				}),
 			),
-		}),
+		}, { additionalProperties: false }),
+		Type.Object({
+			specFile: Type.String({ minLength: 1, description: "Path to a strict v1 squad specification JSON file" }),
+			specSha256: Type.String({ pattern: "^[a-f0-9]{64}$", description: "SHA-256 of the exact source bytes" }),
+		}, { additionalProperties: false }),
+		]),
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!squadEnabled) return { content: [{ type: "text" as const, text: "Squad is disabled. Use /squad enable to re-enable." }], details: undefined };
@@ -442,13 +460,17 @@ export default function (pi: ExtensionAPI) {
 			// cwd may differ (e.g. when a relative --session-dir was used).
 			const rawSessionFile = ctx.sessionManager.getSessionFile();
 			const sessionFile = rawSessionFile ? path.resolve(rawSessionFile) : null;
-			const squadId = store.makeTaskId(params.goal);
-			if (store.squadExists(squadId)) {
-				const uniqueId = `${squadId}-${Date.now().toString(36)}`;
-				return await startSquad(uniqueId, params, ctx.cwd, squadSkillPaths, pi, sessionFile);
+			let prepared: PreparedSpec | undefined;
+			let effective: InlineSquadStart;
+			if ("specFile" in params) {
+				prepared = prepareSpec(params.specFile, params.specSha256, ctx.cwd);
+				effective = { goal: prepared.spec.goal, agents: prepared.spec.agents, tasks: prepared.spec.tasks, config: prepared.spec.config };
+			} else {
+				effective = params;
 			}
-
-			return await startSquad(squadId, params, ctx.cwd, squadSkillPaths, pi, sessionFile);
+			const baseId = store.makeTaskId(effective.goal) || `squad-${prepared?.sha256.slice(0, 12)}`;
+			const squadId = store.squadExists(baseId) ? `${baseId}-${Date.now().toString(36)}` : baseId;
+			return await startSquad(squadId, effective, ctx.cwd, squadSkillPaths, pi, sessionFile, prepared);
 		},
 	});
 
@@ -561,6 +583,13 @@ export default function (pi: ExtensionAPI) {
 			const squad = store.loadSquad(id);
 			if (!squad) {
 				return { content: [{ type: "text" as const, text: `Squad '${id}' not found.` }], details: undefined };
+			}
+			const attestationScheduler = schedulers.get(id) ?? new Scheduler(id, squadSkillPaths, schedulerSpawnContext);
+			if (!schedulers.has(id)) { schedulers.set(id, attestationScheduler); wireSchedulerEvents(pi, attestationScheduler, id); }
+			const invalidAttestations = await attestationScheduler.auditSpecAttestations();
+			if (invalidAttestations.length > 0) {
+				void attestationScheduler.start();
+				return { content: [{ type: "text" as const, text: `Review rejected: invalid canonical spec attestation for task(s): ${invalidAttestations.join(", ")}. Work was reopened.` }], details: undefined };
 			}
 
 			try {
@@ -735,7 +764,11 @@ export default function (pi: ExtensionAPI) {
 						return { content: [{ type: "text" as const, text: "Provide a task definition for add_task." }], details: undefined };
 					}
 					// Validate against the live squad: deps must exist, agent must exist
-					const existing = store.loadAllTasks(activeSquadId);
+					const targetSquad = store.loadSquad(squadId)!;
+					if (targetSquad.spec && !isFileSpecTaskId(params.task.id)) {
+						return { content: [{ type: "text" as const, text: `Invalid file-spec task id '${params.task.id}'. Use 1..64 lowercase letters/digits with internal hyphens.` }], details: undefined };
+					}
+					const existing = store.loadAllTasks(squadId);
 					const existingIds = new Set(existing.map((t) => t.id));
 					if (existingIds.has(params.task.id)) {
 						return { content: [{ type: "text" as const, text: `Task id '${params.task.id}' already exists in this squad.` }], details: undefined };
@@ -758,6 +791,7 @@ export default function (pi: ExtensionAPI) {
 						status: dependencies.every((dependency) => existing.find((candidate) => candidate.id === dependency)?.status === "done") ? "pending" : "blocked",
 						depends: dependencies,
 						...(params.task.inheritContext ? { inheritContext: true } : {}),
+						...(targetSquad.spec ? { fileSpecDelta: true } : {}),
 						created: store.now(),
 						started: null,
 						completed: null,
@@ -824,7 +858,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "pause": {
-					const squad = store.loadSquad(activeSquadId);
+					const squad = store.loadSquad(squadId);
 					if (squad) {
 						squad.status = "paused";
 						store.saveSquad(squad);
@@ -872,6 +906,15 @@ export default function (pi: ExtensionAPI) {
 				squad.status = "paused";
 				store.saveSquad(squad);
 			}
+		}
+
+		// Audit file-spec evidence on restart. Review/running/failed work is reopened;
+		// an explicitly paused squad remains paused and suspended/cancelled tasks stay untouched.
+		for (const squad of store.listSquadsForProject(ctx.cwd).filter((candidate) => candidate.spec && ["running", "failed", "paused", "review"].includes(candidate.status))) {
+			let scheduler = schedulers.get(squad.id);
+			if (!scheduler) { scheduler = new Scheduler(squad.id, squadSkillPaths, schedulerSpawnContext); schedulers.set(squad.id, scheduler); wireSchedulerEvents(pi, scheduler, squad.id); }
+			const invalid = await scheduler.auditSpecAttestations();
+			if (invalid.length > 0 && squad.status !== "paused") await scheduler.start();
 		}
 
 		// Reconstruct schedulers for explicit-suspension stalls without resuming any
@@ -923,7 +966,7 @@ export default function (pi: ExtensionAPI) {
 			if (done > 0) {
 				pi.sendMessage({
 					customType: "squad-paused",
-					content: `[squad] Found paused squad "${squad.id}" (${squad.goal}) — ${formatTaskProgress(tasks)}. ` +
+					content: `[squad] Found paused squad "${squad.id}" (${squad.spec ? `file spec sha256=${squad.spec.sha256}` : squad.goal}) — ${formatTaskProgress(tasks)}. ` +
 						`Use squad_modify with action "resume" to continue, or start a new squad.`,
 					display: true,
 				});
@@ -1757,23 +1800,12 @@ function openPanel(
 
 async function startSquad(
 	squadId: string,
-	params: {
-		goal: string;
-		agents?: Record<string, { model?: string; thinking?: string }>;
-		tasks?: Array<{
-			id: string;
-			title: string;
-			description?: string;
-			agent: string;
-			depends?: string[];
-			inheritContext?: boolean;
-		}>;
-		config?: { maxConcurrency?: number };
-	},
+	params: InlineSquadStart,
 	cwd: string,
 	skillPaths: string[],
 	pi: ExtensionAPI,
 	sessionFile: string | null = null,
+	preparedSpec?: PreparedSpec,
 ) {
 	let plan: PlannerOutput;
 
@@ -1791,7 +1823,8 @@ async function startSquad(
 		// Validate agent names — remap unknown agents to fullstack
 		for (const task of plan.tasks) {
 			const agentDef = store.loadAgentDef(task.agent, cwd);
-			if (!agentDef) {
+			if (!agentDef || agentDef.disabled) {
+				if (preparedSpec) throw new Error(`SPEC_MALFORMED: assigned agent '${task.agent}' is missing or disabled`);
 				const original = task.agent;
 				task.agent = "fullstack";
 				task.description = `[Note: agent "${original}" not found, remapped to fullstack]\n\n${task.description}`;
@@ -1809,7 +1842,7 @@ async function startSquad(
 	}
 
 	// Merge agent roster
-	const agents: Record<string, { model?: string; thinking?: string }> = { ...plan.agents };
+	const agents: Record<string, SquadAgentEntry> = { ...plan.agents };
 	if (params.agents) {
 		for (const [name, entry] of Object.entries(params.agents)) {
 			agents[name] = { ...agents[name], ...entry };
@@ -1829,6 +1862,8 @@ async function startSquad(
 	const config: SquadConfig = {
 		...DEFAULT_SQUAD_CONFIG,
 		...(params.config?.maxConcurrency ? { maxConcurrency: params.config.maxConcurrency } : {}),
+		...(typeof params.config?.autoUnblock === "boolean" ? { autoUnblock: params.config.autoUnblock } : {}),
+		...(typeof params.config?.maxRetries === "number" ? { maxRetries: params.config.maxRetries } : {}),
 	};
 
 	const squad: Squad = {
@@ -1840,12 +1875,18 @@ async function startSquad(
 		sessionFile,
 		agents,
 		config,
+		...(preparedSpec ? { spec: {
+			schemaVersion: 1 as const,
+			sha256: preparedSpec.sha256,
+			bytes: preparedSpec.raw.length,
+			path: path.join(store.getSquadDir(squadId), "spec", "spec.v1.json"),
+			chunkBytes: 32768 as const,
+			chunkCount: chunkRanges(preparedSpec.raw).length,
+		} } : {}),
 	};
 
-	store.saveSquad(squad);
-
-	// Create task files
-	for (const taskDef of plan.tasks) {
+	// Materialize task state in memory so file squads can publish spec+squad+tasks atomically.
+	const initialTasks: Task[] = plan.tasks.map((taskDef) => {
 		const task: Task = {
 			id: taskDef.id,
 			title: taskDef.title,
@@ -1861,10 +1902,13 @@ async function startSquad(
 			error: null,
 			usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
 		};
-		// Note: unknown dependency references are hard validation errors above,
-		// so blocked tasks here always have resolvable deps.
+		return task;
+	});
 
-		store.createTask(squadId, task);
+	if (preparedSpec) store.publishFileSquad(squad, initialTasks, preparedSpec.raw);
+	else {
+		store.saveSquad(squad);
+		for (const task of initialTasks) store.createTask(squadId, task);
 	}
 
 	// Start scheduler
@@ -1888,13 +1932,16 @@ async function startSquad(
 		logError("squad", `Scheduler start error: ${(err as Error).message}`);
 	});
 
-	// Build response
-	const taskSummary = plan.tasks
-		.map((t) => {
-			const deps = t.depends.length > 0 ? ` (depends: ${t.depends.join(", ")})` : "";
-			return `${t.id} → ${t.agent}: ${t.title}${deps}`;
-		})
-		.join("\n");
+	// Build response. File mode returns only the bounded descriptor; the canonical
+	// contract is never reflected back into the main model's transport.
+	const taskSummary = preparedSpec
+		? `Canonical spec: ${squad.spec!.path}\nSHA-256: ${squad.spec!.sha256}\nBytes: ${squad.spec!.bytes}\nTasks: ${plan.tasks.length}`
+		: plan.tasks
+			.map((t) => {
+				const deps = t.depends.length > 0 ? ` (depends: ${t.depends.join(", ")})` : "";
+				return `${t.id} → ${t.agent}: ${t.title}${deps}`;
+			})
+			.join("\n");
 
 	return {
 		content: [

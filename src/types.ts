@@ -123,6 +123,8 @@ export interface Squad {
 	/** Agent name → overrides. Keys must exist in .pi/squad/agents/ */
 	agents: Record<string, SquadAgentEntry>;
 	config: SquadConfig;
+	/** Immutable canonical contract for file-based squads; absent for legacy inline squads. */
+	spec?: { schemaVersion: 1; sha256: string; bytes: number; path: string; chunkBytes: 32768; chunkCount: number };
 	/** Mandatory independent main-session review; absent while rework is running. */
 	review?: SquadReview;
 	/** Completed prior review attempts retained as same-squad audit evidence. */
@@ -170,6 +172,8 @@ export interface Task {
 	usage: TaskUsage;
 	/** Durable Pi context for this task. Absent until its first process creates a session. */
 	session?: TaskSession;
+	/** Dynamic task delta created after immutable file-spec publication. */
+	fileSpecDelta?: boolean;
 	/** If this is a rework task, the original task ID it's fixing */
 	retryOf?: string;
 	/** How many times this task chain has been retried */
@@ -298,7 +302,7 @@ export interface SupervisorResult {
 // ============================================================================
 
 export interface PlannerOutput {
-	agents: Record<string, { model?: string; thinking?: string }>;
+	agents: Record<string, SquadAgentEntry>;
 	tasks: Array<{
 		id: string;
 		title: string;

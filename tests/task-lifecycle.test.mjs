@@ -452,3 +452,55 @@ test("task remains in_progress through low-level end and completes only after ag
 	assert.equal(store.loadTask(id, "settle").status, "done");
 	assert.equal(store.loadTask(id, "settle").output, report);
 });
+
+test("file-spec settlement without attestation reopens same task and never promotes candidate output", async () => {
+	const crypto = await import("node:crypto");
+	const id = `sq-file-attestation-${++counter}`; const taskId = "worker";
+	const squadDir = store.getSquadDir(id); const specPath = path.join(squadDir, "spec", "spec.v1.json");
+	const raw = Buffer.from('{"schemaVersion":1,"goal":"exact"}\n'); const sha = crypto.createHash("sha256").update(raw).digest("hex");
+	fs.mkdirSync(path.dirname(specPath), { recursive: true }); fs.writeFileSync(specPath, raw);
+	store.saveSquad({ id, goal: "exact", status: "running", created: store.now(), cwd: tempHome, agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 }, spec: { schemaVersion: 1, sha256: sha, bytes: raw.length, path: specPath, chunkBytes: 32768, chunkCount: 1 } });
+	store.createTask(id, { id: taskId, title: "worker", description: "from canonical spec", agent: "backend", status: "in_progress", depends: [], created: store.now(), started: store.now(), completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 } });
+	store.appendMessage(id, taskId, { ts: store.now(), from: "backend", type: "text", text: "candidate output must not be accepted" });
+	const scheduler = new Scheduler(id, []);
+	await assert.rejects(() => scheduler.completeTask(taskId, "manual candidate"), /attestation/i, "file-spec manual completion must require attestation");
+	scheduler.handleAgentEvent({ type: "agent_settled", taskId, agentName: "backend", data: { turnCount: 1, toolCallCount: 1 } });
+	await new Promise(resolve => setTimeout(resolve, 20));
+	const task = store.loadTask(id, taskId);
+	assert.equal(task.status, "pending"); assert.equal(task.completed, null); assert.equal(task.output, null);
+	assert.match(task.error, /not fully delivered|attestation/i);
+	assert.ok(store.loadMessages(id, taskId).some(message => /Completion rejected/.test(message.text)));
+});
+
+test("file-spec child bootstrap does not inline canonical goal or initial task descriptions", async () => {
+	const { buildAgentSystemPrompt } = await import("../src/protocol.ts");
+	const squadId = `sq-file-prompt-${++counter}`;
+	const squad = { id: squadId, goal: "SECRET_CANONICAL_GOAL", status: "running", created: store.now(), cwd: tempHome, agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 }, spec: { schemaVersion: 1, sha256: "a".repeat(64), bytes: 40000, path: path.join(tempHome,"spec.json"), chunkBytes: 32768, chunkCount: 2 } };
+	store.saveSquad(squad);
+	const task = { id: "initial", title: "SECRET_TASK_TITLE", description: "SECRET_TASK_DESCRIPTION", agent: "backend", status: "pending", depends: [], created: store.now(), started: null, completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 } };
+	store.createTask(squadId, task);
+	const agentDef = store.loadAgentDef("backend", tempHome);
+	const prompt = buildAgentSystemPrompt({ squadId, squad, task, agentDef, modifiedFiles: {}, queuedMessages: [] });
+	assert.match(prompt,/File-spec squad bootstrap/); assert.match(prompt,/a{64}/); assert.doesNotMatch(prompt,/SECRET_CANONICAL_GOAL|SECRET_TASK_TITLE|SECRET_TASK_DESCRIPTION/);
+	const delta = { ...task, id: "later", title: "DYNAMIC_TITLE", description: "DYNAMIC_DESCRIPTION", fileSpecDelta: true };
+	store.createTask(squadId, delta);
+	const deltaPrompt = buildAgentSystemPrompt({ squadId, squad, task: delta, agentDef, modifiedFiles: {}, queuedMessages: [] });
+	assert.match(deltaPrompt,/DYNAMIC_TITLE/); assert.match(deltaPrompt,/DYNAMIC_DESCRIPTION/);
+});
+
+test("tampered canonical spec quarantines pending scheduling before child spawn", async () => {
+	const crypto = await import("node:crypto"); const id=`sq-canonical-quarantine-${++counter}`; const specPath=path.join(store.getSquadDir(id),"spec","spec.v1.json"); const raw=Buffer.from('{"schemaVersion":1}\n'); const sha=crypto.createHash("sha256").update(raw).digest("hex"); fs.mkdirSync(path.dirname(specPath),{recursive:true}); fs.writeFileSync(specPath,raw);
+	store.saveSquad({id,goal:"quarantine",status:"running",created:store.now(),cwd:tempHome,agents:{backend:{}},config:{maxConcurrency:1,autoUnblock:true,reviewOnComplete:true,maxRetries:1},spec:{schemaVersion:1,sha256:sha,bytes:raw.length,path:specPath,chunkBytes:32768,chunkCount:1}});
+	store.createTask(id,{id:"pending-task",title:"pending",description:"pending",agent:"backend",status:"pending",depends:[],created:store.now(),started:null,completed:null,output:null,error:null,usage:{inputTokens:0,outputTokens:0,cost:0,turns:0}});
+	fs.writeFileSync(specPath,"tampered"); const scheduler=new Scheduler(id,[]); assert.deepEqual(await scheduler.auditSpecAttestations(),["pending-task"]); await scheduler.start(); await new Promise(resolve=>setTimeout(resolve,25)); assert.equal(store.loadTask(id,"pending-task").status,"pending"); assert.match(store.loadTask(id,"pending-task").error,/integrity/i); assert.equal(scheduler.getPool().getRunningAgents().length,0); await scheduler.stop();
+});
+
+test("file-spec review restart audit reopens unattested work and descendant recovery while preserving whole-squad pause", async () => {
+	for (const status of ["review", "paused"]) {
+		const crypto = await import("node:crypto"); const id = `sq-audit-${status}-${++counter}`; const specPath = path.join(store.getSquadDir(id),"spec","spec.v1.json"); const raw=Buffer.from('{"schemaVersion":1}\n'); const sha=crypto.createHash("sha256").update(raw).digest("hex"); fs.mkdirSync(path.dirname(specPath),{recursive:true});fs.writeFileSync(specPath,raw);
+		store.saveSquad({id,goal:"audit",status,created:store.now(),cwd:tempHome,agents:{backend:{}},config:{maxConcurrency:1,autoUnblock:true,reviewOnComplete:true,maxRetries:1},spec:{schemaVersion:1,sha256:sha,bytes:raw.length,path:specPath,chunkBytes:32768,chunkCount:1},...(status==="review"?{review:{status:"pending",requestedAt:store.now(),completedAt:null,verdict:null,contractChecks:[],diffReview:"",verificationEvidence:[],integrationEvidence:"",issues:[]}}:{})});
+		store.createTask(id,{id:"done-task",title:"done",description:"done",agent:"backend",status:"done",depends:[],created:store.now(),started:store.now(),completed:store.now(),output:"unattested",error:null,usage:{inputTokens:0,outputTokens:0,cost:0,turns:1}});
+		store.createTask(id,{id:"done-descendant",title:"descendant",description:"descendant",agent:"backend",status:"done",depends:["done-task"],created:store.now(),started:store.now(),completed:store.now(),output:"also unattested",error:null,usage:{inputTokens:0,outputTokens:0,cost:0,turns:1}});
+		const invalid=await new Scheduler(id,[]).auditSpecAttestations();assert.deepEqual(invalid.sort(),["done-descendant","done-task"]);assert.equal(store.loadTask(id,"done-task").status,"pending");assert.equal(store.loadTask(id,"done-descendant").status,"blocked");assert.equal(store.loadSquad(id).status,status==="review"?"running":"paused");
+	}
+});

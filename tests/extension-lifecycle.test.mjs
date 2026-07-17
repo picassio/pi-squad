@@ -4,6 +4,7 @@ import { registerHooks } from "node:module";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-squad-extension-lifecycle-"));
@@ -49,7 +50,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const args = process.argv.slice(2);
 const log = process.env.PI_SQUAD_FAKE_RPC_LOG;
-fs.appendFileSync(log, JSON.stringify({ kind: "argv", args }) + "\\n");
+fs.appendFileSync(log, JSON.stringify({ kind: "argv", args, specEnv: {
+ squadId: process.env.PI_SQUAD_ID, taskId: process.env.PI_SQUAD_TASK_ID,
+ path: process.env.PI_SQUAD_SPEC_PATH, sha256: process.env.PI_SQUAD_SPEC_SHA256,
+ bytes: process.env.PI_SQUAD_SPEC_BYTES, chunkBytes: process.env.PI_SQUAD_SPEC_CHUNK_BYTES,
+} }) + "\\n");
 const sessionIndex = args.indexOf("--session");
 const dirIndex = args.indexOf("--session-dir");
 const sessionFile = sessionIndex >= 0
@@ -841,4 +846,64 @@ test("restart delivers one durable suspended-stall wake and exact resume clears 
 	assert.equal(store.loadTask(squadId, "blocked-grandchild-exact").status, "blocked");
 	assert.equal(store.loadSquad(squadId).suspendedStallAttention, undefined);
 	await emit(restartedApi, "session_shutdown");
+});
+
+test("file-spec publication rejects inconsistent metadata and unsafe task paths without partial discovery", () => {
+	const raw = Buffer.from("{\"schemaVersion\":1}\n");
+	const id = "atomic-file-publish";
+	const specPath = path.join(store.getSquadDir(id), "spec", "spec.v1.json");
+	const baseSquad = {
+		id, goal: "atomic publish", status: "running", created: store.now(), cwd: tempHome, agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+		spec: { schemaVersion: 1, sha256: "0".repeat(64), bytes: raw.length, path: specPath, chunkBytes: 32768, chunkCount: 1 },
+	};
+	const baseTask = { id: "safe-task", title: "safe", description: "safe", agent: "backend", status: "pending", depends: [], created: store.now(), started: null, completed: null, output: null, error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 } };
+	assert.throws(() => store.publishFileSquad(baseSquad, [baseTask], raw), /PUBLISH_FAILED.*canonical bytes/);
+	assert.equal(fs.existsSync(store.getSquadDir(id)), false);
+	const validSquad = { ...baseSquad, spec: { ...baseSquad.spec, sha256: crypto.createHash("sha256").update(raw).digest("hex") } };
+	assert.throws(() => store.publishFileSquad(validSquad, [{ ...baseTask, id: "../escape" }], raw), /PUBLISH_FAILED.*unsafe/);
+	assert.equal(fs.existsSync(store.getSquadDir(id)), false);
+	assert.equal(store.listSquads().includes(id), false);
+	assert.equal(fs.readdirSync(store.getSquadRoot()).some(entry => entry.startsWith(`${id}.creating.`)), false);
+});
+
+test("cancelled file-spec needs no attestation: public call publishes exact bytes and child manifest", async () => {
+	const crypto = await import("node:crypto");
+	const backendDef = store.loadAgentDef("backend", tempHome); const originalTools = backendDef.tools; backendDef.tools = ["bash"]; store.saveAgentDef(backendDef);
+	const api = createFakeExtensionApi(); registerExtension(api);
+	const ctx = { hasUI: false, cwd: tempHome, sessionManager: { getSessionFile: () => null } };
+	const spec = {
+		schemaVersion: 1,
+		goal: "File API child-process integration",
+		tasks: [{ id: "file-worker", title: "File worker", description: "Goal: verify file transport. Verify: npm test", agent: "backend", depends: [], inheritContext: false, artifactRefs: [] }],
+		agents: { backend: { model: null, thinking: null } },
+		config: { maxConcurrency: 1, autoUnblock: true, maxRetries: 1 },
+		artifacts: [],
+	};
+	const raw = Buffer.from(JSON.stringify(spec, null, 2) + "\n");
+	const sha256 = crypto.createHash("sha256").update(raw).digest("hex");
+	const specFile = path.join(tempHome, "large-contract.json"); fs.writeFileSync(specFile, raw);
+	const before = new Set(store.listSquads());
+	await assert.rejects(() => api.tools.get("squad").execute("bad-file", { specFile, specSha256: "0".repeat(64) }, undefined, undefined, ctx), /SPEC_HASH_MISMATCH/);
+	assert.deepEqual(new Set(store.listSquads()), before, "hash rejection publishes no discoverable squad");
+	const result = await api.tools.get("squad").execute("good-file", { specFile, specSha256: sha256 }, undefined, undefined, ctx);
+	assert.match(result.content[0].text, /started with 1 tasks/);
+	assert.match(result.content[0].text, new RegExp(`SHA-256: ${sha256}`));
+	assert.doesNotMatch(result.content[0].text, /File worker|Goal: verify file transport/,
+		"file start response must stay descriptor-sized instead of reflecting task contracts into the main session");
+	const created = store.listSquads().map(id => store.loadSquad(id)).find(squad => squad?.goal === spec.goal);
+	assert.ok(created?.spec);
+	assert.deepEqual(fs.readFileSync(created.spec.path), raw, "canonical publication preserves every byte");
+	assert.equal(created.spec.sha256, sha256);
+	await waitFor(() => readRpcLog().some(record => record.kind === "argv" && record.specEnv?.squadId === created.id), "file child spawn env");
+	const spawn = readRpcLog().find(record => record.kind === "argv" && record.specEnv?.squadId === created.id);
+	assert.deepEqual(spawn.specEnv, { squadId: created.id, taskId: "file-worker", path: created.spec.path, sha256, bytes: String(raw.length), chunkBytes: "32768" });
+	const toolsIndex = spawn.args.indexOf("--tools"); assert.ok(toolsIndex >= 0); assert.equal(spawn.args[toolsIndex + 1], "bash,squad_spec_read", "file reader is force-added to child tool allowlists");
+	await api.tools.get("squad").execute("collision-file", { specFile, specSha256: sha256 }, undefined, undefined, ctx);
+	const collision = store.listSquads().map(id => store.loadSquad(id)).find(squad => squad?.goal === spec.goal && squad.id !== created.id);
+	assert.ok(collision?.id.startsWith(`${created.id}-`), "an existing published ID resolves to a distinct safe directory");
+	assert.deepEqual(fs.readFileSync(collision.spec.path), raw);
+	await api.tools.get("squad_modify").execute("cancel-collision", { squadId: collision.id, action: "cancel" }, undefined, undefined, ctx);
+	await api.tools.get("squad_modify").execute("cancel-file", { squadId: created.id, action: "cancel" }, undefined, undefined, ctx);
+	await emit(api, "session_shutdown"); backendDef.tools = originalTools; store.saveAgentDef(backendDef);
 });

@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type {
 	AgentDef,
 	KnowledgeEntry,
@@ -314,13 +314,50 @@ export function saveSquad(squad: Squad): void {
 	writeJsonAtomic(getSquadFilePath(squad.id), squad);
 }
 
+/** Atomically publish a new file-spec squad, canonical bytes and initial tasks as one directory rename. */
+export function publishFileSquad(squad: Squad, tasks: Task[], canonicalBytes: Buffer): void {
+	if (!squad.spec) throw new Error("PUBLISH_FAILED: file squad is missing spec metadata");
+	const root = path.resolve(getSquadRoot()); ensureDir(root);
+	if (!/^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/.test(squad.id)) throw new Error(`PUBLISH_FAILED: unsafe squad id ${squad.id}`);
+	const finalDir = path.resolve(getSquadDir(squad.id));
+	if (path.dirname(finalDir) !== root) throw new Error(`PUBLISH_FAILED: squad destination escapes root`);
+	const expectedSpecPath = path.join(finalDir, "spec", "spec.v1.json");
+	if (path.resolve(squad.spec.path) !== expectedSpecPath || canonicalBytes.length !== squad.spec.bytes || createHash("sha256").update(canonicalBytes).digest("hex") !== squad.spec.sha256) throw new Error("PUBLISH_FAILED: canonical bytes or destination do not match spec metadata");
+	const taskIds = new Set<string>();
+	for (const task of tasks) {
+		if (!/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(task.id) || taskIds.has(task.id)) throw new Error(`PUBLISH_FAILED: unsafe or duplicate task id ${task.id}`);
+		taskIds.add(task.id);
+	}
+	if (fs.existsSync(finalDir)) throw new Error(`PUBLISH_FAILED: squad ${squad.id} already exists`);
+	const stagingDir = path.join(root, `${squad.id}.creating.${randomUUID()}`);
+	fs.mkdirSync(stagingDir, { mode: 0o700 });
+	try {
+		const writeDurable = (filePath: string, content: string): void => { const fd = fs.openSync(filePath, "wx", 0o600); try { fs.writeFileSync(fd, content); fs.fsyncSync(fd); } finally { fs.closeSync(fd); } };
+		const specDir = path.join(stagingDir, "spec"); fs.mkdirSync(specDir, { mode: 0o700 });
+		const specPath = path.join(specDir, "spec.v1.json"); const specFd = fs.openSync(specPath, "wx", 0o600);
+		try { fs.writeFileSync(specFd, canonicalBytes); fs.fsyncSync(specFd); } finally { fs.closeSync(specFd); }
+		try { fs.chmodSync(specPath, 0o400); } catch { /* Windows/best effort */ }
+		for (const task of tasks) {
+			const taskDir = path.join(stagingDir, task.id); fs.mkdirSync(taskDir, { mode: 0o700 });
+			writeDurable(path.join(taskDir, "task.json"), JSON.stringify(task, null, 2) + "\n");
+		}
+		writeDurable(path.join(stagingDir, "squad.json"), JSON.stringify(squad, null, 2) + "\n");
+		for (const dir of [specDir, stagingDir]) { try { const fd = fs.openSync(dir, fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } } catch { /* directory fsync unavailable */ } }
+		fs.renameSync(stagingDir, finalDir);
+		try { const fd = fs.openSync(root, fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } } catch { /* directory fsync unavailable */ }
+	} catch (error) {
+		try { fs.rmSync(stagingDir, { recursive: true, force: true }); } catch { /* preserve original failure */ }
+		throw new Error(`PUBLISH_FAILED: ${(error as Error).message}`);
+	}
+}
+
 export function listSquads(): string[] {
 	const root = getSquadRoot();
 	if (!fs.existsSync(root)) return [];
 	return fs
 		.readdirSync(root)
 		.filter((entry) => {
-			if (entry === "agents" || entry === "memory.jsonl") return false;
+			if (entry === "agents" || entry === "memory.jsonl" || entry.includes(".creating.")) return false;
 			const squadFile = path.join(root, entry, "squad.json");
 			return fs.existsSync(squadFile);
 		});

@@ -311,6 +311,27 @@ export function buildAgentSystemPrompt(options: ProtocolBuildOptions): string {
 	const { squadId, squad, task, agentDef, modifiedFiles, queuedMessages } = options;
 	const allTasks = loadAllTasks(squadId);
 
+	if (squad.spec) {
+		const manifest = [
+			"# File-spec squad bootstrap",
+			`Squad ID: ${squad.id}`,
+			`Task ID: ${task.id}`,
+			`Spec SHA-256: ${squad.spec.sha256}`,
+			`Spec bytes: ${squad.spec.bytes}`,
+			`Chunk count: ${squad.spec.chunkCount}`,
+			"Read every canonical chunk with squad_spec_read before using normal tools or completing the task.",
+		].join("\n");
+		const fileSections = [
+			manifest,
+			buildAgentIdentity(agentDef),
+			...(task.fileSpecDelta ? [buildTaskSection(task), buildReworkContext(task, squadId)] : []),
+			buildChainContext(task, allTasks, squadId),
+			buildKnowledgeSection(squadId),
+			buildQueuedMessages(queuedMessages),
+		].filter((section) => section.length > 0);
+		return fileSections.join("\n---\n\n");
+	}
+
 	const sections = [
 		buildSquadProtocol(task.agent, agentDef, squad),
 		buildAgentIdentity(agentDef),

@@ -146,8 +146,9 @@ export class AgentPool {
 		sessionDir?: string;
 		/** Fork the given session file so a new task inherits main-session context. */
 		forkSession?: { file: string; sessionDir: string };
+		spec?: { squadId: string; path: string; sha256: string; bytes: number; chunkBytes: number };
 	}): Promise<AgentProcess> {
-		const { taskId, agentDef, protocolOptions, cwd, skillPaths, resumeSession, sessionDir, forkSession } = options;
+		const { taskId, agentDef, protocolOptions, cwd, skillPaths, resumeSession, sessionDir, forkSession, spec } = options;
 
 		// Kill existing process for this task if any
 		if (this.agents.has(taskId)) {
@@ -161,7 +162,7 @@ export class AgentPool {
 		fs.writeFileSync(promptFile, systemPrompt, "utf-8");
 
 		// Build pi CLI args
-		const args = buildPiArgs(agentDef, promptFile, skillPaths, { resumeSession, sessionDir, forkSession });
+		const args = buildPiArgs(agentDef, promptFile, skillPaths, { resumeSession, sessionDir, forkSession }, Boolean(spec));
 
 		// Spawn pi process — set env var to prevent recursive squad extension loading
 		const invocation = getPiInvocation(["--mode", "rpc", ...args]);
@@ -169,7 +170,14 @@ export class AgentPool {
 		const proc = spawn(invocation.command, invocation.args, {
 			cwd,
 			stdio: ["pipe", "pipe", "pipe"],
-			env: { ...process.env, PI_SQUAD_CHILD: "1" },
+			env: { ...process.env, PI_SQUAD_CHILD: "1", ...(spec ? {
+				PI_SQUAD_ID: spec.squadId,
+				PI_SQUAD_TASK_ID: taskId,
+				PI_SQUAD_SPEC_PATH: spec.path,
+				PI_SQUAD_SPEC_SHA256: spec.sha256,
+				PI_SQUAD_SPEC_BYTES: String(spec.bytes),
+				PI_SQUAD_SPEC_CHUNK_BYTES: String(spec.chunkBytes),
+			} : {}) },
 		});
 
 		const activity: AgentActivity = {
@@ -524,6 +532,7 @@ function buildPiArgs(
 		sessionDir?: string;
 		forkSession?: { file: string; sessionDir: string };
 	},
+	fileSpec = false,
 ): string[] {
 	const { resumeSession, sessionDir, forkSession } = sessionOptions;
 	if (resumeSession && forkSession) throw new Error("Cannot resume and fork a task session simultaneously");
@@ -547,7 +556,10 @@ function buildPiArgs(
 	}
 
 	if (agentDef.tools && agentDef.tools.length > 0) {
-		args.push("--tools", agentDef.tools.join(","));
+		const tools = fileSpec && !agentDef.tools.includes("squad_spec_read")
+			? [...agentDef.tools, "squad_spec_read"]
+			: agentDef.tools;
+		args.push("--tools", tools.join(","));
 	}
 
 	for (const skillPath of skillPaths) {

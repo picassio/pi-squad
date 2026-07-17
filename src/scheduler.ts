@@ -16,6 +16,7 @@ import { AgentPool, type AgentEvent } from "./agent-pool.js";
 import { Monitor } from "./monitor.js";
 import { Router } from "./router.js";
 import * as store from "./store.js";
+import { isFileSpecTaskId, validateCanonicalSpec, validateTaskSpecAttestation } from "./file-spec.js";
 import { debug, logError } from "./logger.js";
 import { buildAgentSystemPrompt } from "./protocol.js";
 import { buildAdvisorConsultText, formatAdvisorSteerMessage, adviceNeedsHuman, type AdvisorConsultInput } from "./advisor.js";
@@ -211,6 +212,29 @@ export class Scheduler {
 		}
 	}
 
+	/** Revalidate durable file-spec completion evidence after parent restart/review recovery. */
+	async auditSpecAttestations(): Promise<string[]> {
+		const squad = store.loadSquad(this.squadId); if (!squad?.spec) return [];
+		const tasks = store.loadAllTasks(this.squadId);
+		if (!validateCanonicalSpec(squad)) {
+			const quarantined = tasks.filter((task) => task.status !== "cancelled");
+			for (const task of quarantined) {
+				if (task.status === "done") await this.invalidateDescendants(task.id);
+				if (task.status === "in_progress" || task.status === "done") store.updateTaskStatus(this.squadId, task.id, "pending", { completed: null, output: null, error: "Canonical spec integrity failure" });
+				else store.updateTaskStatus(this.squadId, task.id, task.status, { error: "Canonical spec integrity failure" });
+			}
+			return quarantined.map((task) => task.id);
+		}
+		const invalid = tasks.filter((task) => task.status === "done" && !validateTaskSpecAttestation(squad, task));
+		for (const task of invalid) {
+			store.updateTaskStatus(this.squadId, task.id, "pending", { completed: null, output: null, error: "Missing or invalid canonical spec read attestation" });
+			store.appendMessage(this.squadId, task.id, { ts: store.now(), from: "system", type: "status", text: "Completion invalidated after attestation audit" });
+			await this.invalidateDescendants(task.id);
+		}
+		if (invalid.length > 0 && squad.status === "review") { squad.status = "running"; delete squad.review; store.saveSquad(squad); }
+		return invalid.map((task) => task.id);
+	}
+
 	/** Get references for external use */
 	getPool(): AgentPool {
 		return this.pool;
@@ -308,6 +332,12 @@ export class Scheduler {
 		if (!this.running) return;
 		const squad = store.loadSquad(this.squadId);
 		if (!squad) return;
+		// Canonical integrity is a scheduling precondition, not merely a completion check.
+		if (squad.spec && !validateCanonicalSpec(squad)) {
+			await this.auditSpecAttestations();
+			debug("squad-scheduler", "reconcile: canonical spec integrity failure — scheduling quarantined");
+			return;
+		}
 
 		const tasks = store.loadAllTasks(this.squadId);
 
@@ -387,8 +417,8 @@ export class Scheduler {
 		}
 
 		const squad = store.loadSquad(this.squadId);
-		if (!squad || squad.status !== "running") {
-			debug("squad-scheduler", `scheduleReadyTasks: squad status=${squad?.status}, skipping`);
+		if (!squad || squad.status !== "running" || (squad.spec && !validateCanonicalSpec(squad))) {
+			debug("squad-scheduler", `scheduleReadyTasks: squad unavailable, inactive, or canonical integrity invalid; status=${squad?.status}`);
 			return;
 		}
 
@@ -536,6 +566,7 @@ export class Scheduler {
 				},
 				cwd: squad.cwd,
 				skillPaths: this.skillPaths,
+				...(squad.spec ? { spec: { squadId: squad.id, path: squad.spec.path, sha256: squad.spec.sha256, bytes: squad.spec.bytes, chunkBytes: squad.spec.chunkBytes } } : {}),
 				...(resumeSession
 					? { resumeSession }
 					: forkSessionFile
@@ -684,16 +715,25 @@ export class Scheduler {
 		entries: TaskMailboxEntry[],
 		legacySeed?: { messages: TaskMessage[]; output: string | null },
 	): string {
-		const lines = resumed
+		const fileSpec = store.loadSquad(this.squadId)?.spec;
+		const lines = fileSpec
 			? [
-					`Resume your existing task: ${task.title}`,
-					"Continue from the durable Pi session context. Do not restart the task from scratch.",
+					`${resumed ? "Resume" : "Start"} file-spec squad task ${task.id}.`,
+					`Canonical spec: sha256=${fileSpec.sha256} bytes=${fileSpec.bytes} chunks=${fileSpec.chunkCount}.`,
+					"Use squad_spec_read to receive every canonical chunk before normal tools or completion.",
+					...(task.fileSpecDelta ? ["", `Dynamic task delta: ${task.title}`, task.description] : []),
+					...(resumed ? ["Continue from this task's durable Pi session and existing read coverage."] : []),
 				]
-			: [
-					`Your task: ${task.title}`,
-					"",
-					task.description || "",
-				];
+			: resumed
+				? [
+						`Resume your existing task: ${task.title}`,
+						"Continue from the durable Pi session context. Do not restart the task from scratch.",
+					]
+				: [
+						`Your task: ${task.title}`,
+						"",
+						task.description || "",
+					];
 
 		if (legacySeed) {
 			const pendingIds = new Set(entries.map((entry) => entry.id));
@@ -854,8 +894,17 @@ export class Scheduler {
 			}
 
 			case "agent_settled": {
-				const status = store.loadTask(this.squadId, event.taskId)?.status;
+				const settledTask = store.loadTask(this.squadId, event.taskId);
+				const status = settledTask?.status;
 				if (status === "cancelled" || status === "suspended") return;
+				const settledSquad = store.loadSquad(this.squadId);
+				if (settledTask && settledSquad && !validateTaskSpecAttestation(settledSquad, settledTask)) {
+					store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null, output: null, error: "Canonical squad spec was not fully delivered; read all chunks with squad_spec_read" });
+					store.appendMessage(this.squadId, event.taskId, { ts: store.now(), from: "system", type: "status", text: "Completion rejected: missing or invalid spec-read-attestation; reopening same task session" });
+					if (this.running) void this.reconcile();
+					this.updateContext();
+					return;
+				}
 				// A mailbox entry not acknowledged by Pi outranks this run's candidate
 				// completion. Reopen the same session so accepted-at-least-once delivery
 				// occurs before the task can become done.
@@ -913,7 +962,12 @@ export class Scheduler {
 
 		// Extract output from last messages
 		const messages = store.loadMessages(this.squadId, taskId);
+		const squad = store.loadSquad(this.squadId);
+		const rejectedAt = squad?.spec
+			? messages.reduce((last, message, index) => message.from === "system" && message.type === "status" && message.text.startsWith("Completion rejected: missing or invalid spec-read-attestation") ? index : last, -1)
+			: -1;
 		const agentMessages = messages
+			.slice(rejectedAt + 1)
 			.filter((m) => m.from === task.agent && (m.type === "text" || m.type === "done"));
 		const output = agentMessages.map((m) => m.text).join("\n");
 
@@ -1117,6 +1171,11 @@ export class Scheduler {
 
 			// Create rework task for the original agent
 			const reworkId = `${originalId}-fix-${fixN}`;
+			const retestId = `${task.id}-retest-${fixN}`;
+			if (squad.spec && (!isFileSpecTaskId(reworkId) || !isFileSpecTaskId(retestId))) {
+				this.handleTaskFailed(task.id, `Generated file-spec rework IDs exceed the safe task-ID contract: ${reworkId}, ${retestId}`);
+				return true;
+			}
 			const reworkTask: Task = {
 				id: reworkId,
 				title: `Fix: ${implTask.title} (attempt ${fixN})`,
@@ -1125,6 +1184,7 @@ export class Scheduler {
 				status: "pending",
 				depends: [],
 				...(implTask.inheritContext ? { inheritContext: true } : {}),
+				...(squad.spec ? { fileSpecDelta: true } : {}),
 				created: store.now(),
 				started: null,
 				completed: null,
@@ -1138,7 +1198,6 @@ export class Scheduler {
 			store.createTask(this.squadId, reworkTask);
 
 			// Create retest task for QA
-			const retestId = `${task.id}-retest-${fixN}`;
 			const retestTask: Task = {
 				id: retestId,
 				title: `Re-test: ${implTask.title} (after fix ${fixN})`,
@@ -1146,6 +1205,7 @@ export class Scheduler {
 				agent: task.agent,
 				status: "blocked",
 				depends: [reworkId],
+				...(squad.spec ? { fileSpecDelta: true } : {}),
 				created: store.now(),
 				started: null,
 				completed: null,
@@ -1226,6 +1286,18 @@ export class Scheduler {
 
 	private checkSquadCompletion(tasks: Task[], squad: Squad): void {
 		if (tasks.length === 0) return;
+
+		const invalidDone = tasks.filter((task) => task.status === "done" && !validateTaskSpecAttestation(squad, task));
+		if (invalidDone.length > 0) {
+			for (const task of invalidDone) {
+				store.updateTaskStatus(this.squadId, task.id, "pending", { completed: null, output: null, error: "Missing or invalid canonical spec read attestation" });
+				store.appendMessage(this.squadId, task.id, { ts: store.now(), from: "system", type: "status", text: "Completion invalidated: canonical spec attestation is missing or invalid" });
+				void this.invalidateDescendants(task.id);
+			}
+			if (squad.status === "review") { squad.status = "running"; delete squad.review; store.saveSquad(squad); }
+			if (this.running) void this.reconcile();
+			return;
+		}
 
 		const relevant = tasks.filter((task) => task.status !== "cancelled");
 		const allDone = relevant.every((task) => task.status === "done");
@@ -1617,6 +1689,8 @@ export class Scheduler {
 		if (!task) throw new Error(`Task not found: ${taskId}`);
 		if (task.status === "done") return;
 		if (task.status === "cancelled") throw new Error(`Task '${taskId}' is cancelled; resume it before marking it done.`);
+		const squad = store.loadSquad(this.squadId);
+		if (squad && !validateTaskSpecAttestation(squad, task)) throw new Error(`Task '${taskId}' cannot complete: missing or invalid canonical spec read attestation.`);
 
 		if (this.pool.isRunning(taskId)) {
 			await this.pool.kill(taskId);
