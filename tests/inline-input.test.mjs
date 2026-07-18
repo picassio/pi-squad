@@ -99,6 +99,39 @@ test("squad-plan validator accepts a strict v1 spec and prints its exact sha256"
 	}
 });
 
+test("squad-plan validator works when installed under node_modules", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-squad-plan-nm-"));
+	try {
+		// Simulate an installed package: node refuses type stripping under
+		// node_modules, so the validator must stage sources elsewhere.
+		const pkgDir = path.join(dir, "node_modules", "pi-squad");
+		fs.mkdirSync(path.join(pkgDir, "src", "skills", "squad-plan"), { recursive: true });
+		for (const file of ["file-spec.ts", "types.ts"]) {
+			fs.copyFileSync(path.join(repoRoot, "src", file), path.join(pkgDir, "src", file));
+		}
+		const installedValidator = path.join(pkgDir, "src", "skills", "squad-plan", "validate-spec.mjs");
+		fs.copyFileSync(validator, installedValidator);
+
+		const spec = {
+			schemaVersion: 1,
+			goal: "Validate from an installed node_modules path",
+			tasks: [
+				{ id: "only-task", title: "Only task", description: "", agent: "qa", depends: [], inheritContext: false, artifactRefs: [] },
+			],
+			agents: { qa: { model: null, thinking: null } },
+			config: { maxConcurrency: 1, autoUnblock: true, maxRetries: 0 },
+			artifacts: [],
+		};
+		const specPath = path.join(dir, "spec.v1.json");
+		fs.writeFileSync(specPath, JSON.stringify(spec, null, 2) + "\n");
+		const out = execFileSync(process.execPath, [installedValidator, specPath], { encoding: "utf8", cwd: dir });
+		assert.match(out, /^VALID$/m);
+		assert.match(out, /specSha256: [a-f0-9]{64}/);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 test("squad-plan validator rejects a malformed spec with the tool's exact error", () => {
 	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-squad-plan-skill-bad-"));
 	try {

@@ -10,8 +10,10 @@
  */
 import { registerHooks } from "node:module";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { copyFileSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 if (!process.features.typescript) {
 	console.error(
@@ -43,7 +45,20 @@ if (!specArg) {
 }
 const specPath = resolve(process.cwd(), specArg);
 
-const { prepareSpec } = await import(new URL("../../file-spec.ts", import.meta.url).href);
+// Node refuses type stripping for files under node_modules, which is exactly
+// where an installed pi-squad lives. Import the real validator from a temp
+// copy outside node_modules; its only runtime deps are node builtins.
+const sourceDir = fileURLToPath(new URL("../..", import.meta.url));
+const stageDir = mkdtempSync(join(tmpdir(), "pi-squad-validate-"));
+for (const file of ["file-spec.ts", "types.ts"]) {
+	copyFileSync(join(sourceDir, file), join(stageDir, file));
+}
+let prepareSpec;
+try {
+	({ prepareSpec } = await import(pathToFileURL(join(stageDir, "file-spec.ts")).href));
+} finally {
+	rmSync(stageDir, { recursive: true, force: true });
+}
 
 try {
 	const raw = readFileSync(specPath);
