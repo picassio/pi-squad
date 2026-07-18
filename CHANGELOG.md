@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-07-18
+
+### Added
+
+- `squad-plan` skill: authoring guide for inline plans and strict v1 file specifications, an error→fix map, and a bundled `validate-spec.mjs` that runs the exact tool validator and prints the ready-to-use `specSha256`.
+
+### Fixed
+
+- The `squad` tool now accepts JSON-encoded strings for `tasks`, `agents`, and `config` and decodes them with precise per-field errors, so transports that stringify structured arguments no longer fail valid plans (`tasks: must be array`). Verified live: a real Opus 4.8 session emitted stringified tasks unprompted and the squad started correctly.
+
+### Changed
+
+- Agent `model`/`thinking` now follow configuration unless the user explicitly requests otherwise: the planner prompt, squad tool schema/guidelines, and skills all instruct omitting overrides so agent definitions and `/squad defaults` apply.
+
 ## [0.18.0] - 2026-07-18
 
 ### Added
@@ -64,7 +78,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Kept failed-review rework in the original squad, preserving task ownership and durable session continuity.
 
-[Unreleased]: https://github.com/picassio/pi-squad/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/picassio/pi-squad/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/picassio/pi-squad/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/picassio/pi-squad/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/picassio/pi-squad/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/picassio/pi-squad/compare/v0.17.0...v0.17.1
