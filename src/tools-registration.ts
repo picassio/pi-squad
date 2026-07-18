@@ -356,6 +356,10 @@ pi.registerTool({
 		store.saveSquad(squad);
 		forceWidgetUpdate();
 		const accepted = squad.status === "done";
+		// An accepted squad needs no further attention: auto-dismiss its widget.
+		// Review-pending, review-failed, and failed squads stay visible, and the
+		// user can still reselect a done squad explicitly with /squad select.
+		if (accepted && runtime.activeSquadId === id) focusSquad(null);
 		const text = accepted
 			? `Independent orchestrator review recorded for '${id}' (${params.verdict}). The squad is now accepted as done.`
 			: `Independent review FAILED for '${id}'. The squad remains review-required. Fix every issue, rerun verification/E2E, then submit a fresh squad_review.`;

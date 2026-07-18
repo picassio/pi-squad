@@ -890,6 +890,57 @@ test("explicit tool targeting keeps widget and opened panel on the same exact sq
 	await emit(api, "session_shutdown");
 });
 
+test("accepted review auto-dismisses the widget; failed review keeps it visible", async () => {
+	const acceptId = "sq-widget-autoclose-accept";
+	const failId = "sq-widget-autoclose-fail";
+	for (const [id, goal] of [[acceptId, "ACCEPT_AUTOCLOSE_GOAL"], [failId, "FAIL_KEEPS_WIDGET_GOAL"]]) {
+		store.saveSquad({
+			id, goal, status: "review", created: "2026-07-18T05:00:00.000Z", cwd: tempHome,
+			agents: { qa: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+			review: { status: "pending", requestedAt: "2026-07-18T05:00:01.000Z", completedAt: null, verdict: null, contractChecks: [], diffReview: "", verificationEvidence: [], integrationEvidence: "", issues: [] },
+		});
+		store.createTask(id, { id: "work", title: "work", description: "work", agent: "qa", status: "done", depends: [], created: store.now(), started: null, completed: store.now(), output: "done", error: null, usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 } });
+	}
+
+	const api = createFakeExtensionApi(); registerExtension(api);
+	const theme = { fg: (_color, text) => text, bold: (text) => text };
+	let widgetFactory;
+	const widgetValues = [];
+	const statusValues = [];
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const ctx = { hasUI: true, cwd: tempHome, ui: {
+		theme,
+		setWidget: (_id, value) => { widgetValues.push(value); widgetFactory = typeof value === "function" ? value : null; },
+		setStatus: (_id, value) => { statusValues.push(value); },
+		notify() {}, onTerminalInput() {}, input: async () => undefined,
+		custom: () => new Promise(() => {}),
+	} };
+	await emit(api, "session_start", {}, ctx);
+
+	const evidence = { contractChecks: ["checked"], diffReview: "inspected", verificationEvidence: ["ran"], integrationEvidence: "ran", issues: [] };
+
+	// Focus the failing squad first: a failed verdict must keep the widget.
+	await api.commands.get("squad").handler(failId, ctx);
+	const failed = await api.tools.get("squad_review").execute("review-fail", { squadId: failId, verdict: "fail", ...evidence, issues: ["broken"] }, undefined, undefined, ctx);
+	assert.match(failed.content[0].text, /FAILED/);
+	assert.ok(widgetFactory(tui, theme).render(160)[0].includes("FAIL_KEEPS_WIDGET_GOAL"), "failed review keeps the widget visible");
+
+	// Now focus and accept the other squad: acceptance auto-dismisses the widget.
+	await api.commands.get("squad").handler(acceptId, ctx);
+	assert.ok(widgetFactory(tui, theme).render(160)[0].includes("ACCEPT_AUTOCLOSE_GOAL"));
+	const accepted = await api.tools.get("squad_review").execute("review-pass", { squadId: acceptId, verdict: "pass", ...evidence }, undefined, undefined, ctx);
+	assert.match(accepted.content[0].text, /accepted as done/);
+	assert.equal(store.loadSquad(acceptId).status, "done");
+	assert.equal(widgetValues.at(-1), undefined, "accepted squad uninstalls the widget");
+	assert.equal(widgetFactory, null, "no live widget factory remains after acceptance");
+	assert.equal(statusValues.at(-1), undefined, "accepted squad clears the squad status line");
+
+	// Explicit reselection of a done squad still displays it (user action).
+	await api.commands.get("squad").handler(acceptId, ctx);
+	assert.ok(widgetFactory(tui, theme).render(160)[0].includes("ACCEPT_AUTOCLOSE_GOAL"), "manual select of a done squad still shows it");
+	await emit(api, "session_shutdown");
+});
+
 test("panel-path scheduler events reach the main session immediately after revival", async () => {
 	const squadId = "sq-panel-wired-revival";
 	const projectDir = path.join(tempHome, "panel-wired-project");
