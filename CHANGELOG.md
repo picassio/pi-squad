@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-18
+
+### Added
+
+- Squad completion reports now include a Working Tree Snapshot (`git diff --stat` plus untracked-file count) when the squad cwd is a Git repository; non-repository output is unchanged and task handoffs are never truncated.
+- Continuous integration workflow running the full test suite on pushes to `main` and all pull requests.
+- This changelog, backfilled for v0.16.5 through v0.17.2, and shipped in the npm package.
+
+### Fixed
+
+- Schedulers reconstructed through the panel and Ctrl+Q paths are now registered and event-wired, so their review/failure/reply/escalation notifications reach the main session instead of being silently dropped.
+
+### Changed
+
+- Refactored the extension into focused modules (`runtime`, `tools-registration`, `commands`, `lifecycle`, `panel-runtime`, `scheduler-runtime`, `start-squad`); `src/index.ts` is now a thin composition root. Behavior, tool schemas, and command surface are unchanged.
+- `reviveScheduler()` is the single authoritative scheduler reconstruction helper; `handleAgentEvent` is a thin dispatcher over per-event handlers.
+
+### Removed
+
+- Dead `supervisor.ts` auto-approval stub and the unused squad knowledge/memory persistence feature (never written by any caller). Legacy `knowledge/` directories in existing squad state remain ignored safely.
+
 ## [0.17.2] - 2026-07-18
 
 ### Fixed
@@ -43,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Kept failed-review rework in the original squad, preserving task ownership and durable session continuity.
 
-[Unreleased]: https://github.com/picassio/pi-squad/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/picassio/pi-squad/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/picassio/pi-squad/compare/v0.17.2...v0.18.0
 [0.17.2]: https://github.com/picassio/pi-squad/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/picassio/pi-squad/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/picassio/pi-squad/compare/v0.16.7...v0.17.0
