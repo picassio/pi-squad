@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.2] - 2026-07-18
+
+### Fixed
+
+- The compact widget now auto-dismisses when a squad is accepted as done through `squad_review`. Review-pending, review-failed, and failed squads keep the widget because they require attention, and explicitly selecting a done squad still displays it.
+
 ## [0.19.1] - 2026-07-18
 
 ### Fixed
@@ -84,7 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Kept failed-review rework in the original squad, preserving task ownership and durable session continuity.
 
-[Unreleased]: https://github.com/picassio/pi-squad/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/picassio/pi-squad/compare/v0.19.2...HEAD
+[0.19.2]: https://github.com/picassio/pi-squad/compare/v0.19.1...v0.19.2
 [0.19.1]: https://github.com/picassio/pi-squad/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/picassio/pi-squad/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/picassio/pi-squad/compare/v0.17.2...v0.18.0
