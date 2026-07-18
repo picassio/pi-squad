@@ -41,6 +41,8 @@ export class SquadPanel implements Component, Focusable {
 	private done: (result: SquadPanelResult) => void;
 	private scheduler: Scheduler;
 	private squadId: string;
+	private isEnabled: () => boolean;
+	private onDisabled: () => void;
 
 	/** Callback for sending messages — set by the extension */
 	onSendMessage?: (taskId: string, message: string) => Promise<void>;
@@ -69,12 +71,16 @@ export class SquadPanel implements Component, Focusable {
 		scheduler: Scheduler,
 		squadId: string,
 		done: (result: SquadPanelResult) => void,
+		isEnabled: () => boolean = () => true,
+		onDisabled: () => void = () => {},
 	) {
 		this.tui = tui;
 		this.theme = theme;
 		this.scheduler = scheduler;
 		this.squadId = squadId;
 		this.done = done;
+		this.isEnabled = isEnabled;
+		this.onDisabled = onDisabled;
 
 		this.taskListView = new TaskListView(theme, squadId);
 		this.messageView = new MessageView(theme, squadId);
@@ -112,6 +118,12 @@ export class SquadPanel implements Component, Focusable {
 	// =========================================================================
 
 	handleInput(data: string): void {
+		if (!this.isEnabled()) {
+			this.onDisabled();
+			this.finish({ action: "close" });
+			return;
+		}
+
 		// Ctrl+Q or q: close panel
 		if (data === "\x11") {
 			this.finish({ action: "close" });
@@ -315,6 +327,10 @@ export class SquadPanel implements Component, Focusable {
 	// =========================================================================
 	// Lifecycle
 	// =========================================================================
+
+	close(): void {
+		this.finish({ action: "close" });
+	}
 
 	dispose(): void {
 		if (this.renderTimeout) {

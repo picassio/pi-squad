@@ -62,12 +62,14 @@ export function getSquadSettingsPath(): string {
 	return path.join(SQUAD_HOME, "settings.json");
 }
 
-/** Load global squad settings, merged over defaults (advisor merged deep) */
+/** Load global squad settings, merged over defaults (advisor merged deep). */
 export function loadSquadSettings(): SquadSettings {
 	const loaded = readJson<Partial<SquadSettings>>(getSquadSettingsPath());
 	return {
 		...DEFAULT_SQUAD_SETTINGS,
 		...(loaded || {}),
+		// Legacy, missing, and malformed values remain backward-compatible.
+		enabled: typeof loaded?.enabled === "boolean" ? loaded.enabled : DEFAULT_SQUAD_SETTINGS.enabled,
 		advisor: { ...DEFAULT_SQUAD_SETTINGS.advisor, ...(loaded?.advisor || {}) },
 	};
 }

@@ -33,7 +33,7 @@ export function matchesKey() { return false; }
 registerHooks({
 	resolve(specifier, context, nextResolve) {
 		if (specifier === "typebox") return { url: pathToFileURL(typeboxStub).href, shortCircuit: true };
-		if (specifier === "@earendil-works/pi-ai") return { url: pathToFileURL(piAiStub).href, shortCircuit: true };
+		if (specifier === "@earendil-works/pi-ai" || specifier === "@earendil-works/pi-ai/compat") return { url: pathToFileURL(piAiStub).href, shortCircuit: true };
 		if (specifier === "@earendil-works/pi-tui") return { url: pathToFileURL(piTuiStub).href, shortCircuit: true };
 		if (specifier.startsWith(".") && specifier.endsWith(".js")) {
 			try { return nextResolve(specifier, context); }

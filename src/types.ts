@@ -44,6 +44,7 @@ export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
  * - any other string: an explicit model id (defaultModel) or thinking level (defaultThinking)
  */
 export interface SquadSettings {
+	enabled: boolean;
 	defaultModel: string;
 	defaultThinking: string;
 	advisor: {
@@ -56,6 +57,7 @@ export interface SquadSettings {
 }
 
 export const DEFAULT_SQUAD_SETTINGS: SquadSettings = {
+	enabled: true,
 	defaultModel: "main",
 	defaultThinking: "main",
 	advisor: {

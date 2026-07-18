@@ -90,6 +90,14 @@ squad_modify({ action: "resume_task", squadId: "<exact-squad-id>", taskId: "<exa
 
 Repeated reconciliation and restart do not create notification storms. A delivered stall remains visible until explicit resumption changes the state; a different suspended/blocked set is a new actionable episode.
 
+### Persistent Master Switch
+
+`/squad disable` persists a global master switch in `~/.pi/squad/settings.json`. It first saves the disabled state, then stops schedulers, durably suspends in-progress tasks, kills child processes, clears focus, and hides the widget. On later Pi restarts, disabled mode does not reconstruct schedulers, recover mail, resume sessions, normalize tasks, or select a squad.
+
+While disabled, all five squad tools and every `/squad` operation fail closed with `/squad enable` guidance; only exact `/squad enable` and the idempotent exact `/squad disable` control commands run. Tool schemas remain registered. Mandatory pending/failed review gates and suspended-stall reminders remain injected because they are durable safety obligations, but they do not authorize squad work while disabled.
+
+`/squad enable` persists the enabled state and restores widget availability without selecting a squad or resuming anything. Suspended work remains suspended until an explicit exact-task resume or `/squad resume <squad-id>`.
+
 ### QA Rework Loop
 
 When a QA agent outputs `## Verdict: FAIL`, the scheduler automatically:
@@ -217,7 +225,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 | `/squad cancel` | Cancel the visibly focused squad; the notification names it and the focused widget/status clear |
 | `/squad clear` | Dismiss widget |
 | `/squad cleanup` | Delete squad data |
-| `/squad enable/disable` | Enable/disable the extension |
+| `/squad enable/disable` | Persistently enable/disable all squad execution; enabling never auto-resumes work |
 
 ## Tools (LLM-callable)
 
@@ -225,6 +233,7 @@ Full overlay with task list, live activity preview, and scrollable message view.
 |---|---|
 | `squad` | Start a squad with goal + optional tasks/config |
 | `squad_status` | Check progress, costs, task states |
+| `squad_review` | Record the main orchestrator's independent acceptance review |
 | `squad_message` | Durably message an exact task; completed tasks reopen on their original session |
 | `squad_modify` | Add/cancel/complete/pause/resume tasks or squads, or replace a task's dependencies with `set_dependencies`; exact `squadId` is required for destructive whole-squad `cancel` and recommended for all task actions |
 
@@ -331,7 +340,7 @@ Agents must complete at least one LLM turn and produce either a tool call or a s
 
 - Every task owns one durable Pi session. New tasks create it under their task directory; stale, suspended, failed, or explicitly reopened tasks resume that same session rather than starting over. A pre-prompt retry may refresh Pi's provisional session ID only while the bound file is the same and its JSONL has not materialized; afterward both file and ID are immutable.
 - Legacy tasks without a session binding migrate on first reopen by creating a task-owned session and seeding its first prompt with the complete persisted multiline message history and prior task output—without truncation.
-- In-progress tasks are **suspended** on orderly shutdown; ordinary orphaned work is paused for explicit resume. If a scheduler itself is reconstructed, stale `in_progress` state is resumed by reconciliation. Independently, extension startup always reconstructs any project squad with pending mailbox entries—including `review` or already accepted `done` squads—and resumes delivery without another user action.
+- In-progress tasks are **suspended** on orderly shutdown; ordinary orphaned work is paused for explicit resume. When the persistent master switch is enabled, a reconstructed scheduler can resume stale `in_progress` state through reconciliation, and startup reconstructs project squads with pending mailbox entries—including `review` or already accepted `done` squads—to resume delivery. Disabled startup performs none of this recovery.
 - A durable message to a completed task clears its prior completion/review state, reopens the squad, keeps the task `in_progress` while its agent is live, and requires a fresh orchestrator review after the final `agent_settled`. Every transitive descendant is re-blocked and reruns in dependency order, so results derived from the reopened dependency cannot remain falsely complete.
 - Failure is never terminal: `resume` recovers failed squads (failed tasks reset to pending), `complete_task` marks recovered work done and schedules dependents, and a 60s reconcile loop re-derives scheduling from persisted state so out-of-band store edits can't strand ready tasks.
 - Mail is acknowledged only after Pi accepts the correlated RPC command. Pending and acknowledged entries remain task-addressed on disk, survive process restart, and remain visible in history. Queue and acknowledgement read/modify/write operations are serialized across processes so concurrent mutations cannot overwrite messages or delivery state.
@@ -355,6 +364,7 @@ All state in `~/.pi/squad/`. No database, no daemon. Writes are atomic. JSONL re
 
 ```
 ~/.pi/squad/
+├── settings.json        — persistent master switch, defaults, and advisor settings
 ├── agents/              — agent definitions (user-editable)
 ├── debug.log            — error and debug logging
 └── {squad-id}/

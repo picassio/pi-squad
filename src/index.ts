@@ -20,7 +20,7 @@ import { Scheduler, formatSuspendedStallAttention, type SchedulerEvent, type Sch
 import { runPlanner } from "./planner.js";
 import { validatePlan, PLAN_STRUCTURE_RULES } from "./plan-rules.js";
 import { ADVISOR_SYSTEM_PROMPT, buildAdvisorConsultText, type AdvisorConsultInput } from "./advisor.js";
-import { completeSimple, type Message, type TextContent } from "@earendil-works/pi-ai";
+import { completeSimple, type Message, type TextContent } from "@earendil-works/pi-ai/compat";
 import { SquadPanel, type SquadPanelResult } from "./panel/squad-panel.js";
 import { setupSquadWidget, type SquadWidgetControls, type SquadWidgetState } from "./panel/squad-widget.js";
 import * as store from "./store.js";
@@ -41,14 +41,21 @@ interface InlineSquadStart {
 	config?: { maxConcurrency?: number; autoUnblock?: boolean; maxRetries?: number };
 }
 
-/** Master switch — when false, all squad tools, hooks, and widget are disabled */
+/** Master switch — loaded from ~/.pi/squad/settings.json before lifecycle work. */
 let squadEnabled = true;
+const DISABLED_GUIDANCE = "pi-squad is disabled. Run /squad enable, then retry this operation; no squad work was changed.";
+const disabledToolResult = () => ({
+	content: [{ type: "text" as const, text: DISABLED_GUIDANCE }],
+	details: undefined,
+});
 /** Registry of all running schedulers — supports multiple concurrent squads */
 const schedulers = new Map<string, Scheduler>();
 /** The currently viewed/focused squad (for widget, panel, status) */
 let activeSquadId: string | null = null;
 /** Whether an overlay panel is currently open (prevents double-open) */
 let overlayOpen = false;
+/** Close an already-open overlay when the master switch is disabled. */
+let closeOverlay: (() => void) | null = null;
 /** Stored ExtensionContext for widget updates from background scheduler events */
 let uiCtx: import("@earendil-works/pi-coding-agent").ExtensionContext | null = null;
 /** Component-based widget state + controls */
@@ -59,7 +66,7 @@ let widgetControls: SquadWidgetControls | null = null;
 function focusSquad(squadId: string | null): void {
 	activeSquadId = squadId;
 	widgetState.squadId = squadId;
-	if (squadId) widgetState.enabled = true;
+	if (squadId && squadEnabled) widgetState.enabled = true;
 	widgetControls?.refreshNow();
 }
 
@@ -255,6 +262,11 @@ export default function (pi: ExtensionAPI) {
 	// File-spec children load only the non-recursive reader and fail-closed guard.
 	if (process.env.PI_SQUAD_CHILD === "1") { registerChildSpecReader(pi); return; }
 
+	// Load the global master switch before any session lifecycle work can run.
+	squadEnabled = store.loadSquadSettings().enabled;
+	widgetState.enabled = squadEnabled;
+	if (!squadEnabled) focusSquad(null);
+
 	// Wire main-session thinking lookup (needs `pi`, guarded against stale API)
 	getMainSessionThinking = () => {
 		try {
@@ -290,6 +302,33 @@ export default function (pi: ExtensionAPI) {
 		return true;
 	};
 
+	/** Register a dynamically gated Ctrl+Q path; disabled mode can only show guidance. */
+	const registerTerminalPanelToggle = (ctx: ExtensionContext): void => {
+		if (!ctx.hasUI) return;
+		ctx.ui.onTerminalInput((data) => {
+			if (data !== "\x11") return undefined;
+			if (!squadEnabled) {
+				ctx.ui.notify(DISABLED_GUIDANCE, "warning");
+				return { consume: true };
+			}
+			// If overlay is already open, let the panel's own handler deal with it.
+			if (overlayOpen) return undefined;
+			if (!activeSquadId) {
+				const latest = store.findLatestSquad(ctx.cwd)
+					|| store.listSquads().map((id) => store.loadSquad(id)).filter((s): s is Squad => s !== null).sort((a, b) => b.created.localeCompare(a.created))[0];
+				if (latest) activateSquadView(latest.id, ctx);
+				else {
+					ctx.ui.notify("No squads found. Use /squad or the squad tool.", "info");
+					return { consume: true };
+				}
+			}
+			if (activeSquadId) {
+				openPanel(pi, ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext), activeSquadId);
+			}
+			return { consume: true };
+		});
+	};
+
 	// =========================================================================
 	// Context Injection — give main agent awareness of squad state
 	// =========================================================================
@@ -306,7 +345,10 @@ export default function (pi: ExtensionAPI) {
 		const durablePrompts = [...pendingReviewGates.map(({ gate }) => gate), ...suspendedAttention];
 		if (!squadEnabled) {
 			if (durablePrompts.length === 0) return;
-			return { systemPrompt: event.systemPrompt + "\n\n" + durablePrompts.join("\n\n") };
+			const enableFirst = durablePrompts.map((prompt) =>
+				`${prompt}\npi-squad is disabled. Run /squad enable first; then perform only the explicit review or exact-task resume described above.`,
+			);
+			return { systemPrompt: event.systemPrompt + "\n\n" + enableFirst.join("\n\n") };
 		}
 
 		// When a squad is active, inject its status
@@ -451,7 +493,7 @@ export default function (pi: ExtensionAPI) {
 		]),
 
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			if (!squadEnabled) return { content: [{ type: "text" as const, text: "Squad is disabled. Use /squad enable to re-enable." }], details: undefined };
+			if (!squadEnabled) return disabledToolResult();
 			if (!uiCtx) uiCtx = ctx;
 
 			// Check if the user cancelled before we start
@@ -490,6 +532,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!squadEnabled) return disabledToolResult();
 			let id = params.squadId || activeSquadId;
 
 			// If no active squad, find the most recent one for this project
@@ -570,6 +613,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!squadEnabled) return disabledToolResult();
 			let id = params.squadId;
 			if (!id && activeSquadId && store.loadSquad(activeSquadId)?.status === "review") {
 				id = activeSquadId;
@@ -590,6 +634,7 @@ export default function (pi: ExtensionAPI) {
 			const attestationScheduler = schedulers.get(id) ?? new Scheduler(id, squadSkillPaths, schedulerSpawnContext);
 			if (!schedulers.has(id)) { schedulers.set(id, attestationScheduler); wireSchedulerEvents(pi, attestationScheduler, id); }
 			const invalidAttestations = await attestationScheduler.auditSpecAttestations();
+			if (!squadEnabled) return disabledToolResult();
 			if (invalidAttestations.length > 0) {
 				void attestationScheduler.start();
 				return { content: [{ type: "text" as const, text: `Review rejected: invalid canonical spec attestation for task(s): ${invalidAttestations.join(", ")}. Work was reopened.` }], details: undefined };
@@ -634,6 +679,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+			if (!squadEnabled) return disabledToolResult();
 			if (!activeSquadId) {
 				return { content: [{ type: "text" as const, text: "No active squad." }], details: undefined };
 			}
@@ -714,6 +760,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (!squadEnabled) return disabledToolResult();
 			if (params.action === "cancel") {
 				if (!params.squadId?.trim()) {
 					return { content: [{ type: "text" as const, text: "cancel requires exact squadId; no squad was changed." }], details: undefined };
@@ -883,12 +930,21 @@ export default function (pi: ExtensionAPI) {
 	// =========================================================================
 
 	pi.on("session_start", async (_event, ctx) => {
+		// Re-read before touching focus, widgets, schedulers, or persisted work.
+		squadEnabled = store.loadSquadSettings().enabled;
 		uiCtx = ctx;
 
 		// A session replacement may not deliver shutdown first. Never carry a
 		// focused squad across projects, and never seed a new widget from stale state.
 		widgetControls?.dispose();
 		widgetControls = null;
+		registerTerminalPanelToggle(ctx);
+		if (!squadEnabled) {
+			widgetState.enabled = false;
+			focusSquad(null);
+			return;
+		}
+		widgetState.enabled = true;
 		const focused = activeSquadId ? store.loadSquad(activeSquadId) : null;
 		focusSquad(focused?.cwd === ctx.cwd ? activeSquadId : null);
 
@@ -993,33 +1049,6 @@ export default function (pi: ExtensionAPI) {
 			});
 		}
 
-		// Register Ctrl+Q terminal input handler for panel toggle
-		if (ctx.hasUI) {
-			ctx.ui.onTerminalInput((data) => {
-				if (data === "\x11") {
-					// If overlay is already open, let the panel's own handler deal with it
-					if (overlayOpen) return undefined;
-
-					// Auto-pick a squad if none active
-					if (!activeSquadId) {
-						const latest = store.findLatestSquad(ctx.cwd)
-							|| store.listSquads().map((id) => store.loadSquad(id)).filter((s): s is Squad => s !== null).sort((a, b) => b.created.localeCompare(a.created))[0];
-						if (latest) {
-							activateSquadView(latest.id, ctx);
-						} else {
-							ctx.ui.notify("No squads found. Use /squad or the squad tool.", "info");
-							return { consume: true };
-						}
-					}
-
-					if (activeSquadId) {
-						openPanel(pi, ctx, schedulers.get(activeSquadId) || new Scheduler(activeSquadId, squadSkillPaths, schedulerSpawnContext), activeSquadId);
-					}
-					return { consume: true };
-				}
-				return undefined;
-			});
-		}
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -1060,7 +1089,12 @@ export default function (pi: ExtensionAPI) {
 			return subs.filter((s) => s.value.startsWith(prefix));
 		},
 		handler: async (args, ctx) => {
-			const parts = args.trim().split(/\s+/);
+			const requested = args.trim();
+			if (!squadEnabled && requested !== "enable" && requested !== "disable") {
+				ctx.ui.notify(DISABLED_GUIDANCE, "warning");
+				return;
+			}
+			const parts = requested.split(/\s+/);
 			const sub = parts[0] || "select";
 
 			switch (sub) {
@@ -1338,22 +1372,48 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "enable": {
+					const wasEnabled = squadEnabled;
+					try {
+						const settings = store.loadSquadSettings();
+						settings.enabled = true;
+						store.saveSquadSettings(settings);
+					} catch (error) {
+						ctx.ui.notify(`Could not enable pi-squad: ${(error as Error).message}`, "error");
+						return;
+					}
 					squadEnabled = true;
+					widgetState.enabled = true;
+					if (!wasEnabled) widgetState.squadId = null;
+					if (!widgetControls && uiCtx?.hasUI) widgetControls = setupSquadWidget(uiCtx, widgetState);
 					widgetControls?.requestUpdate();
-					ctx.ui.notify("pi-squad enabled — tools, widget, and system prompt active", "info");
+					ctx.ui.notify("pi-squad enabled. No suspended work was resumed; use /squad select and an explicit /squad resume <id> or exact resume_task if needed.", "info");
 					return;
 				}
 
 				case "disable": {
-					squadEnabled = false;
-					// Stop all running schedulers
-					for (const [id, sched] of schedulers) {
-						await sched.stop();
+					if (!squadEnabled) {
+						ctx.ui.notify("pi-squad is already disabled. Run /squad enable to use squad operations.", "info");
+						return;
 					}
+					try {
+						const settings = store.loadSquadSettings();
+						settings.enabled = false;
+						store.saveSquadSettings(settings);
+					} catch (error) {
+						ctx.ui.notify(`Could not disable pi-squad: ${(error as Error).message}`, "error");
+						return;
+					}
+					// The persisted state is authoritative before shutdown begins.
+					squadEnabled = false;
+					closeOverlay?.();
+					for (const sched of schedulers.values()) await sched.stop();
 					schedulers.clear();
 					widgetState.enabled = false;
+					widgetState.squadId = null;
 					focusSquad(null);
-					ctx.ui.notify("pi-squad disabled — all tools, widget, and system prompt injection stopped", "info");
+					widgetControls?.dispose();
+					widgetControls = null;
+					ctx.ui.notify("pi-squad disabled. Running work was durably suspended; run /squad enable before any squad operation.", "info");
 					return;
 				}
 
@@ -1618,6 +1678,10 @@ async function pickSquad(
  * Does NOT start a scheduler (view-only unless squad needs resuming).
  */
 function activateSquadView(squadId: string, ctx: import("@earendil-works/pi-coding-agent").ExtensionContext | import("@earendil-works/pi-coding-agent").ExtensionCommandContext): void {
+	if (!squadEnabled) {
+		ctx.ui.notify(DISABLED_GUIDANCE, "warning");
+		return;
+	}
 	const squad = store.loadSquad(squadId);
 	if (!squad) {
 		ctx.ui.notify(`Squad '${squadId}' not found`, "error");
@@ -1647,6 +1711,9 @@ function forceWidgetUpdate(): void {
 /** Wire one scheduler to durable main-session notifications. */
 function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squadId: string): void {
 	scheduler.onEvent((event: SchedulerEvent) => {
+		// Durable scheduler state remains authoritative, but disabled mode suppresses
+		// late operational UI, acknowledgements, focus, and ordinary notifications.
+		if (!squadEnabled) return;
 		forceWidgetUpdate();
 		switch (event.type) {
 			case "squad_review_required": {
@@ -1729,6 +1796,10 @@ function openPanel(
 	scheduler: Scheduler,
 	squadId: string,
 ): void {
+	if (!squadEnabled) {
+		ctx.ui.notify(DISABLED_GUIDANCE, "warning");
+		return;
+	}
 	if (overlayOpen) return;
 	// Opening details also establishes authoritative focus. This covers callers
 	// that reconstructed or targeted a scheduler without going through selector UI.
@@ -1738,13 +1809,30 @@ function openPanel(
 	// The promise resolves when the panel calls done()
 	const panelPromise = ctx.ui.custom<SquadPanelResult>(
 		(tui, theme, _kb, done) => {
-			const panel = new SquadPanel(tui, theme, scheduler, squadId, done);
+			const panel = new SquadPanel(
+				tui,
+				theme,
+				scheduler,
+				squadId,
+				done,
+				() => squadEnabled,
+				() => ctx.ui.notify(DISABLED_GUIDANCE, "warning"),
+			);
+			closeOverlay = () => panel.close();
 
 			// Wire up message sending from panel
 			panel.onSendMessage = async (taskId: string, _prefill: string) => {
+				if (!squadEnabled) {
+					ctx.ui.notify(DISABLED_GUIDANCE, "warning");
+					return;
+				}
 				const task = store.loadTask(squadId, taskId);
 				const agentName = task?.agent || taskId;
 				const input = await ctx.ui.input(`Message to ${agentName}`, "Type your message...");
+				if (!squadEnabled) {
+					ctx.ui.notify(DISABLED_GUIDANCE, "warning");
+					return;
+				}
 				if (input) {
 					let panelSched = schedulers.get(squadId);
 					if (!panelSched) {
@@ -1778,9 +1866,11 @@ function openPanel(
 	// When panel closes (done() called), clean up
 	panelPromise.then(() => {
 		overlayOpen = false;
+		closeOverlay = null;
 		forceWidgetUpdate();
 	}).catch(() => {
 		overlayOpen = false;
+		closeOverlay = null;
 	});
 }
 
@@ -1830,6 +1920,10 @@ async function startSquad(
 			throw new Error(`Failed to plan: ${(error as Error).message}`);
 		}
 	}
+
+	// A planner may take long enough for /squad disable to run concurrently.
+	// Re-check before publishing any squad or constructing a scheduler.
+	if (!squadEnabled) return disabledToolResult();
 
 	// Merge agent roster
 	const agents: Record<string, SquadAgentEntry> = { ...plan.agents };
