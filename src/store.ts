@@ -12,7 +12,6 @@ import * as os from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import type {
 	AgentDef,
-	KnowledgeEntry,
 	Squad,
 	SquadContext,
 	Task,
@@ -101,14 +100,6 @@ export function getSquadFilePath(squadId: string): string {
 
 export function getContextFilePath(squadId: string): string {
 	return path.join(getSquadDir(squadId), "context.json");
-}
-
-export function getKnowledgeDir(squadId: string): string {
-	return path.join(getSquadDir(squadId), "knowledge");
-}
-
-export function getMemoryFilePath(): string {
-	return path.join(getSquadRoot(), "memory.jsonl");
 }
 
 /** Resolve task dir, supporting nested subtasks via parentPath */
@@ -650,28 +641,6 @@ export function saveContext(squadId: string, context: SquadContext): void {
 }
 
 // ============================================================================
-// Knowledge
-// ============================================================================
-
-export function appendKnowledge(squadId: string, type: KnowledgeEntry["type"], entry: KnowledgeEntry): void {
-	const file = path.join(getKnowledgeDir(squadId), `${type}s.jsonl`);
-	appendJsonl(file, entry);
-}
-
-export function loadKnowledge(squadId: string, type: KnowledgeEntry["type"]): KnowledgeEntry[] {
-	const file = path.join(getKnowledgeDir(squadId), `${type}s.jsonl`);
-	return readJsonl<KnowledgeEntry>(file);
-}
-
-export function loadAllKnowledge(squadId: string): KnowledgeEntry[] {
-	return [
-		...loadKnowledge(squadId, "decision"),
-		...loadKnowledge(squadId, "convention"),
-		...loadKnowledge(squadId, "finding"),
-	].sort((a, b) => a.ts.localeCompare(b.ts));
-}
-
-// ============================================================================
 // Rework Helpers
 // ============================================================================
 
@@ -686,18 +655,6 @@ export function getRetryCount(squadId: string, taskId: string): number {
 	if (!task) return 0;
 	if (task.retryCount !== undefined) return task.retryCount;
 	return findRetries(squadId, taskId).length;
-}
-
-// ============================================================================
-// Memory (cross-squad)
-// ============================================================================
-
-export function appendMemory(entry: KnowledgeEntry): void {
-	appendJsonl(getMemoryFilePath(), entry);
-}
-
-export function loadMemory(): KnowledgeEntry[] {
-	return readJsonl<KnowledgeEntry>(getMemoryFilePath());
 }
 
 // ============================================================================

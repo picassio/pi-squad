@@ -890,6 +890,45 @@ test("explicit tool targeting keeps widget and opened panel on the same exact sq
 	await emit(api, "session_shutdown");
 });
 
+test("panel-path scheduler events reach the main session immediately after revival", async () => {
+	const squadId = "sq-panel-wired-revival";
+	const projectDir = path.join(tempHome, "panel-wired-project");
+	fs.mkdirSync(projectDir, { recursive: true });
+	store.saveSquad({
+		id: squadId, goal: "prove panel scheduler wiring", status: "running", created: "2026-07-18T05:00:00.000Z", cwd: projectDir,
+		agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	store.createTask(squadId, {
+		id: "panel-task", title: "panel task", description: "complete through the revived panel scheduler", agent: "backend",
+		status: "pending", depends: [], created: store.now(), started: null, completed: null, output: null, error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+	});
+
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const theme = { fg: (_color, text) => text, bold: (text) => text };
+	let panel;
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const ctx = { hasUI: true, cwd: projectDir, ui: {
+		theme,
+		setWidget() {}, setStatus() {}, notify() {}, onTerminalInput() {}, input: async () => undefined,
+		custom: (factory) => new Promise((resolve) => { panel = factory(tui, theme, {}, resolve); }),
+	} };
+	await emit(api, "session_start", {}, ctx);
+	await api.commands.get("squad").handler("panel", ctx);
+	assert.ok(panel, "panel command creates a scheduler-backed panel");
+
+	await panel.scheduler.completeTask("panel-task", "panel-path completion");
+	assert.ok(
+		api.sent.some((entry) => entry.message.customType === "squad-review-required"),
+		"the scheduler supplied to the panel is registered and wired before panel interaction",
+	);
+
+	panel.handleInput("\x11");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	await emit(api, "session_shutdown");
+});
+
 test("file-spec publication rejects inconsistent metadata and unsafe task paths without partial discovery", () => {
 	const raw = Buffer.from("{\"schemaVersion\":1}\n");
 	const id = "atomic-file-publish";

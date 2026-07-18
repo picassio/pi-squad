@@ -797,159 +797,173 @@ export class Scheduler {
 
 	private handleAgentEvent(event: AgentEvent): void {
 		switch (event.type) {
-			case "message_end": {
-				const msg = event.data;
-				if (msg?.role === "assistant") {
-					// Extract text from assistant message
-					const text = this.extractAssistantText(msg);
-					if (text) {
-						// Route @mentions
-						this.router.processMessage(event.taskId, event.agentName, text);
-
-						// Log message
-						store.appendMessage(this.squadId, event.taskId, {
-							ts: store.now(),
-							from: event.agentName,
-							type: "text",
-							// Persist the complete handoff. Reports can be arbitrarily long;
-							// presentation layers may viewport them, but source data must never truncate.
-							text,
-						});
-
-						// A squad_message is a request/response channel, not fire-and-forget.
-						// Persist an acknowledgement marker before emitting so restart/focus
-						// changes cannot forward the same response twice.
-						if (this.hasPendingOrchestratorRequest(event.taskId)) {
-							store.appendMessage(this.squadId, event.taskId, {
-								ts: store.now(),
-								from: event.agentName,
-								type: "reply",
-								to: "orchestrator",
-								text: "Response forwarded to main orchestrator",
-							});
-							this.emit({
-								type: "orchestrator_reply",
-								squadId: this.squadId,
-								taskId: event.taskId,
-								agentName: event.agentName,
-								message: text,
-							});
-						}
-					}
-
-					// Track usage
-					if (msg.usage) {
-						store.updateTaskUsage(this.squadId, event.taskId, {
-							inputTokens: msg.usage.input || 0,
-							outputTokens: msg.usage.output || 0,
-							cost: msg.usage.cost?.total || 0,
-							turns: 1,
-						});
-					}
-				}
+			case "message_end":
+				this.onMessageEnd(event);
 				break;
-			}
-
-			case "tool_execution_start": {
-				const data = event.data;
-				store.appendMessage(this.squadId, event.taskId, {
-					ts: store.now(),
-					from: event.agentName,
-					type: "tool",
-					text: data.toolName || "unknown",
-					name: data.toolName,
-					args: data.args,
-				});
-
-				this.emit({
-					type: "activity",
-					squadId: this.squadId,
-					taskId: event.taskId,
-					agentName: event.agentName,
-					message: `→ ${data.toolName}`,
-					data,
-				});
+			case "tool_execution_start":
+				this.onToolExecutionStart(event);
 				break;
-			}
-
-			case "tool_execution_end": {
-				// Track file modifications
-				const data = event.data;
-				if (data.toolName === "write" || data.toolName === "edit") {
-					const filePath = data.args?.path || data.args?.file_path;
-					if (filePath) {
-						this.updateModifiedFiles(event.agentName, filePath);
-					}
-				}
+			case "tool_execution_end":
+				this.onToolExecutionEnd(event);
 				break;
-			}
-
-			case "agent_end": {
-				// Pi's low-level agent_end is not completion. AgentPool normally keeps
-				// it internal; if observed here, preserve in_progress. Only an actual
-				// child-process exit carries unexpectedExit and enters retry handling.
-				if (!event.data?.unexpectedExit) break;
-				this.handleUnexpectedAgentExit(event);
+			case "agent_end":
+				if (this.onAgentEnd(event)) return;
+				break;
+			case "agent_settled":
+				this.onAgentSettled(event);
 				return;
-			}
-
-			case "agent_settled": {
-				const settledTask = store.loadTask(this.squadId, event.taskId);
-				const status = settledTask?.status;
-				if (status === "cancelled" || status === "suspended") return;
-				const settledSquad = store.loadSquad(this.squadId);
-				if (settledTask && settledSquad && !validateTaskSpecAttestation(settledSquad, settledTask)) {
-					store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null, output: null, error: "Canonical squad spec was not fully delivered; read all chunks with squad_spec_read" });
-					store.appendMessage(this.squadId, event.taskId, { ts: store.now(), from: "system", type: "status", text: "Completion rejected: missing or invalid spec-read-attestation; reopening same task session" });
-					if (this.running) void this.reconcile();
-					this.updateContext();
-					return;
-				}
-				// A mailbox entry not acknowledged by Pi outranks this run's candidate
-				// completion. Reopen the same session so accepted-at-least-once delivery
-				// occurs before the task can become done.
-				if (store.loadPendingTaskMessages(this.squadId, event.taskId).length > 0) {
-					store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null });
-					store.appendMessage(this.squadId, event.taskId, {
-						ts: store.now(),
-						from: "system",
-						type: "status",
-						text: "Agent settled with pending durable messages; resuming the same task session",
-					});
-					if (this.running) void this.reconcile();
-					this.updateContext();
-					return;
-				}
-
-				const turnCount = event.data?.turnCount ?? 0;
-				const toolCallCount = event.data?.toolCallCount ?? 0;
-				const hasSubstantiveOutput = store.loadMessages(this.squadId, event.taskId)
-					.some((message) => message.from === event.agentName && message.type === "text" && message.text.trim().length > 0);
-				const hadMeaningfulWork = turnCount > 0 && (toolCallCount > 0 || hasSubstantiveOutput);
-				if (hadMeaningfulWork) {
-					this.handleTaskCompleted(event.taskId).then(() => this.updateContext());
-				} else {
-					this.handleUnexpectedAgentExit({
-						...event,
-						data: { ...event.data, unexpectedExit: true },
-					});
-				}
-				return;
-			}
-
-			case "error": {
-				const errorMsg = event.data?.message || "Unknown error";
-				store.appendMessage(this.squadId, event.taskId, {
-					ts: store.now(),
-					from: "system",
-					type: "error",
-					text: errorMsg,
-				});
+			case "error":
+				this.onError(event);
 				break;
-			}
 		}
 
 		this.updateContext();
+	}
+
+	private onMessageEnd(event: AgentEvent): void {
+		const msg = event.data;
+		if (msg?.role === "assistant") {
+			// Extract text from assistant message
+			const text = this.extractAssistantText(msg);
+			if (text) {
+				// Route @mentions
+				this.router.processMessage(event.taskId, event.agentName, text);
+
+				// Log message
+				store.appendMessage(this.squadId, event.taskId, {
+					ts: store.now(),
+					from: event.agentName,
+					type: "text",
+					// Persist the complete handoff. Reports can be arbitrarily long;
+					// presentation layers may viewport them, but source data must never truncate.
+					text,
+				});
+
+				// A squad_message is a request/response channel, not fire-and-forget.
+				// Persist an acknowledgement marker before emitting so restart/focus
+				// changes cannot forward the same response twice.
+				if (this.hasPendingOrchestratorRequest(event.taskId)) {
+					store.appendMessage(this.squadId, event.taskId, {
+						ts: store.now(),
+						from: event.agentName,
+						type: "reply",
+						to: "orchestrator",
+						text: "Response forwarded to main orchestrator",
+					});
+					this.emit({
+						type: "orchestrator_reply",
+						squadId: this.squadId,
+						taskId: event.taskId,
+						agentName: event.agentName,
+						message: text,
+					});
+				}
+			}
+
+			// Track usage
+			if (msg.usage) {
+				store.updateTaskUsage(this.squadId, event.taskId, {
+					inputTokens: msg.usage.input || 0,
+					outputTokens: msg.usage.output || 0,
+					cost: msg.usage.cost?.total || 0,
+					turns: 1,
+				});
+			}
+		}
+	}
+
+	private onToolExecutionStart(event: AgentEvent): void {
+		const data = event.data;
+		store.appendMessage(this.squadId, event.taskId, {
+			ts: store.now(),
+			from: event.agentName,
+			type: "tool",
+			text: data.toolName || "unknown",
+			name: data.toolName,
+			args: data.args,
+		});
+
+		this.emit({
+			type: "activity",
+			squadId: this.squadId,
+			taskId: event.taskId,
+			agentName: event.agentName,
+			message: `→ ${data.toolName}`,
+			data,
+		});
+	}
+
+	private onToolExecutionEnd(event: AgentEvent): void {
+		// Track file modifications
+		const data = event.data;
+		if (data.toolName === "write" || data.toolName === "edit") {
+			const filePath = data.args?.path || data.args?.file_path;
+			if (filePath) {
+				this.updateModifiedFiles(event.agentName, filePath);
+			}
+		}
+	}
+
+	private onAgentEnd(event: AgentEvent): boolean {
+		// Pi's low-level agent_end is not completion. AgentPool normally keeps
+		// it internal; if observed here, preserve in_progress. Only an actual
+		// child-process exit carries unexpectedExit and enters retry handling.
+		if (!event.data?.unexpectedExit) return false;
+		this.handleUnexpectedAgentExit(event);
+		return true;
+	}
+
+	private onAgentSettled(event: AgentEvent): void {
+		const settledTask = store.loadTask(this.squadId, event.taskId);
+		const status = settledTask?.status;
+		if (status === "cancelled" || status === "suspended") return;
+		const settledSquad = store.loadSquad(this.squadId);
+		if (settledTask && settledSquad && !validateTaskSpecAttestation(settledSquad, settledTask)) {
+			store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null, output: null, error: "Canonical squad spec was not fully delivered; read all chunks with squad_spec_read" });
+			store.appendMessage(this.squadId, event.taskId, { ts: store.now(), from: "system", type: "status", text: "Completion rejected: missing or invalid spec-read-attestation; reopening same task session" });
+			if (this.running) void this.reconcile();
+			this.updateContext();
+			return;
+		}
+		// A mailbox entry not acknowledged by Pi outranks this run's candidate
+		// completion. Reopen the same session so accepted-at-least-once delivery
+		// occurs before the task can become done.
+		if (store.loadPendingTaskMessages(this.squadId, event.taskId).length > 0) {
+			store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null });
+			store.appendMessage(this.squadId, event.taskId, {
+				ts: store.now(),
+				from: "system",
+				type: "status",
+				text: "Agent settled with pending durable messages; resuming the same task session",
+			});
+			if (this.running) void this.reconcile();
+			this.updateContext();
+			return;
+		}
+
+		const turnCount = event.data?.turnCount ?? 0;
+		const toolCallCount = event.data?.toolCallCount ?? 0;
+		const hasSubstantiveOutput = store.loadMessages(this.squadId, event.taskId)
+			.some((message) => message.from === event.agentName && message.type === "text" && message.text.trim().length > 0);
+		const hadMeaningfulWork = turnCount > 0 && (toolCallCount > 0 || hasSubstantiveOutput);
+		if (hadMeaningfulWork) {
+			this.handleTaskCompleted(event.taskId).then(() => this.updateContext());
+		} else {
+			this.handleUnexpectedAgentExit({
+				...event,
+				data: { ...event.data, unexpectedExit: true },
+			});
+		}
+	}
+
+	private onError(event: AgentEvent): void {
+		const errorMsg = event.data?.message || "Unknown error";
+		store.appendMessage(this.squadId, event.taskId, {
+			ts: store.now(),
+			from: "system",
+			type: "error",
+			text: errorMsg,
+		});
 	}
 
 	private async handleTaskCompleted(taskId: string): Promise<void> {

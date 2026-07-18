@@ -256,20 +256,6 @@ export interface SquadContext {
 }
 
 // ============================================================================
-// Knowledge (JSONL entries)
-// ============================================================================
-
-export type KnowledgeType = "decision" | "convention" | "finding";
-
-export interface KnowledgeEntry {
-	ts: string;
-	from: string;
-	squad?: string;
-	type: KnowledgeType;
-	text: string;
-}
-
-// ============================================================================
 // Scheduler
 // ============================================================================
 
@@ -286,18 +272,6 @@ export interface AgentActivity {
 }
 
 export type HealthStatus = "healthy" | "idle_warning" | "stuck" | "looping" | "long_running";
-
-// ============================================================================
-// Supervisor
-// ============================================================================
-
-export type SupervisorVerdict = "approve" | "revise" | "escalate";
-
-export interface SupervisorResult {
-	verdict: SupervisorVerdict;
-	reason: string;
-	feedback?: string;
-}
 
 // ============================================================================
 // Planner

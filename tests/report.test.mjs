@@ -1,5 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { buildCompletionSummary, buildFailureSummary } from "../src/report.ts";
 
 function task(id, status, output = null, error = null) {
@@ -43,6 +47,30 @@ test("completion report preserves cancelled tasks in a distinct neutral section"
 	assert.match(report, /CANCELLED TASKS \(neutral; not successful output\)/);
 	assert.match(report, /- obsolete-qa \(role-obsolete-qa\): cancelled/);
 	assert.doesNotMatch(report, /obsolete-qa.*done/);
+});
+
+test("completion report includes a git working tree snapshot", (t) => {
+	const repo = mkdtempSync(join(tmpdir(), "pi-squad-report-git-"));
+	t.after(() => rmSync(repo, { recursive: true, force: true }));
+	execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+	writeFileSync(join(repo, "tracked.txt"), "before\n");
+	execFileSync("git", ["add", "tracked.txt"], { cwd: repo });
+	writeFileSync(join(repo, "tracked.txt"), "after\nmore\n");
+	writeFileSync(join(repo, "untracked.txt"), "new\n");
+
+	const report = buildCompletionSummary([task("done-work", "done", "full handoff")], repo);
+	assert.match(report, /Working Tree Snapshot/);
+	assert.match(report, /tracked\.txt\s+\|/);
+	assert.match(report, /Untracked files: 1/);
+	assert.ok(report.includes("full handoff"));
+});
+
+test("completion report for a non-repo cwd is identical to the legacy output", (t) => {
+	const nonRepo = mkdtempSync(join(tmpdir(), "pi-squad-report-non-repo-"));
+	t.after(() => rmSync(nonRepo, { recursive: true, force: true }));
+	const tasks = [task("done-work", "done", "full handoff"), task("obsolete", "cancelled")];
+
+	assert.equal(buildCompletionSummary(tasks, nonRepo), buildCompletionSummary(tasks));
 });
 
 test("failure report preserves complete diagnostics", () => {

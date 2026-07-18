@@ -6,12 +6,11 @@
  * 2. Agent identity (role, custom prompt)
  * 3. Chain context (completed dependency outputs)
  * 4. Sibling awareness (parallel tasks, file map)
- * 5. Knowledge entries (decisions, conventions, findings)
- * 6. Queued messages (received while agent wasn't running)
+ * 5. Queued messages (received while agent wasn't running)
  */
 
-import type { AgentDef, KnowledgeEntry, Squad, Task, TaskMessage } from "./types.js";
-import { loadAllKnowledge, loadAllTasks, loadMessages } from "./store.js";
+import type { AgentDef, Squad, Task, TaskMessage } from "./types.js";
+import { loadAllTasks, loadMessages } from "./store.js";
 
 // ============================================================================
 // Squad Protocol (injected into every agent)
@@ -187,47 +186,6 @@ function buildSiblingAwareness(
 }
 
 // ============================================================================
-// Knowledge
-// ============================================================================
-
-function buildKnowledgeSection(squadId: string): string {
-	const entries = loadAllKnowledge(squadId);
-	if (entries.length === 0) return "";
-
-	const decisions = entries.filter((e) => e.type === "decision");
-	const conventions = entries.filter((e) => e.type === "convention");
-	const findings = entries.filter((e) => e.type === "finding");
-
-	const lines: string[] = ["# Squad Knowledge\n"];
-
-	if (decisions.length > 0) {
-		lines.push("## Decisions");
-		for (const d of decisions) {
-			lines.push(`- ${d.text} (${d.from})`);
-		}
-		lines.push("");
-	}
-
-	if (conventions.length > 0) {
-		lines.push("## Project Conventions");
-		for (const c of conventions) {
-			lines.push(`- ${c.text} (${c.from})`);
-		}
-		lines.push("");
-	}
-
-	if (findings.length > 0) {
-		lines.push("## Findings");
-		for (const f of findings) {
-			lines.push(`- ${f.text} (${f.from})`);
-		}
-		lines.push("");
-	}
-
-	return lines.join("\n");
-}
-
-// ============================================================================
 // Queued Messages
 // ============================================================================
 
@@ -326,7 +284,6 @@ export function buildAgentSystemPrompt(options: ProtocolBuildOptions): string {
 			buildAgentIdentity(agentDef),
 			...(task.fileSpecDelta ? [buildTaskSection(task), buildReworkContext(task, squadId)] : []),
 			buildChainContext(task, allTasks, squadId),
-			buildKnowledgeSection(squadId),
 			buildQueuedMessages(queuedMessages),
 		].filter((section) => section.length > 0);
 		return fileSections.join("\n---\n\n");
@@ -339,7 +296,6 @@ export function buildAgentSystemPrompt(options: ProtocolBuildOptions): string {
 		buildReworkContext(task, squadId),
 		buildChainContext(task, allTasks, squadId),
 		buildSiblingAwareness(task, allTasks, modifiedFiles),
-		buildKnowledgeSection(squadId),
 		buildQueuedMessages(queuedMessages),
 	].filter((s) => s.length > 0);
 
