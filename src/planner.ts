@@ -251,8 +251,7 @@ Respond with a JSON object (and nothing else outside the JSON):
 \`\`\`json
 {
   "agents": {
-    "agent-name": {},
-    "agent-name": { "model": "override-model-if-needed", "thinking": "high" }
+    "agent-name": {}
   },
   "tasks": [
     {
@@ -269,7 +268,7 @@ Respond with a JSON object (and nothing else outside the JSON):
 ## Rules
 ${PLAN_STRUCTURE_RULES}
 - Only reference agents that exist in the Available Agents list
-- Agent overrides are optional: "model" (a pi model id) and "thinking" (one of: off, minimal, low, medium, high, xhigh, max). Omit both to use defaults. Raise "thinking" only for tasks needing deep reasoning (architecture, security)
+- Agent entries stay empty ({}) so each agent uses its configured model/thinking (agent definition, then squad defaults). Set "model" (a pi model id) or "thinking" (off, minimal, low, medium, high, xhigh, max) ONLY when the goal explicitly requests a specific model or thinking level
 
 ## Task Descriptions
 ${TASK_DESCRIPTION_GUIDE}

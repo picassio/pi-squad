@@ -11,6 +11,7 @@
       "src/index.ts"
     ],
     "skills": [
+      "src/skills/squad-plan",
       "src/skills/squad-supervisor",
       "src/skills/squad-backend-dev",
       "src/skills/squad-code-review",

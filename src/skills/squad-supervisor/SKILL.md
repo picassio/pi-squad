@@ -29,6 +29,7 @@ Providing `tasks` yourself skips the planner agent — so you must apply its rul
 - When tasks share an interface (API endpoints, schema, data formats), create a design/contract task FIRST and make consumers depend on it
 - Include a final QA/verification task if there are user-facing changes
 - Required work only — no optional polish
+- Do NOT set agent `model`/`thinking` overrides unless the user explicitly asked for them — configured agent definitions and `/squad defaults` apply otherwise
 
 Plans are validated on submission: structural errors (unknown deps, cycles, duplicate IDs, no entry task) are rejected; rule violations come back as ⚠️ warnings in the tool response. **Act on the warnings** — fix them with `squad_modify` `add_task`, or note them for review time. Don't silently ignore them.
 

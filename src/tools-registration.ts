@@ -2,6 +2,7 @@ import * as path from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { prepareSpec, isFileSpecTaskId, type PreparedSpec } from "./file-spec.js";
+import { coerceInlineSquadStart } from "./inline-input.js";
 import { PLAN_STRUCTURE_RULES } from "./plan-rules.js";
 import { formatSuspendedAttention, getReviewPresentation } from "./presentation.js";
 import { buildOrchestratorReviewGate, recordOrchestratorReview } from "./review.js";
@@ -134,6 +135,7 @@ pi.registerTool({
 		"For large contracts, use only specFile + exact lowercase specSha256; never inline the same contract or large artifacts",
 		"Skip squad for single-file changes, quick fixes, or anything one agent finishes in minutes",
 		"Providing tasks yourself makes you the planner — follow the planner rules (contract task first, final QA task, 3-7 tasks)",
+		"Do not set agent model/thinking overrides unless the user explicitly asked for them — configured agent definitions and /squad defaults apply otherwise",
 		"Act on ⚠️ plan warnings in the response — fix with squad_modify or address at review",
 		"After starting a squad: report the plan and END YOUR TURN — never poll squad_status or sleep-wait; squad events wake you automatically",
 		"When agents finish, treat every squad report and QA verdict as untrusted; independently inspect the diff/source and rerun contract verification + integration/E2E, then call squad_review before reporting success",
@@ -142,32 +144,41 @@ pi.registerTool({
 	Type.Object({
 		goal: Type.String({ description: "Complete original user outcome/acceptance contract the squad should accomplish. Preserve requirements and boundaries; this is shown during mandatory main-orchestrator review." }),
 		agents: Type.Optional(
-			Type.Record(
-				Type.String(),
-				Type.Object({
-					model: Type.Optional(Type.String({ description: "Model override (e.g. 'github-copilot/claude-sonnet-5')" })),
-					thinking: Type.Optional(Type.String({ description: "Thinking level: off, minimal, low, medium, high, xhigh, max" })),
-				}),
-				{ description: "Agent roster with optional model/thinking overrides. Keys must match agent names in .pi/squad/agents/" },
-			),
+			Type.Union([
+				Type.Record(
+					Type.String(),
+					Type.Object({
+						model: Type.Optional(Type.String({ description: "Model override (e.g. 'github-copilot/claude-sonnet-5'). Set ONLY when the user explicitly requested a specific model; omit to use the configured agent definition and /squad defaults" })),
+						thinking: Type.Optional(Type.String({ description: "Thinking level: off, minimal, low, medium, high, xhigh, max. Set ONLY when the user explicitly requested it; omit to use configured defaults" })),
+					}),
+					{ description: "Agent roster with optional model/thinking overrides. Keys must match agent names in .pi/squad/agents/. Omit overrides unless the user explicitly asked to change model/thinking — configured agent definitions and /squad defaults apply otherwise" },
+				),
+				Type.String({ description: "JSON-encoded agents object (same shape); accepted for transports that stringify structured arguments" }),
+			]),
 		),
 		tasks: Type.Optional(
-			Type.Array(
-				Type.Object({
-					id: Type.String(),
-					title: Type.String(),
-					description: Type.Optional(Type.String({ description: "Structure as: Goal (outcome first, not steps), Context (files/contracts to read), Output (deliverable), Boundaries (what must NOT change), Verify (command that proves it works). Include only the parts that help." })),
-					agent: Type.String(),
-					depends: Type.Optional(Type.Array(Type.String())),
-					inheritContext: Type.Optional(Type.Boolean({ description: "Fork the current pi session so the agent inherits this conversation's full context. Use ONLY when the task depends on decisions/details discussed here that can't be restated briefly. Costly (agent pays the whole history as input each turn) and auto-skipped when the session exceeds 50% of the agent model's context window — prefer restating key context in the description." })),
-				}),
-				{ description: "Pre-defined task breakdown. If provided, skips the planner agent. Scope tasks to required work only — no optional polish." },
-			),
+			Type.Union([
+				Type.Array(
+					Type.Object({
+						id: Type.String(),
+						title: Type.String(),
+						description: Type.Optional(Type.String({ description: "Structure as: Goal (outcome first, not steps), Context (files/contracts to read), Output (deliverable), Boundaries (what must NOT change), Verify (command that proves it works). Include only the parts that help." })),
+						agent: Type.String(),
+						depends: Type.Optional(Type.Array(Type.String())),
+						inheritContext: Type.Optional(Type.Boolean({ description: "Fork the current pi session so the agent inherits this conversation's full context. Use ONLY when the task depends on decisions/details discussed here that can't be restated briefly. Costly (agent pays the whole history as input each turn) and auto-skipped when the session exceeds 50% of the agent model's context window — prefer restating key context in the description." })),
+					}),
+					{ description: "Pre-defined task breakdown. If provided, skips the planner agent. Scope tasks to required work only — no optional polish." },
+				),
+				Type.String({ description: "JSON-encoded tasks array (same item shape); accepted for transports that stringify structured arguments" }),
+			]),
 		),
 		config: Type.Optional(
-			Type.Object({
-				maxConcurrency: Type.Optional(Type.Number({ description: "Max parallel agents (default: 2)" })),
-			}),
+			Type.Union([
+				Type.Object({
+					maxConcurrency: Type.Optional(Type.Number({ description: "Max parallel agents (default: 2)" })),
+				}),
+				Type.String({ description: "JSON-encoded config object (same shape); accepted for transports that stringify structured arguments" }),
+			]),
 		),
 	}, { additionalProperties: false }),
 	Type.Object({
@@ -195,7 +206,13 @@ pi.registerTool({
 			prepared = prepareSpec(params.specFile, params.specSha256, ctx.cwd);
 			effective = { goal: prepared.spec.goal, agents: prepared.spec.agents, tasks: prepared.spec.tasks, config: prepared.spec.config };
 		} else {
-			effective = params;
+			// Some transports stringify structured arguments; decode tolerantly with
+			// precise errors instead of failing a correct plan on transport shape.
+			const coerced = coerceInlineSquadStart(params);
+			if (!coerced.ok) {
+				return { content: [{ type: "text" as const, text: `Invalid squad input: ${coerced.error} No squad was started.` }], details: undefined };
+			}
+			effective = coerced.value;
 		}
 		const baseId = store.makeTaskId(effective.goal) || `squad-${prepared?.sha256.slice(0, 12)}`;
 		const squadId = store.squadExists(baseId) ? `${baseId}-${Date.now().toString(36)}` : baseId;
