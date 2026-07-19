@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.3] - 2026-07-19
+
 ### Fixed
 
 - Newly generated squad IDs now combine a path-safe readable goal slug with a full UUID, eliminating collisions while retaining recognizable names. Slugs also trim separators introduced at the 40-character boundary, preventing `PUBLISH_FAILED: unsafe squad id`. Existing persisted squad IDs and user-authored task IDs are unchanged.
