@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Generated squad IDs now trim a separator introduced at the 40-character truncation boundary, preventing valid file-spec squads from failing publication with `PUBLISH_FAILED: unsafe squad id`.
+- Newly generated squad IDs now combine a path-safe readable goal slug with a full UUID, eliminating collisions while retaining recognizable names. Slugs also trim separators introduced at the 40-character boundary, preventing `PUBLISH_FAILED: unsafe squad id`. Existing persisted squad IDs and user-authored task IDs are unchanged.
 
 ## [0.19.2] - 2026-07-18
 

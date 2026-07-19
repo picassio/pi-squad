@@ -980,10 +980,16 @@ test("panel-path scheduler events reach the main session immediately after reviv
 	await emit(api, "session_shutdown");
 });
 
-test("generated squad IDs remain safe when truncation lands on a separator", () => {
-	const id = store.makeTaskId("In /home/ubuntu/projects/pi-para (main at 100ad68, v0.6.7), implement cleanup");
-	assert.equal(id, "in-home-ubuntu-projects-pi-para-main-at");
-	assert.match(id, /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/);
+test("generated squad IDs combine a readable safe slug with a UUID", () => {
+	const goal = "In /home/ubuntu/projects/pi-para (main at 100ad68, v0.6.7), implement cleanup";
+	assert.equal(store.makeTaskId(goal), "in-home-ubuntu-projects-pi-para-main-at");
+	const first = store.makeSquadId(goal);
+	const second = store.makeSquadId(goal);
+	const expected = /^in-home-ubuntu-projects-pi-para-main-at-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+	assert.match(first, expected);
+	assert.match(second, expected);
+	assert.notEqual(first, second);
+	assert.match(store.makeSquadId("!!!"), /^squad-[0-9a-f-]{36}$/);
 });
 
 test("file-spec publication rejects inconsistent metadata and unsafe task paths without partial discovery", () => {
@@ -1039,7 +1045,8 @@ test("cancelled file-spec needs no attestation: public call publishes exact byte
 	const toolsIndex = spawn.args.indexOf("--tools"); assert.ok(toolsIndex >= 0); assert.equal(spawn.args[toolsIndex + 1], "bash,squad_spec_read", "file reader is force-added to child tool allowlists");
 	await api.tools.get("squad").execute("collision-file", { specFile, specSha256: sha256 }, undefined, undefined, ctx);
 	const collision = store.listSquads().map(id => store.loadSquad(id)).find(squad => squad?.goal === spec.goal && squad.id !== created.id);
-	assert.ok(collision?.id.startsWith(`${created.id}-`), "an existing published ID resolves to a distinct safe directory");
+	assert.match(collision?.id ?? "", /^file-api-child-process-integration-[0-9a-f-]{36}$/,
+		"repeated goals receive distinct readable UUID-backed directories");
 	assert.deepEqual(fs.readFileSync(collision.spec.path), raw);
 	await api.tools.get("squad_modify").execute("cancel-collision", { squadId: collision.id, action: "cancel" }, undefined, undefined, ctx);
 	await api.tools.get("squad_modify").execute("cancel-file", { squadId: created.id, action: "cancel" }, undefined, undefined, ctx);

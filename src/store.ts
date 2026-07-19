@@ -705,6 +705,10 @@ export function makeTaskId(title: string): string {
 		.replace(/-$/, "");
 }
 
+export function makeSquadId(goal: string): string {
+	return `${makeTaskId(goal) || "squad"}-${randomUUID()}`;
+}
+
 export function squadExists(squadId: string): boolean {
 	return fs.existsSync(getSquadFilePath(squadId));
 }

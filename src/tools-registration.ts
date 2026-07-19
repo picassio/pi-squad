@@ -214,7 +214,7 @@ pi.registerTool({
 			}
 			effective = coerced.value;
 		}
-		const baseId = store.makeTaskId(effective.goal) || `squad-${prepared?.sha256.slice(0, 12)}`;
+		const baseId = store.makeSquadId(effective.goal);
 		const squadId = store.squadExists(baseId) ? `${baseId}-${Date.now().toString(36)}` : baseId;
 		return await startSquad(squadId, effective, ctx.cwd, squadSkillPaths, pi, sessionFile, prepared);
 	},
