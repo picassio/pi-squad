@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Generated squad IDs now trim a separator introduced at the 40-character truncation boundary, preventing valid file-spec squads from failing publication with `PUBLISH_FAILED: unsafe squad id`.
+
 ## [0.19.2] - 2026-07-18
 
 ### Fixed

@@ -980,6 +980,12 @@ test("panel-path scheduler events reach the main session immediately after reviv
 	await emit(api, "session_shutdown");
 });
 
+test("generated squad IDs remain safe when truncation lands on a separator", () => {
+	const id = store.makeTaskId("In /home/ubuntu/projects/pi-para (main at 100ad68, v0.6.7), implement cleanup");
+	assert.equal(id, "in-home-ubuntu-projects-pi-para-main-at");
+	assert.match(id, /^[a-z0-9](?:[a-z0-9-]{0,126}[a-z0-9])?$/);
+});
+
 test("file-spec publication rejects inconsistent metadata and unsafe task paths without partial discovery", () => {
 	const raw = Buffer.from("{\"schemaVersion\":1}\n");
 	const id = "atomic-file-publish";

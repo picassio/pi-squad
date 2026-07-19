@@ -701,7 +701,8 @@ export function makeTaskId(title: string): string {
 		.toLowerCase()
 		.replace(/[^a-z0-9]+/g, "-")
 		.replace(/^-|-$/g, "")
-		.slice(0, 40);
+		.slice(0, 40)
+		.replace(/-$/, "");
 }
 
 export function squadExists(squadId: string): boolean {
