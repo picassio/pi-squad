@@ -449,3 +449,22 @@ test("squad_failed emits only on the transition, never on repeated reconciles", 
 	assert.equal(events.length, 1, "an already-failed squad never queues duplicate stall notifications");
 	await scheduler.stop();
 });
+
+test("a task completing after an interim failure clears its stale error annotation", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "flaky", status: "in_progress" }],
+	});
+	store.updateTaskStatus(id, "flaky", "in_progress", { error: "Agent devops exited before RPC response" });
+	scheduler.handleAgentEvent({
+		type: "message_end",
+		taskId: "flaky",
+		agentName: "devops",
+		data: { role: "assistant", content: [{ type: "text", text: "recovered and finished" }] },
+	});
+	await scheduler.handleTaskCompleted("flaky");
+	const task = store.loadTask(id, "flaky");
+	assert.equal(task.status, "done");
+	assert.equal(task.error, null, "a done task must not display a stale interim failure");
+	await scheduler.stop();
+});

@@ -994,8 +994,11 @@ export class Scheduler {
 			.filter((m) => m.from === task.agent && (m.type === "text" || m.type === "done"));
 		const output = agentMessages.map((m) => m.text).join("\n");
 
+		// Clear any interim failure annotation (spawn retry, RPC race): a task
+		// that ultimately completed must not display a stale error forever.
 		store.updateTaskStatus(this.squadId, taskId, "done", {
 			output: output || "Task completed",
+			error: null,
 			completed: store.now(),
 		});
 

@@ -986,6 +986,58 @@ test("panel-path scheduler events reach the main session immediately after reviv
 	await emit(api, "session_shutdown");
 });
 
+test("terminal task failure notifies the main session while siblings continue; squad stall defers to squad-failed", async () => {
+	const squadId = "sq-task-failed-notify";
+	const projectDir = path.join(tempHome, "task-failed-project");
+	fs.mkdirSync(projectDir, { recursive: true });
+	store.saveSquad({
+		id: squadId, goal: "prove task-failure notification", status: "running", created: store.now(), cwd: projectDir,
+		agents: { devops: {} }, config: { maxConcurrency: 2, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	// Pending (not in_progress): session_start orphan cleanup suspends
+	// in_progress tasks of scheduler-less squads, which is a different flow.
+	for (const id of ["doomed", "sibling"]) {
+		store.createTask(squadId, {
+			id, title: id, description: "work", agent: "devops", status: "pending", depends: [],
+			created: store.now(), started: null, completed: null, output: null, error: null,
+			usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+		});
+	}
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const theme = { fg: (_c, t) => t, bold: (t) => t };
+	let panel;
+	const tui = { terminal: { rows: 40, columns: 160 }, requestRender() {} };
+	const ctx = { hasUI: true, cwd: projectDir, ui: {
+		theme, setWidget() {}, setStatus() {}, notify() {}, onTerminalInput() {}, input: async () => undefined,
+		custom: (factory) => new Promise((resolve) => { panel = factory(tui, theme, {}, resolve); }),
+	} };
+	await emit(api, "session_start", {}, ctx);
+	await api.commands.get("squad").handler("panel", ctx);
+	assert.ok(panel, "panel provides the wired scheduler");
+	try {
+		panel.scheduler.handleTaskFailed("doomed", "Agent devops exited before RPC response");
+		const taskFailedMsgs = api.sent.filter((entry) => entry.message.customType === "squad-task-failed");
+		assert.equal(taskFailedMsgs.length, 1, "individual failure with a live sibling notifies the main session");
+		assert.match(taskFailedMsgs[0].message.content, /doomed/);
+		assert.match(taskFailedMsgs[0].message.content, /Agent devops exited before RPC response/);
+		assert.equal(api.sent.filter((entry) => entry.message.customType === "squad-failed").length, 0,
+			"squad keeps running, so no squad-level stall notification yet");
+
+		panel.scheduler.handleTaskFailed("sibling", "boom");
+		assert.equal(api.sent.filter((entry) => entry.message.customType === "squad-task-failed").length, 1,
+			"when the failure stalls the whole squad, the squad-failed summary replaces the task-level message");
+		assert.equal(api.sent.filter((entry) => entry.message.customType === "squad-failed").length, 1,
+			"the stall is reported exactly once");
+	} finally {
+		// Teardown must run even on assertion failure: a live monitor interval
+		// otherwise keeps the test process alive forever.
+		panel.handleInput("\x11");
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await emit(api, "session_shutdown");
+	}
+});
+
 test("generated squad IDs combine a readable safe slug with a UUID", () => {
 	const goal = "In /home/ubuntu/projects/pi-para (main at 100ad68, v0.6.7), implement cleanup";
 	assert.equal(store.makeTaskId(goal), "in-home-ubuntu-projects-pi-para-main-at");

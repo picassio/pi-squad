@@ -66,6 +66,29 @@ export function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squa
 				}
 				break;
 			}
+			case "task_failed": {
+				// A task died terminally while the squad continues. Without this the
+				// main session learns about individual failures only when the whole
+				// squad later stalls or finishes. When no runnable work remains the
+				// imminent squad_failed event carries the failure summary instead, so
+				// skip the task-level message to avoid duplicate notifications.
+				try {
+					const tasks = store.loadAllTasks(squadId);
+					const squadContinues = tasks.some((task) => task.status === "in_progress" || task.status === "pending");
+					if (!squadContinues) break;
+					const failed = tasks.find((task) => task.id === event.taskId);
+					pi.sendMessage({
+						customType: "squad-task-failed",
+						content: `[squad] Task '${event.taskId}'${failed ? ` (${failed.agent})` : ""} FAILED in '${squadId}' while other tasks continue.\n` +
+							`Error: ${event.message ?? failed?.error ?? "unknown"}\n` +
+							`Dependents of this task stay blocked. Repair now with squad_modify — resume_task to retry it, set_dependencies to reroute, or cancel_task if obsolete — or the squad will stall after the remaining tasks finish.`,
+						display: true,
+					}, { triggerTurn: true, deliverAs: "followUp" });
+				} catch (error) {
+					logError("squad-scheduler", `task-failed delivery failed for ${squadId}/${event.taskId}: ${(error as Error).message}`);
+				}
+				break;
+			}
 			case "squad_failed": {
 				const tasks = store.loadAllTasks(squadId);
 				const failed = tasks.filter((task) => task.status === "failed");
