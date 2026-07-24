@@ -78,6 +78,9 @@ export type SquadStatus = "planning" | "running" | "paused" | "review" | "done" 
 export interface SquadReview {
 	status: "pending" | "passed" | "failed";
 	requestedAt: string;
+	/** When the review-required notification was handed to the main session.
+	 * Absent/null = not yet delivered; reconcile re-raises the gate. */
+	notifiedAt?: string | null;
 	completedAt: string | null;
 	verdict: "pass" | "pass_with_issues" | "fail" | null;
 	contractChecks: string[];

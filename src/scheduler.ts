@@ -403,6 +403,15 @@ export class Scheduler {
 		if (freshSquad && (freshSquad.status === "running" || freshSquad.status === "failed")) {
 			this.checkSquadCompletion(store.loadAllTasks(this.squadId), freshSquad);
 		}
+
+		// A pending review whose notification never reached the main session
+		// (delivery threw, or disabled mode dropped the event) is re-raised until
+		// the delivery handler durably records review.notifiedAt. Successful
+		// delivery stops the re-raise, so a slow human review never re-notifies.
+		const reviewSquad = freshSquad?.status === "review" ? freshSquad : store.loadSquad(this.squadId);
+		if (reviewSquad?.status === "review" && reviewSquad.review?.status === "pending" && !reviewSquad.review.notifiedAt) {
+			this.emit({ type: "squad_review_required", squadId: this.squadId });
+		}
 	}
 
 	// =========================================================================
@@ -1328,7 +1337,11 @@ export class Scheduler {
 			store.saveSquad(squad);
 			this.emit({ type: "squad_review_required", squadId: this.squadId });
 		} else if (anyFailed && !anyInProgress) {
-			// All remaining tasks are blocked/failed with no way forward
+			// All remaining tasks are blocked/failed with no way forward.
+			// Emit only on the transition: repeated reconciles over an already-failed
+			// squad must not queue duplicate stall notifications (each would trigger
+			// its own main-session turn).
+			if (squad.status === "failed") return;
 			const blockedCount = relevant.filter((task) => task.status === "blocked").length;
 			const failedCount = relevant.filter((task) => task.status === "failed").length;
 			if (blockedCount + failedCount === relevant.filter((task) => task.status !== "done").length) {

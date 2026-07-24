@@ -974,6 +974,12 @@ test("panel-path scheduler events reach the main session immediately after reviv
 		api.sent.some((entry) => entry.message.customType === "squad-review-required"),
 		"the scheduler supplied to the panel is registered and wired before panel interaction",
 	);
+	assert.ok(store.loadSquad(squadId).review?.notifiedAt,
+		"successful wired delivery durably records review.notifiedAt so reconcile stops re-raising");
+	const sentBefore = api.sent.filter((entry) => entry.message.customType === "squad-review-required").length;
+	await panel.scheduler.reconcile();
+	assert.equal(api.sent.filter((entry) => entry.message.customType === "squad-review-required").length, sentBefore,
+		"a delivered pending review is never re-notified by reconcile");
 
 	panel.handleInput("\x11");
 	await new Promise((resolve) => setTimeout(resolve, 0));

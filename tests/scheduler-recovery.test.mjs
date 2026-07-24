@@ -377,3 +377,75 @@ test("reconcile() leaves genuinely stalled squads failed (no runnable work)", as
 	assert.deepEqual(spawned, []);
 	await scheduler.stop();
 });
+
+test("pending review gate is re-raised by reconcile until delivery records notifiedAt", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "only-task", status: "done" }],
+	});
+	const events = [];
+	scheduler.onEvent((event) => { if (event.type === "squad_review_required") events.push(event); });
+
+	// Transition emits once; no delivery handler records notifiedAt, so the
+	// same reconcile pass re-raises the undelivered gate.
+	await scheduler.start();
+	assert.equal(store.loadSquad(id).status, "review");
+	assert.equal(store.loadSquad(id).review.status, "pending");
+	assert.ok(events.length >= 1, "undelivered review gate is emitted");
+	const undelivered = events.length;
+
+	await scheduler.reconcile();
+	assert.ok(events.length > undelivered, "reconcile keeps re-raising while delivery is unrecorded");
+
+	// Simulate the wired main-session handler durably recording delivery.
+	const squad = store.loadSquad(id);
+	squad.review.notifiedAt = store.now();
+	store.saveSquad(squad);
+	const delivered = events.length;
+	await scheduler.reconcile();
+	await scheduler.reconcile();
+	assert.equal(events.length, delivered, "recorded delivery stops re-raising; a slow human review is never re-notified");
+	await scheduler.stop();
+});
+
+test("review gate emits exactly once per transition when delivery records notifiedAt synchronously", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "solo", status: "done" }],
+	});
+	const events = [];
+	scheduler.onEvent((event) => {
+		if (event.type !== "squad_review_required") return;
+		events.push(event);
+		// Mirror wireSchedulerEvents: successful sendMessage records delivery.
+		const squad = store.loadSquad(id);
+		if (squad?.review?.status === "pending" && !squad.review.notifiedAt) {
+			squad.review.notifiedAt = store.now();
+			store.saveSquad(squad);
+		}
+	});
+	await scheduler.start();
+	await scheduler.reconcile();
+	assert.equal(events.length, 1, "delivered gate is never duplicated by later reconciles");
+	assert.ok(store.loadSquad(id).review.notifiedAt);
+	await scheduler.stop();
+});
+
+test("squad_failed emits only on the transition, never on repeated reconciles", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [
+			{ id: "dead", status: "failed" },
+			{ id: "stuck", status: "blocked", depends: ["dead"] },
+		],
+	});
+	const events = [];
+	scheduler.onEvent((event) => { if (event.type === "squad_failed") events.push(event); });
+	await scheduler.start();
+	assert.equal(store.loadSquad(id).status, "failed");
+	assert.equal(events.length, 1, "stall notification fires on the transition");
+	await scheduler.reconcile();
+	await scheduler.reconcile();
+	assert.equal(events.length, 1, "an already-failed squad never queues duplicate stall notifications");
+	await scheduler.stop();
+});

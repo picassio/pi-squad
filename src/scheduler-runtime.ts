@@ -22,14 +22,32 @@ export function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squa
 				const totalCost = tasks.reduce((sum, task) => sum + task.usage.cost, 0);
 				scheduler.updateContext();
 				if (!squad) break;
-				pi.sendMessage({
-					customType: "squad-review-required",
-					content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` +
-						`Squad claims (review inputs only):\n${summary}\n\n` +
-						`Total cost: $${totalCost.toFixed(4)}\n\n` +
-						buildOrchestratorReviewGate(squad, tasks),
-					display: true,
-				}, { triggerTurn: true, deliverAs: "followUp" });
+				try {
+					pi.sendMessage({
+						customType: "squad-review-required",
+						content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` +
+							`Squad claims (review inputs only):\n${summary}\n\n` +
+							`Total cost: $${totalCost.toFixed(4)}\n\n` +
+							buildOrchestratorReviewGate(squad, tasks),
+						display: true,
+					}, { triggerTurn: true, deliverAs: "followUp" });
+					// Record durable delivery so reconcile stops re-raising the gate.
+					// An unrecorded emission (throw here, or the disabled-mode drop
+					// above) is re-emitted by the next reconcile pass.
+					const fresh = store.loadSquad(squadId);
+					if (fresh?.review?.status === "pending" && !fresh.review.notifiedAt) {
+						fresh.review.notifiedAt = store.now();
+						store.saveSquad(fresh);
+					}
+				} catch (error) {
+					logError("squad-scheduler", `review-required delivery failed for ${squadId}: ${(error as Error).message}`);
+				}
+				// The followUp above waits for the current main run to settle. Surface
+				// the pending gate immediately in the TUI so a long/stalled run cannot
+				// hide it for hours.
+				try {
+					if (runtime.uiCtx?.hasUI) runtime.uiCtx.ui.notify(`[squad] "${squadId}" finished — awaiting your independent review (report queued for end of current turn)`, "info");
+				} catch { /* toast is best-effort */ }
 				// Keep the settled scheduler addressable. A later exact-task message
 				// can reopen the task immediately on its bound durable Pi session.
 				break;

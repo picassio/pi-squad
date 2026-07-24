@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The mandatory review-required report can no longer be silently lost or invisibly stalled. Successful delivery is durably recorded as `review.notifiedAt`; the 60s reconcile loop re-raises an unrecorded pending gate (covers delivery exceptions and disabled-mode drops), and an immediate TUI notification surfaces the pending review even while a long or stalled main-session run delays the queued follow-up report. Delivered gates are never re-notified while a human review is in progress.
+- `squad_failed` stall notifications now fire only on the actual transition to `failed`. Repeated reconciles over an already-failed squad no longer queue duplicate notifications, each of which previously triggered its own main-session turn.
+- Review-required delivery failures are now logged to `~/.pi/squad/debug.log` instead of being swallowed.
+
 ## [0.19.3] - 2026-07-19
 
 ### Fixed
