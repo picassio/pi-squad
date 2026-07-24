@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.4] - 2026-07-24
+
 ### Fixed
 
 - The mandatory review-required report can no longer be silently lost or invisibly stalled. Successful delivery is durably recorded as `review.notifiedAt`; the 60s reconcile loop re-raises an unrecorded pending gate (covers delivery exceptions and disabled-mode drops), and an immediate TUI notification surfaces the pending review even while a long or stalled main-session run delays the queued follow-up report. Delivered gates are never re-notified while a human review is in progress.
