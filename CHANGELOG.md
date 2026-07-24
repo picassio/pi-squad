@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.5] - 2026-07-24
+
 ### Fixed
 
 - Terminal task failures are now reported to the main session immediately when the rest of the squad keeps running (new `squad-task-failed` notification with the exact task, agent, error, and repair guidance). Previously an individual agent death — e.g. `Agent devops exited before RPC response` — was invisible in chat until the whole squad stalled or finished. When no runnable work remains, the existing `squad-failed` summary is sent instead, never both.
