@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-26
+
 ### Added
 
 - `squad_modify add_task` accepts `forkFromTask: "<task id>"`: the new task's session is forked from the source task's durable session, so follow-up and review-rework agents continue with the source's complete context instead of redoing everything. Validated at add time (source must exist and have run once; mutually exclusive with `inheritContext`) and guarded by the same 50%-of-context-window check as `inheritContext`.
