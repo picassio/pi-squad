@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `squad_modify add_task` accepts `forkFromTask: "<task id>"`: the new task's session is forked from the source task's durable session, so follow-up and review-rework agents continue with the source's complete context instead of redoing everything. Validated at add time (source must exist and have run once; mutually exclusive with `inheritContext`) and guarded by the same 50%-of-context-window check as `inheritContext`.
+
+### Fixed
+
+- Provider/API outages no longer leave tasks permanently unretriable. Unexpected agent exits now retry on the same durable session with backoff (2s/10s/30s/60s/120s, `PI_SQUAD_SPAWN_RETRIES` overrides the count) instead of a single 2s retry whose in-memory flag was never cleared — previously one early blip consumed the only retry forever, and a resumed task could instantly re-fail terminally. Successful completion and explicit `resume`/`resume_task` grant a fresh budget, and the terminal failure message now teaches the exact recovery call.
+- A failed `squad_review` verdict now responds with explicit same-squad rework instructions (add `-fix` tasks, ideally `forkFromTask` the reviewed implementation) and forbids cancelling or abandoning the squad, closing the observed "review failed → squad stopped, no rework requested" drift.
+
 ## [0.19.5] - 2026-07-24
 
 ### Fixed

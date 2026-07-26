@@ -468,3 +468,73 @@ test("a task completing after an interim failure clears its stale error annotati
 	assert.equal(task.error, null, "a done task must not display a stale interim failure");
 	await scheduler.stop();
 });
+
+test("provider-outage exits retry with backoff and explicit resume grants a fresh budget", async () => {
+	process.env.PI_SQUAD_SPAWN_RETRIES = "2";
+	try {
+		const { id, scheduler } = makeSquad({
+			squadStatus: "running",
+			tasks: [{ id: "outage", status: "in_progress" }],
+		});
+		const failures = [];
+		scheduler.onEvent((event) => { if (event.type === "task_failed") failures.push(event); });
+		const exit = () => scheduler.handleUnexpectedAgentExit({ type: "agent_end", taskId: "outage", agentName: "backend", data: { exitCode: 1, turnCount: 0 } });
+
+		exit();
+		assert.equal(store.loadTask(id, "outage").status, "pending", "retry 1 re-queues the same durable session");
+		exit();
+		assert.equal(store.loadTask(id, "outage").status, "pending", "retry 2 stays within the budget");
+		exit();
+		const failed = store.loadTask(id, "outage");
+		assert.equal(failed.status, "failed", "exhausted budget is terminal");
+		assert.match(failed.error, /resume_task/, "terminal failure teaches the recovery command");
+		assert.match(failed.error, /provider\/API outage/);
+		assert.equal(failures.length, 1);
+
+		await scheduler.resumeTask("outage");
+		exit();
+		assert.equal(store.loadTask(id, "outage").status, "pending",
+			"resume_task grants a fresh retry budget instead of instantly re-failing");
+		await scheduler.stop();
+	} finally {
+		delete process.env.PI_SQUAD_SPAWN_RETRIES;
+	}
+});
+
+test("forkFromTask spawns the new task as a fork of the source task's durable session", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [
+			{ id: "source", status: "done" },
+			{ id: "followup", status: "pending" },
+		],
+	});
+	const sourceSession = path.join(tempHome, `fork-source-${id}.jsonl`);
+	fs.writeFileSync(sourceSession, '{"type":"session"}\n');
+	store.bindTaskSession(id, "source", { file: sourceSession });
+	const followup = store.loadTask(id, "followup");
+	followup.forkFromTaskId = "source";
+	store.saveTask(id, followup);
+
+	const agentDef = { name: "backend", role: "Backend", description: "", model: null, tools: null, tags: [], prompt: "" };
+	assert.equal(
+		scheduler.resolveForkSession(store.loadTask(id, "followup"), store.loadSquad(id), agentDef),
+		sourceSession,
+		"the follow-up task forks the source task's durable session",
+	);
+
+	// A source without any durable session skips the fork with a durable notice.
+	followup.forkFromTaskId = "missing-task";
+	store.saveTask(id, followup);
+	assert.equal(scheduler.resolveForkSession(store.loadTask(id, "followup"), store.loadSquad(id), agentDef), undefined);
+	assert.ok(store.loadMessages(id, "followup").some((m) => m.text.includes("Session fork skipped")));
+
+	// The context-window guard still protects against oversized forks.
+	const guarded = new Scheduler(id, [], { resolveContextWindow: () => 4 });
+	followup.forkFromTaskId = "source";
+	store.saveTask(id, followup);
+	assert.equal(guarded.resolveForkSession(store.loadTask(id, "followup"), store.loadSquad(id), agentDef), undefined,
+		"fork source larger than 50% of the model window is skipped");
+	await scheduler.stop();
+	await guarded.stop();
+});

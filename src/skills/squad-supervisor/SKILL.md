@@ -149,7 +149,9 @@ Send small, scoped corrections instead of restarting the task:
 ## Modifying a Running Squad
 
 Use `squad_modify` when:
-- **`add_task`**: User requests something not in the original plan
+- **`add_task`**: User requests something not in the original plan. For follow-up or review-rework work, set `forkFromTask: "<source task id>"` so the new agent forks the source task's durable session and continues with its full context instead of redoing everything (mutually exclusive with `inheritContext`; the source must have run at least once).
+- **Provider outage recovery**: a task that failed with "retries exhausted — likely provider/API outage" is not stuck. When the provider recovers, `{ action: "resume_task", taskId: "..." }` reopens the exact durable session with a fresh retry budget — never recreate the task from scratch for this.
+- **Failed independent review**: never cancel the squad or mark it failed. Add same-squad rework tasks (ideally with `forkFromTask` pointing at the reviewed implementation task), let them settle, re-verify, and submit a fresh `squad_review`.
 - **`set_dependencies`**: Replace a task's dependency list with top-level `taskId` and `depends`, e.g. `{ action: "set_dependencies", taskId: "publish", depends: ["build"] }`. This is allowed only for tasks that are not running or done; the complete replacement is validated atomically for unknown IDs, self-dependencies, duplicates, and cycles.
 - **`cancel_task`**: A task is no longer needed. Cancellation is refused while any non-cancelled task directly depends on it. First call `set_dependencies` for every dependent named in the refusal, then retry `cancel_task`. Cancellation never cascades and never removes or rewrites dependencies automatically.
 - **`pause_task`** / **`resume_task`**: Temporarily halt or explicitly revive an agent; `resume_task` is also the only action that revives a cancelled task.

@@ -362,7 +362,9 @@ pi.registerTool({
 		if (accepted && runtime.activeSquadId === id) focusSquad(null);
 		const text = accepted
 			? `Independent orchestrator review recorded for '${id}' (${params.verdict}). The squad is now accepted as done.`
-			: `Independent review FAILED for '${id}'. The squad remains review-required. Fix every issue, rerun verification/E2E, then submit a fresh squad_review.`;
+			: `Independent review FAILED for '${id}'. The squad remains review-required — do NOT cancel it, do NOT mark it failed, and do NOT stop here.\n` +
+				`Route same-squad rework NOW: squad_modify { action: "add_task", squadId: "${id}", task: { id: "<slice>-fix-1", agent: "<original implementer>", forkFromTask: "<original task id>", title: "...", description: "<the exact failed issues>" } }.\n` +
+				`forkFromTask reopens the implementer's full session context so nothing is redone. When rework settles, independently re-verify and submit a fresh squad_review.`;
 		return { content: [{ type: "text" as const, text }], details: undefined };
 	},
 });
@@ -457,6 +459,7 @@ pi.registerTool({
 				agent: Type.String(),
 				depends: Type.Optional(Type.Array(Type.String())),
 				inheritContext: Type.Optional(Type.Boolean({ description: "Fork the current pi session so the agent inherits this conversation's context (see squad tool docs for caveats)" })),
+				forkFromTask: Type.Optional(Type.String({ description: "Existing task ID in this squad whose durable session seeds the new task as a fork — the agent continues with that task's full context instead of redoing everything. Ideal for follow-up and review-rework tasks. Mutually exclusive with inheritContext." })),
 			}, { description: "Task definition for add_task" }),
 		),
 	}),
@@ -534,6 +537,18 @@ pi.registerTool({
 					const available = store.loadAllAgentDefs(targetCwd).filter((a) => !a.disabled).map((a) => a.name).join(", ");
 					return { content: [{ type: "text" as const, text: `Unknown agent '${params.task.agent}'. Available: ${available}` }], details: undefined };
 				}
+				const forkFromTask = params.task.forkFromTask?.trim();
+				if (forkFromTask) {
+					if (params.task.inheritContext) {
+						return { content: [{ type: "text" as const, text: "Choose either forkFromTask or inheritContext, not both." }], details: undefined };
+					}
+					if (!existingIds.has(forkFromTask)) {
+						return { content: [{ type: "text" as const, text: `forkFromTask '${forkFromTask}' not found in squad '${squadId}'. Existing tasks: ${[...existingIds].join(", ")}` }], details: undefined };
+					}
+					if (!store.loadTaskSession(squadId, forkFromTask)) {
+						return { content: [{ type: "text" as const, text: `forkFromTask '${forkFromTask}' has no durable session yet (it never spawned). Add the task without forkFromTask, or fork a task that has run.` }], details: undefined };
+					}
+				}
 				const dependencies = params.task.depends || [];
 				const task: Task = {
 					id: params.task.id,
@@ -543,6 +558,7 @@ pi.registerTool({
 					status: dependencies.every((dependency) => existing.find((candidate) => candidate.id === dependency)?.status === "done") ? "pending" : "blocked",
 					depends: dependencies,
 					...(params.task.inheritContext ? { inheritContext: true } : {}),
+					...(forkFromTask ? { forkFromTaskId: forkFromTask } : {}),
 					...(targetSquad.spec ? { fileSpecDelta: true } : {}),
 					created: store.now(),
 					started: null,

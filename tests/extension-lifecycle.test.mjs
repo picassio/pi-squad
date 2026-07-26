@@ -1038,6 +1038,51 @@ test("terminal task failure notifies the main session while siblings continue; s
 	}
 });
 
+test("add_task forkFromTask validates the source session and persists the fork request", async () => {
+	const squadId = "sq-fork-from-task";
+	const projectDir = path.join(tempHome, "fork-from-task-project");
+	fs.mkdirSync(projectDir, { recursive: true });
+	store.saveSquad({
+		id: squadId, goal: "prove forkFromTask", status: "running", created: store.now(), cwd: projectDir,
+		agents: { backend: {} }, config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 1 },
+	});
+	store.createTask(squadId, {
+		id: "impl", title: "impl", description: "original implementation", agent: "backend", status: "done", depends: [],
+		created: store.now(), started: store.now(), completed: store.now(), output: "done", error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 0 },
+	});
+	const api = createFakeExtensionApi();
+	registerExtension(api);
+	const ctx = { hasUI: false, cwd: projectDir, sessionManager: { getSessionFile: () => null } };
+	try {
+		const noSession = await api.tools.get("squad_modify").execute("fork-nosession", {
+			squadId, action: "add_task",
+			task: { id: "impl-fix-1", title: "rework", agent: "backend", depends: [], forkFromTask: "impl" },
+		}, undefined, undefined, ctx);
+		assert.match(noSession.content[0].text, /has no durable session/, "fork source must have a durable session");
+		assert.equal(store.loadTask(squadId, "impl-fix-1"), null, "invalid fork request creates no task");
+
+		const both = await api.tools.get("squad_modify").execute("fork-both", {
+			squadId, action: "add_task",
+			task: { id: "impl-fix-1", title: "rework", agent: "backend", depends: [], forkFromTask: "impl", inheritContext: true },
+		}, undefined, undefined, ctx);
+		assert.match(both.content[0].text, /either forkFromTask or inheritContext/);
+
+		const sourceSession = path.join(tempHome, "fork-from-task-source.jsonl");
+		fs.writeFileSync(sourceSession, '{"type":"session"}\n');
+		store.bindTaskSession(squadId, "impl", { file: sourceSession });
+		const ok = await api.tools.get("squad_modify").execute("fork-ok", {
+			squadId, action: "add_task",
+			task: { id: "impl-fix-1", title: "rework", agent: "backend", depends: [], forkFromTask: "impl" },
+		}, undefined, undefined, ctx);
+		assert.match(ok.content[0].text, /added to squad/);
+		assert.equal(store.loadTask(squadId, "impl-fix-1").forkFromTaskId, "impl",
+			"the fork request is durably persisted for the spawn path");
+	} finally {
+		await emit(api, "session_shutdown");
+	}
+});
+
 test("generated squad IDs combine a readable safe slug with a UUID", () => {
 	const goal = "In /home/ubuntu/projects/pi-para (main at 100ad68, v0.6.7), implement cleanup";
 	assert.equal(store.makeTaskId(goal), "in-home-ubuntu-projects-pi-para-main-at");

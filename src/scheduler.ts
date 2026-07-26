@@ -22,6 +22,15 @@ import { buildAgentSystemPrompt } from "./protocol.js";
 import { buildAdvisorConsultText, formatAdvisorSteerMessage, adviceNeedsHuman, type AdvisorConsultInput } from "./advisor.js";
 import { beginOrchestratorReview, beginOrchestratorRework } from "./review.js";
 
+/** Backoff schedule for unexpected agent exits (provider/API outages). The
+ * last delay repeats when PI_SQUAD_SPAWN_RETRIES exceeds the schedule. */
+const SPAWN_RETRY_BACKOFF_MS = [2_000, 10_000, 30_000, 60_000, 120_000];
+
+function maxSpawnRetries(): number {
+	const value = Number(process.env.PI_SQUAD_SPAWN_RETRIES);
+	return Number.isFinite(value) && value >= 0 ? Math.floor(value) : SPAWN_RETRY_BACKOFF_MS.length;
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -130,7 +139,9 @@ export class Scheduler {
 	private spawnContext?: SchedulerSpawnContext;
 	private running = false;
 	/** Track spawn retries to allow one retry per task */
-	private spawnRetries = new Set<string>();
+	/** Spawn retries per task. Success and explicit resume grant a fresh budget
+	 * so a provider/API outage never leaves a task permanently unretriable. */
+	private spawnRetryCounts = new Map<string, number>();
 	/** Periodic level-triggered reconcile (heals missed events / out-of-band store edits) */
 	private reconcileTimer: ReturnType<typeof setInterval> | null = null;
 	/** Suppress duplicate edge emission within one scheduler; disk remains the outbox. */
@@ -289,6 +300,9 @@ export class Scheduler {
 	/** Resume suspended/failed work. A failed review is archived only when
 	 * resumable work actually exists; a bare resume cannot bypass the gate. */
 	async resume(): Promise<void> {
+		// Every resume is an explicit operator decision: grant fresh spawn-retry
+		// budgets so provider-outage failures are always retriggerable.
+		this.spawnRetryCounts.clear();
 		const tasks = store.loadAllTasks(this.squadId);
 		let resumedWork = false;
 		for (const task of tasks) {
@@ -678,24 +692,43 @@ export class Scheduler {
 	}
 
 	/**
-	 * Decide whether this task's agent should be spawned as a fork of the main
-	 * pi session (context inheritance). Guards against blowing the child model's
-	 * context window: forks only when the estimated session tokens fit within
-	 * 50% of the agent model's context window.
+	 * Decide whether this task's agent should be spawned as a fork of an
+	 * existing session: another task's durable session (forkFromTaskId) or the
+	 * main pi session (inheritContext). Guards against blowing the child
+	 * model's context window: forks only when the estimated session tokens fit
+	 * within 50% of the agent model's context window.
 	 */
 	private resolveForkSession(task: Task, squad: Squad, agentDef: AgentDef): string | undefined {
-		if (!task.inheritContext) return undefined;
+		if (!task.inheritContext && !task.forkFromTaskId) return undefined;
 
 		const skip = (reason: string): undefined => {
-			logError("squad-scheduler", `inheritContext skipped for ${task.id}: ${reason}`);
+			logError("squad-scheduler", `session fork skipped for ${task.id}: ${reason}`);
 			store.appendMessage(this.squadId, task.id, {
 				ts: store.now(),
 				from: "system",
 				type: "status",
-				text: `Context inheritance skipped: ${reason}. Agent starts with standard squad context only.`,
+				text: `Session fork skipped: ${reason}. Agent starts with standard squad context only.`,
 			});
 			return undefined;
 		};
+
+		// Fork another task's durable session: the follow-up/rework agent
+		// continues with the source task's complete context.
+		if (task.forkFromTaskId) {
+			const source = store.loadTaskSession(this.squadId, task.forkFromTaskId);
+			if (!source || !fs.existsSync(source.file)) {
+				return skip(`fork source task '${task.forkFromTaskId}' has no durable session file`);
+			}
+			const estTokens = Math.ceil(fs.statSync(source.file).size / 4);
+			const window = this.spawnContext?.resolveContextWindow?.(agentDef.model ?? null);
+			// An unknown window does not veto an explicit operator/orchestrator
+			// request: task sessions are bounded, unlike whole main sessions.
+			if (window && estTokens > window * 0.5) {
+				return skip(`fork source session (~${Math.round(estTokens / 1000)}k tokens) exceeds 50% of ${agentDef.model || "default model"}'s ${Math.round(window / 1000)}k window — restate key context in the task description instead`);
+			}
+			debug("squad-scheduler", `forkFromTask: forking ${source.file} (task ${task.forkFromTaskId}) for ${task.id} (~${Math.round(estTokens / 1000)}k tokens)`);
+			return source.file;
+		}
 
 		const sessionFile = squad.sessionFile;
 		if (!sessionFile) return skip("main session has no session file (ephemeral --no-session run)");
@@ -778,24 +811,32 @@ export class Scheduler {
 		const turnCount = event.data?.turnCount ?? 0;
 		const stderr = event.data?.stderr || "";
 		const retryKey = `spawn-retry:${event.taskId}`;
-		if (!this.spawnRetries.has(retryKey)) {
-			this.spawnRetries.add(retryKey);
+		const attempt = this.spawnRetryCounts.get(retryKey) ?? 0;
+		const maxRetries = maxSpawnRetries();
+		if (attempt < maxRetries) {
+			this.spawnRetryCounts.set(retryKey, attempt + 1);
+			const delayMs = SPAWN_RETRY_BACKOFF_MS[Math.min(attempt, SPAWN_RETRY_BACKOFF_MS.length - 1)];
 			const reason = turnCount === 0
-				? "exited with 0 turns (likely rate limit or API error)"
+				? "exited with 0 turns (likely rate limit or provider API error)"
 				: `exited before final agent_settled after ${turnCount} turns`;
-			logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retrying in 2s... stderr: ${stderr}`);
+			logError("squad-scheduler", `Agent ${event.agentName} ${reason}, code=${exitCode}. Retry ${attempt + 1}/${maxRetries} in ${Math.round(delayMs / 1000)}s... stderr: ${stderr}`);
 			store.updateTaskStatus(this.squadId, event.taskId, "pending");
 			store.appendMessage(this.squadId, event.taskId, {
 				ts: store.now(),
 				from: "system",
 				type: "status",
-				text: `Agent ${reason}. Resuming the same task session...`,
+				text: `Agent ${reason}. Retry ${attempt + 1}/${maxRetries} resumes the same task session in ${Math.round(delayMs / 1000)}s...`,
 			});
-			setTimeout(() => {
+			const timer = setTimeout(() => {
 				if (this.running) this.scheduleReadyTasks();
-			}, 2000);
+			}, delayMs);
+			(timer as { unref?: () => void }).unref?.();
 		} else {
-			this.handleTaskFailed(event.taskId, `Agent exited with code ${exitCode} before final agent_settled (retry exhausted). ${stderr}`);
+			this.handleTaskFailed(
+				event.taskId,
+				`Agent exited with code ${exitCode} before final agent_settled (${maxRetries} backoff retries exhausted — likely provider/API outage). ${stderr}`.trimEnd() +
+					`\nWhen the provider recovers, squad_modify { action: "resume_task", taskId: "${event.taskId}" } reopens the same durable session with a fresh retry budget — no work is redone.`,
+			);
 		}
 		this.updateContext();
 	}
@@ -994,6 +1035,9 @@ export class Scheduler {
 			.filter((m) => m.from === task.agent && (m.type === "text" || m.type === "done"));
 		const output = agentMessages.map((m) => m.text).join("\n");
 
+		// A successful completion also restores the full spawn-retry budget for
+		// any later reopen of this task (rework, follow-up messages).
+		this.spawnRetryCounts.delete(`spawn-retry:${taskId}`);
 		// Clear any interim failure annotation (spawn retry, RPC race): a task
 		// that ultimately completed must not display a stale error forever.
 		store.updateTaskStatus(this.squadId, taskId, "done", {
@@ -1679,6 +1723,8 @@ export class Scheduler {
 	async resumeTask(taskId: string): Promise<"resumed" | "already_running"> {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) throw new Error(`Task not found: ${taskId}`);
+		// Explicit resume grants a fresh spawn-retry budget (provider recovery).
+		this.spawnRetryCounts.delete(`spawn-retry:${taskId}`);
 		const live = this.pool.isRunning(taskId);
 		if (task.status === "in_progress" && live) return "already_running";
 		if (live) throw new Error(`Task '${taskId}' has a live child but durable status '${task.status}'; no duplicate resume was started.`);

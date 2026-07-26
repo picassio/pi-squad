@@ -284,6 +284,10 @@ squad({
 - Once created, that task-to-session binding is immutable; later resumes pass the original file through `--session`
 - Prefer restating the 3-5 key decisions in the task description — reach for `inheritContext` only when that's impractical
 
+### Task-to-Task Context (`forkFromTask`)
+
+Follow-up and review-rework tasks can fork an **existing task's** durable session instead of starting fresh: `squad_modify { action: "add_task", task: { id: "impl-fix-1", agent: "backend", forkFromTask: "impl", ... } }`. The new agent continues with the source task's complete conversation context — nothing is re-explored or redone. The source must have run at least once (it needs a durable session); the same 50%-of-context-window guard as `inheritContext` applies, and `forkFromTask` is mutually exclusive with `inheritContext`. This is the recommended shape for rework after a failed independent review.
+
 ### Custom Agents
 
 Create `~/.pi/squad/agents/my-agent.json` (global) or `{project}/.pi/squad/agents/my-agent.json` (project override):
@@ -334,7 +338,7 @@ Configure with `/squad advisor` (on/off, model, max calls per task, reasoning ef
 
 ### Meaningful Work Check
 
-Agents must complete at least one LLM turn and produce either a tool call or a substantive assistant artifact before they can be marked `done`. This permits legitimate report-only planning/review work while rejecting empty exits. A child that exits before final `agent_settled`, or settles without meaningful work, is resumed once on the same task session and then failed if the retry is exhausted.
+Agents must complete at least one LLM turn and produce either a tool call or a substantive assistant artifact before they can be marked `done`. This permits legitimate report-only planning/review work while rejecting empty exits. A child that exits before final `agent_settled` (typically a provider/API outage) is resumed on the same task session with backoff — 2s, 10s, 30s, 60s, 120s (override the attempt count with `PI_SQUAD_SPAWN_RETRIES`) — and only fails after the budget is exhausted. Successful completion or an explicit `resume_task`/`resume` grants a fresh budget, so an outage-failed task is always retriggerable once the provider recovers: `squad_modify { action: "resume_task", taskId: "..." }` reopens the same durable session and no work is redone.
 
 ### Session Resilience
 

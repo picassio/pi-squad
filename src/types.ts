@@ -169,6 +169,10 @@ export interface Task {
 	/** Fork the main pi session so this agent inherits the full conversation context.
 	 * Skipped automatically if the estimated context exceeds 50% of the agent model's window. */
 	inheritContext?: boolean;
+	/** Seed this task's new session as a fork of another task's durable session,
+	 * so follow-up/rework work continues with that task's full context instead of
+	 * starting fresh. Mutually exclusive with inheritContext. */
+	forkFromTaskId?: string;
 	created: string;
 	started: string | null;
 	completed: string | null;
