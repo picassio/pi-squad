@@ -1,11 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import { registerHooks } from "node:module";
+
+// Map ./x.js → ./x.ts for src imports (Node type stripping doesn't rewrite).
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		if (specifier.startsWith(".") && specifier.endsWith(".js")) {
+			try {
+				return nextResolve(specifier, context);
+			} catch {
+				return nextResolve(specifier.replace(/\.js$/, ".ts"), context);
+			}
+		}
+		return nextResolve(specifier, context);
+	},
+});
+
+const {
 	beginOrchestratorReview,
 	beginOrchestratorRework,
 	buildOrchestratorReviewGate,
 	recordOrchestratorReview,
-} from "../src/review.ts";
+} = await import("../src/review.ts");
 
 function squad() {
 	return {

@@ -64,6 +64,8 @@ The completion report is explicitly labeled **untrusted and not yet accepted**. 
 
 Task messages, task outputs, dependency/rework handoffs, QA feedback, advisor handoffs, completion reports, failure diagnostics, and planner errors are persisted and forwarded in full. There is no character or task-count limit on report data. TUI widgets may show width/height-limited **views** to fit the terminal, but the underlying data and agent/main-session handoffs remain complete.
 
+**Large-squad review reports spill to a durable file, not into the main context.** When the assembled review-required report exceeds the inline limit (default 24,000 chars; `PI_SQUAD_REVIEW_INLINE_LIMIT` overrides), the complete report — every task handoff, working-tree snapshot, and the full review gate — is written untruncated to `~/.pi/squad/<squad-id>/review-report.md`, and the main session receives a bounded digest: task counts/costs, a per-task index with output sizes, a compact review gate whose plan lines point at each durable `task.json`, and a mandate to read the entire report file (in `Read` offset/limit slices) before reviewing. An 89-task squad therefore cannot blow the main session's context window, and nothing is ever shortened — only relocated. Review gates with oversized delegated plans (over ~8,000 chars) likewise auto-compact to durable `task.json` pointer lines everywhere they are injected (report, per-turn gate reminder, restart restoration, `squad_status`).
+
 ## Features
 
 ### Dependency-Aware Scheduling

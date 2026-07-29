@@ -2,9 +2,25 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildCompletionSummary, buildFailureSummary } from "../src/report.ts";
+
+// Map ./x.js → ./x.ts for src imports (Node type stripping doesn't rewrite).
+registerHooks({
+	resolve(specifier, context, nextResolve) {
+		if (specifier.startsWith(".") && specifier.endsWith(".js")) {
+			try {
+				return nextResolve(specifier, context);
+			} catch {
+				return nextResolve(specifier.replace(/\.js$/, ".ts"), context);
+			}
+		}
+		return nextResolve(specifier, context);
+	},
+});
+
+const { buildCompletionSummary, buildFailureSummary } = await import("../src/report.ts");
 
 function task(id, status, output = null, error = null) {
 	return {

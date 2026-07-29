@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Huge squads (e.g. 89 tasks) no longer blow the main session's context window at review time. When the assembled review-required report exceeds the inline limit (default 24,000 chars; `PI_SQUAD_REVIEW_INLINE_LIMIT`), the complete report is written untruncated to `<squad>/review-report.md` and the main session receives a bounded digest: counts/cost, a per-task index with output sizes, a compact gate with durable `task.json` pointers, and a mandate to read the entire report file before reviewing. Review gates with oversized delegated plans (>~8,000 chars) also auto-compact to `task.json` pointer lines in every injection site (finish report, per-turn gate reminder, restart restoration, `squad_status`). Nothing is truncated — the canonical bytes are relocated to durable files.
+
 ## [0.20.0] - 2026-07-26
 
 ### Added

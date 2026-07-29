@@ -1,7 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { logError } from "./logger.js";
-import { buildCompletionSummary, buildFailureSummary } from "./report.js";
-import { buildOrchestratorReviewGate } from "./review.js";
+import { buildFailureSummary, buildReviewRequiredNotification } from "./report.js";
 import { Scheduler, formatSuspendedStallAttention, type SchedulerEvent } from "./scheduler.js";
 import * as store from "./store.js";
 import type { SuspendedStallAttention } from "./types.js";
@@ -18,17 +17,16 @@ export function wireSchedulerEvents(pi: ExtensionAPI, scheduler: Scheduler, squa
 			case "squad_review_required": {
 				const tasks = store.loadAllTasks(squadId);
 				const squad = store.loadSquad(squadId);
-				const summary = buildCompletionSummary(tasks, squad?.cwd);
-				const totalCost = tasks.reduce((sum, task) => sum + task.usage.cost, 0);
 				scheduler.updateContext();
 				if (!squad) break;
 				try {
+					// Large squads spill the complete report to a durable file and
+					// deliver a bounded digest, protecting the main session context
+					// without truncating any handoff content.
+					const notification = buildReviewRequiredNotification(squad, tasks);
 					pi.sendMessage({
 						customType: "squad-review-required",
-						content: `[squad] TASK EXECUTION FINISHED for "${squadId}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` +
-							`Squad claims (review inputs only):\n${summary}\n\n` +
-							`Total cost: $${totalCost.toFixed(4)}\n\n` +
-							buildOrchestratorReviewGate(squad, tasks),
+						content: notification.content,
 						display: true,
 					}, { triggerTurn: true, deliverAs: "followUp" });
 					// Record durable delivery so reconcile stops re-raising the gate.

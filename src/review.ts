@@ -1,7 +1,12 @@
 import * as path from "node:path";
+import { getTaskDir } from "./store.js";
 import type { Squad, Task } from "./types.js";
 
 export type OrchestratorReviewVerdict = "pass" | "pass_with_issues" | "fail";
+
+/** Above this expanded-plan size the review gate lists durable task.json
+ * pointers instead of inlined titles/descriptions (complete, not truncated). */
+const COMPACT_PLAN_THRESHOLD = 8_000;
 
 export interface OrchestratorReviewInput {
 	verdict: OrchestratorReviewVerdict;
@@ -91,8 +96,11 @@ export function recordOrchestratorReview(squad: Squad, input: OrchestratorReview
 	squad.status = input.verdict === "fail" ? "review" : "done";
 }
 
-/** Persistent system-prompt contract shown until squad_review accepts the work. */
-export function buildOrchestratorReviewGate(squad: Squad, tasks: Task[]): string {
+/** Persistent system-prompt contract shown until squad_review accepts the work.
+ * `compactPlan` lists each task as a one-line pointer to its durable task.json
+ * instead of inlining titles/descriptions — used when the full report is
+ * delivered as a durable file so huge squads cannot blow the main context. */
+export function buildOrchestratorReviewGate(squad: Squad, tasks: Task[], opts?: { compactPlan?: boolean }): string {
 	const failed = squad.review?.status === "failed";
 	const reviewLabel = failed
 		? "✗ REVIEW FAILED · awaiting same-squad rework"
@@ -103,9 +111,19 @@ export function buildOrchestratorReviewGate(squad: Squad, tasks: Task[]): string
 	const goalReference = squad.spec
 		? `Canonical file spec at ${squad.spec.path} (sha256=${squad.spec.sha256}, bytes=${squad.spec.bytes}). Read and hash the exact file during review; its contract is intentionally not duplicated into this prompt.`
 		: squad.goal;
-	const delegatedPlan = squad.spec
-		? tasks.map((task) => `- ${task.id} (${task.agent}) [${task.status}] — task state: ${path.join(path.dirname(path.dirname(squad.spec!.path)), task.id, "task.json")}`).join("\n")
-		: tasks.map((task) => `- ${task.id} (${task.agent}): ${task.title}\n  ${task.description || "(no description)"}`).join("\n");
+	let delegatedPlan: string;
+	if (squad.spec) {
+		delegatedPlan = tasks.map((task) => `- ${task.id} (${task.agent}) [${task.status}] — task state: ${path.join(path.dirname(path.dirname(squad.spec!.path)), task.id, "task.json")}`).join("\n");
+	} else {
+		const fullPlan = tasks.map((task) => `- ${task.id} (${task.agent}): ${task.title}\n  ${task.description || "(no description)"}`).join("\n");
+		// Auto-compact huge plans: pointer lines keep every task addressable via
+		// its durable task.json without inlining all descriptions into the main
+		// session (an 89-task plan would otherwise dominate the context window).
+		const compact = opts?.compactPlan || fullPlan.length > COMPACT_PLAN_THRESHOLD;
+		delegatedPlan = compact
+			? tasks.map((task) => `- ${task.id} (${task.agent}) [${task.status}] — full title/description/state: ${path.join(getTaskDir(squad.id, task.id), "task.json")}`).join("\n")
+			: fullPlan;
+	}
 
 	return `<squad_review_required>
 UNTRUSTED CANDIDATE WORK — INDEPENDENT ORCHESTRATOR REVIEW IS MANDATORY.
