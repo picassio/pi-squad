@@ -381,6 +381,25 @@ export class Scheduler {
 			store.saveSquad(squad);
 		}
 
+		// 0b. Zombie in_progress recovery: tasks marked in_progress with no
+		// live pool process are stranded (e.g. the main Pi session restarted
+		// after a model switch, crash, or rate-limit kill while a worker was
+		// running). Reset them to pending so scheduleReadyTasks respawns on
+		// the same durable session.
+		for (const task of tasks) {
+			if (task.status !== "in_progress") continue;
+			if (this.pool.isRunning(task.id)) continue;
+			debug("squad-scheduler", `reconcile: zombie in_progress task '${task.id}' has no live process — resetting to pending`);
+			store.updateTaskStatus(this.squadId, task.id, "pending", { completed: null, error: null });
+			store.appendMessage(this.squadId, task.id, {
+				ts: store.now(),
+				from: "system",
+				type: "status",
+				text: "Agent process lost (session restart, model switch, or provider failure). Resuming on the same durable session...",
+			});
+			task.status = "pending";
+		}
+
 		// 1. Blocked → pending when all deps are done (respects autoUnblock config)
 		if (squad.config.autoUnblock) {
 			for (const task of tasks) {

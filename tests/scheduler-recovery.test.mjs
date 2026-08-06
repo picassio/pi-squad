@@ -538,3 +538,35 @@ test("forkFromTask spawns the new task as a fork of the source task's durable se
 	await scheduler.stop();
 	await guarded.stop();
 });
+
+
+test("reconcile heals zombie in_progress tasks whose process was lost", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [
+			{ id: "zombie-a", status: "in_progress" },
+			{ id: "zombie-b", status: "in_progress" },
+		],
+	});
+	assert.equal(scheduler.pool.isRunning("zombie-a"), false);
+	assert.equal(scheduler.pool.isRunning("zombie-b"), false);
+	scheduler.running = true;
+
+	// Capture task status right after zombie detection (before scheduleReadyTasks
+	// tries to respawn). The reconcile path: 0b resets to pending → message →
+	// scheduleReadyTasks → spawnAgentForTask (fails in test env, no agent def) →
+	// handleTaskFailed. The recovery message proves the zombie path fired.
+	await scheduler.reconcile();
+
+	const msgsA = store.loadMessages(id, "zombie-a");
+	const msgsB = store.loadMessages(id, "zombie-b");
+	assert.ok(msgsA.some(m => m.text.includes("Agent process lost")),
+		"zombie-a recovery message recorded");
+	assert.ok(msgsB.some(m => m.text.includes("Agent process lost")),
+		"zombie-b recovery message recorded");
+
+	// In production, scheduleReadyTasks respawns the healed task on its durable
+	// session. In the test env (no agent defs), the spawn fails and the task
+	// moves to failed — but the zombie detection itself is proven by the message.
+	await scheduler.stop();
+});
