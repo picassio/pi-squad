@@ -140,9 +140,15 @@ pi.registerTool({
 		"After starting a squad: report the plan and END YOUR TURN — never poll squad_status or sleep-wait; squad events wake you automatically",
 		"When agents finish, treat every squad report and QA verdict as untrusted; independently inspect the diff/source and rerun contract verification + integration/E2E, then call squad_review before reporting success",
 	],
-	parameters: Type.Union([
-	Type.Object({
-		goal: Type.String({ description: "Complete original user outcome/acceptance contract the squad should accomplish. Preserve requirements and boundaries; this is shown during mandatory main-orchestrator review." }),
+	// Two mutually exclusive modes — inline ({goal, tasks?, agents?, config?}) or
+	// canonical file spec ({specFile, specSha256}) — flattened into a single object
+	// with optional fields so the emitted JSON Schema has `type: "object"` at the
+	// root. Strict OpenAI-compatible providers (DeepSeek, OpenAI) reject a
+	// top-level anyOf/Union (`type: null`). Mode is discriminated at runtime in
+	// execute() via `"specFile" in params` and validated by coerceInlineSquadStart
+	// / prepareSpec.
+	parameters: Type.Object({
+		goal: Type.Optional(Type.String({ description: "Inline mode: complete original user outcome/acceptance contract the squad should accomplish. Preserve requirements and boundaries; this is shown during mandatory main-orchestrator review. Required for inline mode; omit when using specFile." })),
 		agents: Type.Optional(
 			Type.Union([
 				Type.Record(
@@ -151,7 +157,7 @@ pi.registerTool({
 						model: Type.Optional(Type.String({ description: "Model override (e.g. 'github-copilot/claude-sonnet-5'). Set ONLY when the user explicitly requested a specific model; omit to use the configured agent definition and /squad defaults" })),
 						thinking: Type.Optional(Type.String({ description: "Thinking level: off, minimal, low, medium, high, xhigh, max. Set ONLY when the user explicitly requested it; omit to use configured defaults" })),
 					}),
-					{ description: "Agent roster with optional model/thinking overrides. Keys must match agent names in .pi/squad/agents/. Omit overrides unless the user explicitly asked to change model/thinking — configured agent definitions and /squad defaults apply otherwise" },
+					{ description: "Inline mode: agent roster with optional model/thinking overrides. Keys must match agent names in .pi/squad/agents/. Omit overrides unless the user explicitly asked to change model/thinking — configured agent definitions and /squad defaults apply otherwise" },
 				),
 				Type.String({ description: "JSON-encoded agents object (same shape); accepted for transports that stringify structured arguments" }),
 			]),
@@ -167,7 +173,7 @@ pi.registerTool({
 						depends: Type.Optional(Type.Array(Type.String())),
 						inheritContext: Type.Optional(Type.Boolean({ description: "Fork the current pi session so the agent inherits this conversation's full context. Use ONLY when the task depends on decisions/details discussed here that can't be restated briefly. Costly (agent pays the whole history as input each turn) and auto-skipped when the session exceeds 50% of the agent model's context window — prefer restating key context in the description." })),
 					}),
-					{ description: "Pre-defined task breakdown. If provided, skips the planner agent. Scope tasks to required work only — no optional polish." },
+					{ description: "Inline mode: pre-defined task breakdown. If provided, skips the planner agent. Scope tasks to required work only — no optional polish." },
 				),
 				Type.String({ description: "JSON-encoded tasks array (same item shape); accepted for transports that stringify structured arguments" }),
 			]),
@@ -180,12 +186,9 @@ pi.registerTool({
 				Type.String({ description: "JSON-encoded config object (same shape); accepted for transports that stringify structured arguments" }),
 			]),
 		),
+		specFile: Type.Optional(Type.String({ minLength: 1, description: "File-spec mode: path to a strict v1 squad specification JSON file. Mutually exclusive with goal/tasks/agents/config — when provided, must be accompanied by specSha256 and no inline fields." })),
+		specSha256: Type.Optional(Type.String({ pattern: "^[a-f0-9]{64}$", description: "File-spec mode: lowercase SHA-256 of the exact source bytes at specFile. Required with specFile." })),
 	}, { additionalProperties: false }),
-	Type.Object({
-		specFile: Type.String({ minLength: 1, description: "Path to a strict v1 squad specification JSON file" }),
-		specSha256: Type.String({ pattern: "^[a-f0-9]{64}$", description: "SHA-256 of the exact source bytes" }),
-	}, { additionalProperties: false }),
-	]),
 
 	async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 		if (!runtime.squadEnabled) return disabledToolResult();
@@ -202,13 +205,26 @@ pi.registerTool({
 		const sessionFile = rawSessionFile ? path.resolve(rawSessionFile) : null;
 		let prepared: PreparedSpec | undefined;
 		let effective: InlineSquadStart;
-		if ("specFile" in params) {
+		// Mode discrimination: schema is a single flat object (see parameters
+		// above); `specFile` presence selects file-spec mode, otherwise inline.
+		if (params.specFile !== undefined) {
+			if (params.specSha256 === undefined) {
+				return { content: [{ type: "text" as const, text: "Invalid squad input: specSha256 is required with specFile. No squad was started." }], details: undefined };
+			}
+			if (params.goal !== undefined || params.tasks !== undefined || params.agents !== undefined || params.config !== undefined) {
+				return { content: [{ type: "text" as const, text: "Invalid squad input: specFile mode is mutually exclusive with goal/tasks/agents/config. No squad was started." }], details: undefined };
+			}
 			prepared = prepareSpec(params.specFile, params.specSha256, ctx.cwd);
 			effective = { goal: prepared.spec.goal, agents: prepared.spec.agents, tasks: prepared.spec.tasks, config: prepared.spec.config };
 		} else {
 			// Some transports stringify structured arguments; decode tolerantly with
 			// precise errors instead of failing a correct plan on transport shape.
-			const coerced = coerceInlineSquadStart(params);
+			const coerced = coerceInlineSquadStart({
+				goal: (params.goal ?? "") as string,
+				agents: params.agents,
+				tasks: params.tasks,
+				config: params.config,
+			});
 			if (!coerced.ok) {
 				return { content: [{ type: "text" as const, text: `Invalid squad input: ${coerced.error} No squad was started.` }], details: undefined };
 			}
