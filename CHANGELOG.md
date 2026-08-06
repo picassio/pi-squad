@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.2] - 2026-08-06
+
+### Fixed
+
+- The `squad` tool no longer fails at registration time on strict OpenAI-compatible providers (DeepSeek, OpenAI, and others that reject `type: null` at the root of `function.parameters`). Its parameter schema was a top-level `Type.Union([...])` of two `Type.Object`s (inline vs. file-spec mode); TypeBox emits that as `{ anyOf: [...] }` with no root `type`, which those providers refuse with `Invalid schema for function 'squad': schema must be a JSON Schema of 'type: "object"', got 'type: null'`. Flattened to a single `Type.Object` with all fields optional (`goal`, `agents`, `tasks`, `config`, `specFile`, `specSha256`) and moved the inline-vs-spec discrimination into `execute()`: `specFile` presence selects file-spec mode (requires `specSha256`, forbids inline fields), otherwise inline mode routes through `coerceInlineSquadStart` as before. Behavior is unchanged for callers; only the emitted JSON Schema shape differs. Google Gemini tolerated the previous shape, which is why the bug only surfaced when switching provider.
+
 ## [0.20.1] - 2026-07-29
 
 ### Fixed
