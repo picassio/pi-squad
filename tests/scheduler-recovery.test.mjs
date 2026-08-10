@@ -611,3 +611,28 @@ test("repeated attestation rejections suspend the task and escalate instead of l
 
 	await scheduler.stop();
 });
+
+test("concurrent reconciles never double-spawn the same task (zero-work startup failure regression)", async () => {
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "solo", status: "pending" }],
+	});
+	// Slow spawn: keeps the task's ready-window open while other reconciles run.
+	const spawnCalls = [];
+	scheduler.spawnAgentForTask = async (task) => {
+		spawnCalls.push(task.id);
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		store.updateTaskStatus(id, task.id, "in_progress");
+	};
+	scheduler.running = true;
+
+	await Promise.all([
+		scheduler.reconcile(),
+		scheduler.reconcile(),
+		scheduler.reconcile(),
+	]);
+	// Coalesced re-runs may re-check, but the task must be spawned exactly once.
+	assert.deepEqual(spawnCalls, ["solo"], "one spawn despite three concurrent reconciles");
+
+	await scheduler.stop();
+});

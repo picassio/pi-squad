@@ -146,6 +146,14 @@ export class Scheduler {
 	 * a paid loop; after a bounded number of failures the task suspends and the
 	 * orchestrator is escalated with the precise reason instead of burning. */
 	private attestationRejectionCounts = new Map<string, number>();
+	/** Single-flight guards. Reconcile is level-triggered from persisted state,
+	 * so concurrent invocations (60s timer + event-driven calls + backoff
+	 * timers) add nothing — but their stale ready-lists could double-spawn a
+	 * task, and pool.spawn kills the existing process for the task, SIGTERMing
+	 * a freshly started worker before it received any prompt. */
+	private reconciling = false;
+	private scheduling = false;
+	private scheduleAgain = false;
 	/** Periodic level-triggered reconcile (heals missed events / out-of-band store edits) */
 	private reconcileTimer: ReturnType<typeof setInterval> | null = null;
 	/** Suppress duplicate edge emission within one scheduler; disk remains the outbox. */
@@ -348,6 +356,18 @@ export class Scheduler {
 	 */
 	async reconcile(): Promise<void> {
 		if (!this.running) return;
+		// Level-triggered: a concurrent run already observes the same durable
+		// state; overlapping runs only create duplicate-spawn races.
+		if (this.reconciling) return;
+		this.reconciling = true;
+		try {
+			await this.reconcileInner();
+		} finally {
+			this.reconciling = false;
+		}
+	}
+
+	private async reconcileInner(): Promise<void> {
 		const squad = store.loadSquad(this.squadId);
 		if (!squad) return;
 		// Canonical integrity is a scheduling precondition, not merely a completion check.
@@ -461,6 +481,27 @@ export class Scheduler {
 			debug("squad-scheduler", "scheduleReadyTasks: not running, skipping");
 			return;
 		}
+		// Single-flight with coalesced re-run: concurrent callers (reconcile,
+		// retry/backoff timers, resume paths) must not each spawn from their own
+		// snapshot of the ready list — that double-spawns the same task and the
+		// pool kill-and-replace turns it into a zero-work startup failure.
+		if (this.scheduling) {
+			this.scheduleAgain = true;
+			return;
+		}
+		this.scheduling = true;
+		try {
+			do {
+				this.scheduleAgain = false;
+				await this.scheduleReadyTasksOnce();
+			} while (this.scheduleAgain && this.running);
+		} finally {
+			this.scheduling = false;
+			this.scheduleAgain = false;
+		}
+	}
+
+	private async scheduleReadyTasksOnce(): Promise<void> {
 
 		const squad = store.loadSquad(this.squadId);
 		if (!squad || squad.status !== "running" || (squad.spec && !validateCanonicalSpec(squad))) {
@@ -485,6 +526,9 @@ export class Scheduler {
 
 		for (const task of toSpawn) {
 			try {
+				// Defensive: never spawn over a live process. pool.spawn would kill
+				// and replace it, discarding a healthy worker mid-startup.
+				if (this.pool.isRunning(task.id)) continue;
 				await this.spawnAgentForTask(task, squad);
 			} catch (error) {
 				logError("squad-scheduler", `Failed to spawn ${task.id}: ${(error as Error).message}`);

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.5] - 2026-08-10
+
+### Fixed
+
+- "Zero-work scheduler startup failures" — freshly spawned workers SIGTERM'd before receiving any prompt (observed as `code=143` exits with ~18 stdout lines, reported by orchestrators as "exited before receiving any RPC task"). Root cause: `reconcile()` and `scheduleReadyTasks()` had no single-flight guard, so the 60s reconcile timer, event-driven reconciles, and spawn-backoff timers could interleave with stale ready-task snapshots and spawn the same task twice — and `pool.spawn` kills the existing process for the task, discarding the healthy first worker mid-startup. Now: reconcile is single-flight (level-triggered, overlapping runs add nothing), scheduleReadyTasks is single-flight with coalesced re-run, and the spawn loop defensively skips tasks whose process is already live.
+
 ## [0.20.4] - 2026-08-10
 
 ### Fixed
