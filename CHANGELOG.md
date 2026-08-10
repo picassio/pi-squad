@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-08-10
+
+### Fixed
+
+- File-spec squads whose tasks legitimately modify pinned artifact files are no longer permanently wedged. Artifact drift (a pinned contract file changing after spec publication) previously failed `validateTaskSpecAttestation` at every completion site with the misleading message "read all chunks with squad_spec_read" — the agent obediently re-read and re-completed in an infinite paid reject/reopen loop, and even orchestrator `complete_task` was blocked with no recovery path. Now: the full-read attestation remains a hard completion gate, but artifact drift is a review-time concern — reported precisely (file, expected→actual bytes/sha) in a prominent ⚠ SPEC ARTIFACT DRIFT block of the review-required notification so the orchestrator verifies each change is a legitimate product of the work.
+- Attestation rejection messages now state the exact failure (attestation missing, recorded against a different spec revision, chunk N mismatch, incomplete state, identity mismatch) via `explainTaskSpecAttestationFailure` instead of a generic re-read instruction.
+- Loop breaker: three consecutive completion rejections for the same task suspend it and send one escalation to the main session with the precise reason and the `resume_task` recovery call, instead of respawning the agent forever. Explicit `resume_task` grants a fresh rejection budget.
+
 ## [0.20.2] - 2026-08-06
 
 ### Fixed

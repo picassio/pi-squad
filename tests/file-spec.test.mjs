@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { chunkRanges, prepareSpec, MAX_SPEC_BYTES, registerChildSpecReader, validateTaskSpecAttestation } from "../src/file-spec.ts";
+import { chunkRanges, explainTaskSpecAttestationFailure, prepareSpec, MAX_SPEC_BYTES, registerChildSpecReader, specArtifactDrift, validateTaskSpecAttestation } from "../src/file-spec.ts";
 
 const hash = b => crypto.createHash("sha256").update(b).digest("hex");
 const valid = () => ({schemaVersion:1,goal:"full canonical contract",tasks:[{id:"qa",title:"QA",description:"Goal: verify. Verify: npm test",agent:"qa",depends:[],inheritContext:false,artifactRefs:[]}],agents:{qa:{model:null,thinking:null}},config:{maxConcurrency:1,autoUnblock:true,maxRetries:2},artifacts:[]});
@@ -37,3 +37,64 @@ test("crash-finalization recovery is distinct from deleted or tampered complete 
 test("partial or malformed file manifests fail closed while true legacy children remain unchanged",()=>{const old={...process.env};try{Object.assign(process.env,{PI_SQUAD_CHILD:"1",PI_SQUAD_ID:"sq",PI_SQUAD_TASK_ID:"task",PI_SQUAD_SPEC_PATH:"/tmp/missing-spec"});delete process.env.PI_SQUAD_SPEC_SHA256;delete process.env.PI_SQUAD_SPEC_BYTES;delete process.env.PI_SQUAD_SPEC_CHUNK_BYTES;const handlers=new Map();assert.equal(registerChildSpecReader({on(name,fn){handlers.set(name,fn)},registerTool(){throw new Error("invalid manifest must not expose a reader")}}),true);assert.ok(handlers.get("tool_call")({toolName:"read"})?.block);assert.match(handlers.get("before_agent_start")({systemPrompt:"BASE"}).systemPrompt,/^BASE\n\nFile-spec bootstrap failed closed:/);}finally{for(const key of Object.keys(process.env))if(!(key in old))delete process.env[key];Object.assign(process.env,old);}});
 
 test("legacy child without any file manifest registers no reader",()=>{const old={...process.env};process.env.PI_SQUAD_CHILD="1";for(const key of ["PI_SQUAD_SPEC_PATH","PI_SQUAD_SPEC_SHA256","PI_SQUAD_SPEC_BYTES","PI_SQUAD_SPEC_CHUNK_BYTES"])delete process.env[key];try{const pi={on(){throw new Error("must not register guard")},registerTool(){throw new Error("must not register reader")}};assert.equal(registerChildSpecReader(pi),false);}finally{for(const key of Object.keys(process.env))if(!(key in old))delete process.env[key];Object.assign(process.env,old);}});
+
+test("artifact drift no longer blocks attestation; it is reported precisely for review", async () => {
+	const d = fs.mkdtempSync(path.join(os.tmpdir(), "squad-drift-"));
+	const squadDir = path.join(d, "sq");
+	const taskDir = path.join(squadDir, "task");
+	const specPath = path.join(squadDir, "spec", "spec.v1.json");
+	fs.mkdirSync(taskDir, { recursive: true });
+	fs.mkdirSync(path.dirname(specPath), { recursive: true });
+
+	// Spec pins one artifact
+	const artifact = path.join(d, "DESIGN.md");
+	fs.writeFileSync(artifact, "original contract text");
+	const spec = valid();
+	spec.artifacts = [{ id: "design", path: artifact, sha256: hash(Buffer.from("original contract text")), bytes: 22, purpose: "binding design" }];
+	spec.tasks[0].artifactRefs = ["design"];
+	const raw = Buffer.from(JSON.stringify(spec));
+	fs.writeFileSync(specPath, raw);
+
+	// Produce a complete attestation via the child reader
+	const old = { ...process.env };
+	Object.assign(process.env, { PI_SQUAD_CHILD: "1", PI_SQUAD_ID: "sq", PI_SQUAD_TASK_ID: "task", PI_SQUAD_SPEC_PATH: specPath, PI_SQUAD_SPEC_SHA256: hash(raw), PI_SQUAD_SPEC_BYTES: String(raw.length), PI_SQUAD_SPEC_CHUNK_BYTES: "32768" });
+	try {
+		const handlers = new Map(); const tools = new Map();
+		registerChildSpecReader({ on(n, f) { handlers.set(n, f); }, registerTool(t) { tools.set(t.name, t); } });
+		const reader = tools.get("squad_spec_read");
+		const count = chunkRanges(raw).length;
+		for (let i = 0; i < count; i++) {
+			const res = await reader.execute(`c-${i}`, { index: i });
+			handlers.get("message_end")({ type: "message_end", message: { role: "toolResult", toolName: "squad_spec_read", toolCallId: `c-${i}`, isError: false, content: res.content, details: res.details } });
+		}
+	} finally {
+		for (const key of Object.keys(process.env)) if (!(key in old)) delete process.env[key];
+		Object.assign(process.env, old);
+	}
+
+	const squad = { id: "sq", spec: { schemaVersion: 1, sha256: hash(raw), bytes: raw.length, path: specPath, chunkBytes: 32768, chunkCount: chunkRanges(raw).length } };
+	const task = { id: "task" };
+
+	// Pristine artifacts: everything valid, no drift
+	assert.equal(validateTaskSpecAttestation(squad, task), true);
+	assert.equal(explainTaskSpecAttestationFailure(squad, task), null);
+	assert.deepEqual(specArtifactDrift(squad), []);
+
+	// The implementation legitimately modifies the pinned artifact
+	fs.writeFileSync(artifact, "original contract text — updated by the foundation task");
+
+	// Attestation-only validation passes; artifact-inclusive fails; drift names the file
+	assert.equal(validateTaskSpecAttestation(squad, task, { verifyArtifacts: false }), true,
+		"artifact drift must not invalidate a genuine full-read attestation");
+	assert.equal(validateTaskSpecAttestation(squad, task), false, "legacy artifact-inclusive check still detects drift");
+	assert.equal(explainTaskSpecAttestationFailure(squad, task), null,
+		"explain never blames the attestation for artifact drift");
+	const drift = specArtifactDrift(squad);
+	assert.equal(drift.length, 1);
+	assert.match(drift[0], /DESIGN\.md — modified after spec publication/);
+	assert.match(drift[0], /bytes 22→/);
+
+	// Missing attestation is explained precisely
+	fs.rmSync(path.join(taskDir, "spec-read-attestation.json"));
+	assert.match(explainTaskSpecAttestationFailure(squad, task), /attestation file missing.*squad_spec_read/);
+});

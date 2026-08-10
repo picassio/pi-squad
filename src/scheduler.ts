@@ -16,7 +16,7 @@ import { AgentPool, type AgentEvent } from "./agent-pool.js";
 import { Monitor } from "./monitor.js";
 import { Router } from "./router.js";
 import * as store from "./store.js";
-import { isFileSpecTaskId, validateCanonicalSpec, validateTaskSpecAttestation } from "./file-spec.js";
+import { explainTaskSpecAttestationFailure, isFileSpecTaskId, validateCanonicalSpec, validateTaskSpecAttestation } from "./file-spec.js";
 import { debug, logError } from "./logger.js";
 import { buildAgentSystemPrompt } from "./protocol.js";
 import { buildAdvisorConsultText, formatAdvisorSteerMessage, adviceNeedsHuman, type AdvisorConsultInput } from "./advisor.js";
@@ -142,6 +142,10 @@ export class Scheduler {
 	/** Spawn retries per task. Success and explicit resume grant a fresh budget
 	 * so a provider/API outage never leaves a task permanently unretriable. */
 	private spawnRetryCounts = new Map<string, number>();
+	/** Consecutive attestation rejections per task. Any reject/reopen cycle is
+	 * a paid loop; after a bounded number of failures the task suspends and the
+	 * orchestrator is escalated with the precise reason instead of burning. */
+	private attestationRejectionCounts = new Map<string, number>();
 	/** Periodic level-triggered reconcile (heals missed events / out-of-band store edits) */
 	private reconcileTimer: ReturnType<typeof setInterval> | null = null;
 	/** Suppress duplicate edge emission within one scheduler; disk remains the outbox. */
@@ -236,7 +240,7 @@ export class Scheduler {
 			}
 			return quarantined.map((task) => task.id);
 		}
-		const invalid = tasks.filter((task) => task.status === "done" && !validateTaskSpecAttestation(squad, task));
+		const invalid = tasks.filter((task) => task.status === "done" && !validateTaskSpecAttestation(squad, task, { verifyArtifacts: false }));
 		for (const task of invalid) {
 			store.updateTaskStatus(this.squadId, task.id, "pending", { completed: null, output: null, error: "Missing or invalid canonical spec read attestation" });
 			store.appendMessage(this.squadId, task.id, { ts: store.now(), from: "system", type: "status", text: "Completion invalidated after attestation audit" });
@@ -987,13 +991,33 @@ export class Scheduler {
 		const status = settledTask?.status;
 		if (status === "cancelled" || status === "suspended") return;
 		const settledSquad = store.loadSquad(this.squadId);
-		if (settledTask && settledSquad && !validateTaskSpecAttestation(settledSquad, settledTask)) {
-			store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null, output: null, error: "Canonical squad spec was not fully delivered; read all chunks with squad_spec_read" });
-			store.appendMessage(this.squadId, event.taskId, { ts: store.now(), from: "system", type: "status", text: "Completion rejected: missing or invalid spec-read-attestation; reopening same task session" });
+		if (settledTask && settledSquad && !validateTaskSpecAttestation(settledSquad, settledTask, { verifyArtifacts: false })) {
+			const reason = explainTaskSpecAttestationFailure(settledSquad, settledTask) ?? "spec-read attestation is invalid";
+			const rejections = (this.attestationRejectionCounts.get(event.taskId) ?? 0) + 1;
+			this.attestationRejectionCounts.set(event.taskId, rejections);
+			if (rejections >= 3) {
+				// Loop breaker: repeated rejections mean retrying cannot fix it
+				// (validator bug, wedged state). Suspend and escalate instead of
+				// respawning the agent forever.
+				store.updateTaskStatus(this.squadId, event.taskId, "suspended", { completed: null, output: null, error: `Attestation rejected ${rejections}x: ${reason}` });
+				store.appendMessage(this.squadId, event.taskId, { ts: store.now(), from: "system", type: "status", text: `Completion rejected ${rejections} consecutive times — task suspended to stop the retry loop. Reason: ${reason}` });
+				this.emit({
+					type: "escalation",
+					squadId: this.squadId,
+					taskId: event.taskId,
+					agentName: event.agentName,
+					message: `Task '${event.taskId}' completion was rejected ${rejections} consecutive times and the task is now SUSPENDED.\nExact reason: ${reason}\nRetrying cannot fix this. Inspect the attestation and spec state, repair the cause, then squad_modify { action: "resume_task", taskId: "${event.taskId}" }.`,
+				});
+				this.updateContext();
+				return;
+			}
+			store.updateTaskStatus(this.squadId, event.taskId, "pending", { completed: null, output: null, error: `Completion rejected: ${reason}` });
+			store.appendMessage(this.squadId, event.taskId, { ts: store.now(), from: "system", type: "status", text: `Completion rejected (${rejections}/3 before suspension): ${reason}` });
 			if (this.running) void this.reconcile();
 			this.updateContext();
 			return;
 		}
+		this.attestationRejectionCounts.delete(event.taskId);
 		// A mailbox entry not acknowledged by Pi outranks this run's candidate
 		// completion. Reopen the same session so accepted-at-least-once delivery
 		// occurs before the task can become done.
@@ -1376,7 +1400,7 @@ export class Scheduler {
 	private checkSquadCompletion(tasks: Task[], squad: Squad): void {
 		if (tasks.length === 0) return;
 
-		const invalidDone = tasks.filter((task) => task.status === "done" && !validateTaskSpecAttestation(squad, task));
+		const invalidDone = tasks.filter((task) => task.status === "done" && !validateTaskSpecAttestation(squad, task, { verifyArtifacts: false }));
 		if (invalidDone.length > 0) {
 			for (const task of invalidDone) {
 				store.updateTaskStatus(this.squadId, task.id, "pending", { completed: null, output: null, error: "Missing or invalid canonical spec read attestation" });
@@ -1742,8 +1766,10 @@ export class Scheduler {
 	async resumeTask(taskId: string): Promise<"resumed" | "already_running"> {
 		const task = store.loadTask(this.squadId, taskId);
 		if (!task) throw new Error(`Task not found: ${taskId}`);
-		// Explicit resume grants a fresh spawn-retry budget (provider recovery).
+		// Explicit resume grants a fresh spawn-retry budget (provider recovery)
+		// and a fresh attestation-rejection budget (post-repair retry).
 		this.spawnRetryCounts.delete(`spawn-retry:${taskId}`);
+		this.attestationRejectionCounts.delete(taskId);
 		const live = this.pool.isRunning(taskId);
 		if (task.status === "in_progress" && live) return "already_running";
 		if (live) throw new Error(`Task '${taskId}' has a live child but durable status '${task.status}'; no duplicate resume was started.`);
@@ -1785,7 +1811,10 @@ export class Scheduler {
 		if (task.status === "done") return;
 		if (task.status === "cancelled") throw new Error(`Task '${taskId}' is cancelled; resume it before marking it done.`);
 		const squad = store.loadSquad(this.squadId);
-		if (squad && !validateTaskSpecAttestation(squad, task)) throw new Error(`Task '${taskId}' cannot complete: missing or invalid canonical spec read attestation.`);
+		if (squad && !validateTaskSpecAttestation(squad, task, { verifyArtifacts: false })) {
+			const reason = explainTaskSpecAttestationFailure(squad, task) ?? "spec-read attestation is invalid";
+			throw new Error(`Task '${taskId}' cannot complete: ${reason}`);
+		}
 
 		if (this.pool.isRunning(taskId)) {
 			await this.pool.kill(taskId);

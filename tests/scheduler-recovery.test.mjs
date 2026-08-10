@@ -570,3 +570,44 @@ test("reconcile heals zombie in_progress tasks whose process was lost", async ()
 	// moves to failed — but the zombie detection itself is proven by the message.
 	await scheduler.stop();
 });
+
+test("repeated attestation rejections suspend the task and escalate instead of looping forever", async () => {
+	const { createHash } = await import("node:crypto");
+	const { id, scheduler } = makeSquad({
+		squadStatus: "running",
+		tasks: [{ id: "ghost", status: "in_progress" }],
+	});
+	// Attach a canonical spec whose metadata is valid but for which task
+	// 'ghost' has NO attestation → completion is rejected every settle.
+	const specDir = path.join(store.getSquadDir(id), "spec");
+	fs.mkdirSync(specDir, { recursive: true });
+	const specPath = path.join(specDir, "spec.v1.json");
+	const raw = Buffer.from('{"canonical":"spec"}');
+	fs.writeFileSync(specPath, raw);
+	const squad = store.loadSquad(id);
+	squad.spec = { schemaVersion: 1, sha256: createHash("sha256").update(raw).digest("hex"), bytes: raw.length, path: specPath, chunkBytes: 32768, chunkCount: 1 };
+	store.saveSquad(squad);
+
+	const escalations = [];
+	scheduler.onEvent((event) => { if (event.type === "escalation") escalations.push(event); });
+
+	for (let i = 0; i < 3; i++) {
+		scheduler.onAgentSettled({ type: "agent_settled", taskId: "ghost", agentName: "backend" });
+	}
+
+	const task = store.loadTask(id, "ghost");
+	assert.equal(task.status, "suspended", "third rejection suspends the task instead of reopening");
+	assert.match(task.error, /attestation file missing/i, "the recorded reason is precise, not a generic re-read instruction");
+	assert.equal(escalations.length, 1, "exactly one escalation reaches the orchestrator");
+	assert.match(escalations[0].message, /SUSPENDED/);
+	assert.match(escalations[0].message, /resume_task/);
+
+	// Explicit resume grants a fresh rejection budget.
+	await scheduler.resumeTask("ghost");
+	scheduler.onAgentSettled({ type: "agent_settled", taskId: "ghost", agentName: "backend" });
+	const resumed = store.loadTask(id, "ghost");
+	assert.notEqual(resumed.status, "suspended", "post-resume rejection reopens (fresh budget) instead of instantly suspending");
+	assert.equal(escalations.length, 1, "no duplicate escalation after resume");
+
+	await scheduler.stop();
+});

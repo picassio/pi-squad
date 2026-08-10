@@ -251,25 +251,100 @@ export function validateCanonicalSpec(squad: Squad): boolean {
 
 export function validateTaskSpecAttestation(squad: Squad, task: Task, options: { verifyArtifacts?: boolean } = {}): boolean {
 	if (!squad.spec) return true;
-	try {
-		const raw = stableReadFile(squad.spec.path, "SPEC_UNSTABLE");
-		if (!canonicalMetadataMatches(squad, raw)) return false;
-		if (options.verifyArtifacts !== false) {
+	if (explainTaskSpecAttestationFailure(squad, task) !== null) return false;
+	if (options.verifyArtifacts !== false) {
+		try {
+			const raw = stableReadFile(squad.spec.path, "SPEC_UNSTABLE");
 			const decoded = new TextDecoder("utf-8", { fatal: true }).decode(raw);
 			if (!artifactsStillMatch(validateSpec(parseJsonNoDuplicateKeys(decoded)))) return false;
-		}
-		const attestationRaw = stableReadFile(attestationPath(squad, task), "SPEC_UNSTABLE");
+		} catch { return false; }
+	}
+	return true;
+}
+
+/**
+ * Explain exactly why a task's spec-read attestation is invalid, or null when
+ * it is valid. Deliberately EXCLUDES artifact drift: attestation proves the
+ * child fully read the canonical spec bytes; drift of pinned artifacts is a
+ * separate review-time concern reported by specArtifactDrift(). Precise
+ * reasons prevent misdirected retry loops (an agent told to "re-read chunks"
+ * when the actual problem was artifact drift re-reads forever).
+ */
+export function explainTaskSpecAttestationFailure(squad: Squad, task: Task): string | null {
+	if (!squad.spec) return null;
+	let raw: Buffer;
+	try {
+		raw = stableReadFile(squad.spec.path, "SPEC_UNSTABLE");
+	} catch (error) {
+		return `canonical spec file unreadable: ${(error as Error).message}`;
+	}
+	if (!canonicalMetadataMatches(squad, raw)) {
+		return "canonical spec file no longer matches its published sha256/bytes metadata";
+	}
+	const filePath = attestationPath(squad, task);
+	let attestationRaw: Buffer;
+	try {
+		attestationRaw = stableReadFile(filePath, "SPEC_UNSTABLE");
+	} catch {
+		return `attestation file missing (${filePath}) — the task's agent must read every canonical spec chunk with squad_spec_read`;
+	}
+	try {
 		const attestationText = new TextDecoder("utf-8", { fatal: true }).decode(attestationRaw);
 		const attestation = parseJsonNoDuplicateKeys(attestationText) as Record<string, unknown>;
 		const topKeys = ["version", "state", "squadId", "taskId", "specSha256", "specBytes", "chunkBytes", "chunkCount", "chunks", "completedAt"];
-		if (!attestation || typeof attestation !== "object" || !exactObjectKeys(attestation, topKeys)) return false;
+		if (!attestation || typeof attestation !== "object" || !exactObjectKeys(attestation, topKeys)) {
+			return "attestation file is malformed (unexpected structure/keys)";
+		}
+		if (attestation.state !== "complete") return `attestation is incomplete (state=${String(attestation.state)}) — continue squad_spec_read until every chunk is delivered`;
 		const ranges = chunkRanges(raw); const chunks = attestation.chunks;
-		if (attestation.version !== 1 || attestation.state !== "complete" || attestation.squadId !== squad.id || attestation.taskId !== task.id || attestation.specSha256 !== squad.spec.sha256 || attestation.specBytes !== raw.length || attestation.chunkBytes !== SPEC_CHUNK_BYTES || attestation.chunkCount !== ranges.length || !Array.isArray(chunks) || chunks.length !== ranges.length || !isRfc3339(attestation.completedAt)) return false;
-		return chunks.every((rawChunk, index) => {
-			if (!rawChunk || typeof rawChunk !== "object" || Array.isArray(rawChunk)) return false; const chunk = rawChunk as Record<string, unknown>; const [start, end] = ranges[index];
-			return exactObjectKeys(chunk, ["index", "startByte", "endByteExclusive", "bytes", "sha256", "toolCallId", "deliveredAt"]) && chunk.index === index && chunk.startByte === start && chunk.endByteExclusive === end && chunk.bytes === end - start && chunk.sha256 === sha256(raw.subarray(start, end)) && typeof chunk.toolCallId === "string" && chunk.toolCallId.length > 0 && isRfc3339(chunk.deliveredAt);
-		});
-	} catch { return false; }
+		if (attestation.version !== 1 || attestation.squadId !== squad.id || attestation.taskId !== task.id || !isRfc3339(attestation.completedAt)) {
+			return "attestation identity fields do not match this squad/task";
+		}
+		if (attestation.specSha256 !== squad.spec.sha256 || attestation.specBytes !== raw.length || attestation.chunkBytes !== SPEC_CHUNK_BYTES || attestation.chunkCount !== ranges.length) {
+			return "attestation was recorded against a different spec revision — re-read every chunk with squad_spec_read";
+		}
+		if (!Array.isArray(chunks) || chunks.length !== ranges.length) {
+			return `attestation chunk list is incomplete (${Array.isArray(chunks) ? chunks.length : 0}/${ranges.length})`;
+		}
+		for (let index = 0; index < chunks.length; index++) {
+			const rawChunk = chunks[index];
+			if (!rawChunk || typeof rawChunk !== "object" || Array.isArray(rawChunk)) return `attestation chunk ${index} is malformed`;
+			const chunk = rawChunk as Record<string, unknown>; const [start, end] = ranges[index];
+			const ok = exactObjectKeys(chunk, ["index", "startByte", "endByteExclusive", "bytes", "sha256", "toolCallId", "deliveredAt"]) && chunk.index === index && chunk.startByte === start && chunk.endByteExclusive === end && chunk.bytes === end - start && chunk.sha256 === sha256(raw.subarray(start, end)) && typeof chunk.toolCallId === "string" && chunk.toolCallId.length > 0 && isRfc3339(chunk.deliveredAt);
+			if (!ok) return `attestation chunk ${index} does not match the canonical spec bytes`;
+		}
+		return null;
+	} catch (error) {
+		return `attestation file unreadable: ${(error as Error).message}`;
+	}
+}
+
+/**
+ * Describe pinned spec artifacts that changed after spec publication.
+ * Empty when everything still matches (or there is no spec). Drift does not
+ * block completion; it is surfaced prominently at independent review so the
+ * orchestrator verifies each change is a legitimate product of the work.
+ */
+export function specArtifactDrift(squad: Squad): string[] {
+	if (!squad.spec) return [];
+	try {
+		const raw = stableReadFile(squad.spec.path, "SPEC_UNSTABLE");
+		const spec = validateSpec(parseJsonNoDuplicateKeys(new TextDecoder("utf-8", { fatal: true }).decode(raw)));
+		const drift: string[] = [];
+		for (const artifact of spec.artifacts) {
+			try {
+				const actual = stableHashFile(artifact.path, "ARTIFACT_UNSTABLE");
+				if (actual.bytes !== artifact.bytes || actual.sha256 !== artifact.sha256) {
+					drift.push(`${artifact.path} — modified after spec publication (bytes ${artifact.bytes}→${actual.bytes}, sha256 ${artifact.sha256.slice(0, 12)}…→${actual.sha256.slice(0, 12)}…)`);
+				}
+			} catch {
+				drift.push(`${artifact.path} — missing or unreadable (was ${artifact.bytes} bytes)`);
+			}
+		}
+		return drift;
+	} catch {
+		return [];
+	}
 }
 
 function withFileLock<T>(filePath: string, operation: () => T): T {

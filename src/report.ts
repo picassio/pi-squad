@@ -1,6 +1,7 @@
 import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { specArtifactDrift } from "./file-spec.js";
 import { buildOrchestratorReviewGate } from "./review.js";
 import { getSquadDir, now } from "./store.js";
 import type { Squad, Task } from "./types.js";
@@ -93,7 +94,11 @@ export interface ReviewRequiredNotification {
 export function buildReviewRequiredNotification(squad: Squad, tasks: Task[]): ReviewRequiredNotification {
 	const summary = buildCompletionSummary(tasks, squad.cwd);
 	const totalCost = tasks.reduce((sum, task) => sum + task.usage.cost, 0);
-	const header = `[squad] TASK EXECUTION FINISHED for "${squad.id}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n`;
+	const drift = specArtifactDrift(squad);
+	const driftBlock = drift.length > 0
+		? `⚠ SPEC ARTIFACT DRIFT — pinned contract artifacts changed after spec publication. During review, verify each change is a legitimate product of the delegated work (not contract tampering):\n${drift.map((line) => `- ${line}`).join("\n")}\n\n`
+		: "";
+	const header = `[squad] TASK EXECUTION FINISHED for "${squad.id}" — WORK IS UNTRUSTED AND NOT YET ACCEPTED.\n\n` + driftBlock;
 	const gate = buildOrchestratorReviewGate(squad, tasks);
 	const inline = header +
 		`Squad claims (review inputs only):\n${summary}\n\n` +
