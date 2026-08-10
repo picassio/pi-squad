@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-08-10
+
+### Fixed
+
+- The squad widget no longer freezes while the main session is idle. Two compounding bugs: (1) widget updates mutated component lines without ever calling `tui.requestRender()`, so new state only appeared when unrelated activity happened to repaint the terminal; (2) the render cache key excluded elapsed durations, so the 5-second active-squad timer bailed on an "unchanged" key without repainting. The widget factory now captures the TUI handle and requests a repaint after every lines update, and live squads (any `in_progress` task) add a 5s time bucket to the cache key. Widget refreshes are pure local terminal rendering — they cost zero LLM tokens.
+
 ## [0.20.3] - 2026-08-10
 
 ### Fixed

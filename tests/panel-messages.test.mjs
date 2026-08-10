@@ -333,3 +333,44 @@ test("live preview and compact widget visibly prioritize a recent orchestrator m
 		controls.dispose();
 	}
 });
+
+test("widget repaints via tui.requestRender on updates and live squads bypass the render cache", async () => {
+	const squadId = "sq-widget-repaint";
+	store.saveSquad({
+		id: squadId, goal: "live repaint", status: "running", created: store.now(), cwd: process.cwd(),
+		agents: { backend: {} },
+		config: { maxConcurrency: 1, autoUnblock: true, reviewOnComplete: true, maxRetries: 2 },
+	});
+	store.createTask(squadId, {
+		id: "busy", title: "Busy", description: "", agent: "backend", status: "in_progress", depends: [],
+		created: store.now(), started: store.now(), completed: null, output: null, error: null,
+		usage: { inputTokens: 0, outputTokens: 0, cost: 0, turns: 1 },
+	});
+
+	let widgetFactory = null;
+	let renderRequests = 0;
+	const ctx = {
+		hasUI: true,
+		ui: {
+			theme,
+			setWidget: (_id, factory) => { widgetFactory = factory; },
+			setStatus: () => {},
+		},
+	};
+	const controls = setupSquadWidget(ctx, { squadId, enabled: true });
+	try {
+		assert.ok(widgetFactory, "widget installed");
+		// The factory hands the TUI to the widget; later refreshes must repaint.
+		widgetFactory({ terminal: { columns: 120 }, requestRender: () => { renderRequests++; } }, theme);
+
+		// A running task makes the cache key time-bucketed: a later refresh
+		// re-renders (and requests a repaint) even with identical task state.
+		const before = renderRequests;
+		await new Promise((resolve) => setTimeout(resolve, 5_100));
+		controls.refreshNow();
+		assert.ok(renderRequests > before,
+			"refresh with an in_progress task must request a terminal repaint (frozen-widget regression)");
+	} finally {
+		controls.dispose();
+	}
+});

@@ -64,6 +64,11 @@ export function setupSquadWidget(
 
 	let durationTimer: ReturnType<typeof setInterval> | null = null;
 	let renderTimer: ReturnType<typeof setTimeout> | null = null;
+	/** TUI handle captured from the component factory; mutating widget lines
+	 * does NOT repaint the terminal by itself — an idle main session would show
+	 * a frozen widget while background workers progress. Free to call: pure
+	 * local terminal rendering, zero LLM tokens. */
+	let tuiHandle: { requestRender?: () => void } | null = null;
 	/** Cache key to skip redundant setWidget calls */
 	let lastCacheKey = "";
 	/** Last built lines — the factory re-uses these on each TUI render */
@@ -177,7 +182,11 @@ export function setupSquadWidget(
 			lines.push(`  ${th.fg("dim", `  +${tasks.length - maxVisible} more · ^q detail`)}`);
 		}
 
-		const cacheKey = `${state.squadId}:${squad.status}:${squad.review?.status ?? "none"}:${attention?.fingerprint ?? "no-attention"}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}:${recentMessageKeys.join(",")}`;
+		// While work is in flight the widget shows live durations/activity, so
+		// the cache key includes a 5s time bucket — otherwise the duration timer's
+		// renders hit an unchanged key and bail before repainting (frozen widget).
+		const liveBucket = tasks.some((t) => t.status === "in_progress") ? `:t${Math.floor(Date.now() / 5_000)}` : "";
+		const cacheKey = `${state.squadId}:${squad.status}:${squad.review?.status ?? "none"}:${attention?.fingerprint ?? "no-attention"}:${tasks.map(t => `${t.id}=${t.status}:${t.usage.turns}`).join(",")}:${recentMessageKeys.join(",")}${liveBucket}`;
 
 		const statusText = review
 			? th.fg(review.tone, `${review.label} · ${progressText}`)
@@ -246,12 +255,17 @@ export function setupSquadWidget(
 			widgetComponent.lines = lines;
 
 			const comp = widgetComponent;
-			ctx.ui.setWidget("squad-tasks", (_tui: TUI, _theme: Theme) => comp);
+			ctx.ui.setWidget("squad-tasks", (tui: TUI, _theme: Theme) => {
+				tuiHandle = tui;
+				return comp;
+			});
 			widgetInstalled = true;
 		} else if (widgetComponent) {
-			// Update lines in-place — the next TUI render picks them up.
-			// No setWidget call needed, avoiding component tree rebuild.
+			// Update lines in-place, then explicitly request a repaint: without
+			// this the new lines only appear when something else re-renders the
+			// TUI (streaming, keypress), which froze the widget on idle sessions.
 			widgetComponent.lines = lines;
+			tuiHandle?.requestRender?.();
 		}
 
 		ctx.ui.setStatus("squad", statusText);
