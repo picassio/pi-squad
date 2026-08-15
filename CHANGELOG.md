@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- CI schema gate: every registered tool's parameter schema is validated against strict OpenAI-compatible provider constraints (root `type: "object"`, no `type: null`, every union branch concretely typed). Prevents regressions of the 0.20.2 class of failure where one tool's root-union schema made strict providers (DeepSeek) reject every request — bricking message sending in ALL sessions, including ones that never used squad tools.
+
 ## [0.20.6] - 2026-08-11
 
 ### Added
