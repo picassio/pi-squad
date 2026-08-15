@@ -182,6 +182,25 @@ function buildSiblingAwareness(
 		);
 	}
 
+	// Parallel write isolation: when other agents are actively working in the
+	// same repository, direct main-tree edits collide (checkouts, index locks,
+	// half-written files in another agent's test run). Worktrees isolate each
+	// writer at near-zero cost.
+	const concurrentWriters = siblings.some((sibling) => sibling.status === "in_progress");
+	if (concurrentWriters || fileEntries.length > 0) {
+		lines.push(`
+## Parallel Work — Use a Git Worktree
+
+Other agents may modify this repository while you work. If your task EDITS files in a shared git repository, do your work in a dedicated worktree instead of the main tree:
+
+1. \`git worktree add ../$(basename "$PWD").wt-<your-task-id> -b squad/<your-task-id>\` (run from the repo root, then cd into it)
+2. Commit your work on that \`squad/<your-task-id>\` branch.
+3. In your final handoff, state the branch name and worktree path so the integrating task can merge.
+4. Do NOT remove the worktree yourself if a downstream task must merge your branch — the integration/final task merges all \`squad/*\` branches, then cleans up with \`git worktree remove <path>\` and \`git branch -d squad/<task-id>\` for each.
+
+Read-only tasks (review, QA inspection, research) work directly in the main tree — no worktree needed. If you are the LAST integrating task: after merging, verify \`git worktree list\` shows only the main tree and no stale \`squad/*\` branches remain — leftover worktrees have filled disks before.`);
+	}
+
 	return lines.join("\n") + "\n";
 }
 

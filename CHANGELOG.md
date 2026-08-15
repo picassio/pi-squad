@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.6] - 2026-08-11
+
+### Added
+
+- Worktree isolation guidance for parallel writers. When other agents are concurrently working in the same repository (an in_progress sibling or foreign modified files), the agent system prompt now instructs editing agents to work in a dedicated git worktree on a `squad/<task-id>` branch, hand off the branch name, and leave merging to the integration/final task — which merges all `squad/*` branches and must clean up every worktree (`git worktree remove` + branch delete) and verify `git worktree list` is clean. Read-only tasks stay in the main tree; solo squads get no worktree overhead. The planner rules now direct plan authors to put these instructions in task descriptions whenever 2+ tasks modify the same repo in parallel, and the supervisor skill adds a review-time cleanliness check (leftover worktrees have caused disk-full incidents).
+
 ## [0.20.5] - 2026-08-10
 
 ### Fixed

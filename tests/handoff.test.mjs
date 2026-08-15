@@ -109,3 +109,38 @@ test("mentioning a completed agent immediately returns its durable output and su
 	assert.equal(replies.length, 1);
 	assert.ok(replies[0].text.includes("CONTRACT-END"));
 });
+
+test("concurrent writers receive worktree isolation guidance; solo tasks do not", () => {
+	const id = "sq-worktree-guidance";
+	const squad = saveSquad(id, { backend: {}, frontend: {} });
+	const mine = saveTask(id, { id: "api", agent: "backend", status: "pending", depends: [] });
+	saveTask(id, { id: "ui", agent: "frontend", status: "in_progress", depends: [] });
+
+	const prompt = buildAgentSystemPrompt({
+		squadId: id,
+		squad,
+		task: mine,
+		agentDef: { name: "backend", role: "Backend", description: "impl", model: null, tools: null, tags: [], prompt: "Build." },
+		modifiedFiles: { frontend: ["src/app.tsx"] },
+		queuedMessages: [],
+	});
+	assert.ok(prompt.includes("Use a Git Worktree"), "concurrent writers get worktree guidance");
+	assert.ok(prompt.includes("git worktree add"), "guidance includes the exact command shape");
+	assert.ok(prompt.includes("squad/<your-task-id>"), "guidance names the branch convention");
+	assert.ok(prompt.includes("git worktree remove"), "cleanup contract is part of the guidance");
+	assert.ok(prompt.includes("Read-only tasks"), "read-only tasks are exempted");
+
+	// A squad with no concurrent activity and no foreign modified files stays lean.
+	const soloId = "sq-worktree-solo";
+	const soloSquad = saveSquad(soloId, { backend: {} });
+	const solo = saveTask(soloId, { id: "only", agent: "backend", status: "pending", depends: [] });
+	const soloPrompt = buildAgentSystemPrompt({
+		squadId: soloId,
+		squad: soloSquad,
+		task: solo,
+		agentDef: { name: "backend", role: "Backend", description: "impl", model: null, tools: null, tags: [], prompt: "Build." },
+		modifiedFiles: {},
+		queuedMessages: [],
+	});
+	assert.ok(!soloPrompt.includes("Use a Git Worktree"), "solo tasks are not pushed into worktrees");
+});

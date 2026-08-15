@@ -25,6 +25,7 @@ export const PLAN_STRUCTURE_RULES = `- Task IDs must be short kebab-case (e.g., 
 - First task(s) should have empty depends: []
 - When tasks share an interface (API endpoints, database schema, data formats), create a design/contract task first that defines the contract, and make consuming tasks depend on it
 - Include a final QA/verification task if there are user-facing changes
+- When two or more tasks modify the SAME git repository in parallel, instruct each (in its description) to work in its own git worktree on a squad/<task-id> branch, and make one integration task (or the final QA task) responsible for merging the branches and cleaning up every worktree (git worktree remove + branch delete) when done
 - Don't over-decompose — 3-7 tasks is usually right for most goals
 - Scope tasks to required work only — no optional polish or nice-to-haves unless the goal asks for them`;
 
