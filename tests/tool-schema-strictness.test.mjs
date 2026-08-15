@@ -4,10 +4,30 @@ import { registerHooks } from "node:module";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
+
+// Pi host packages are unavailable in CI — stub them. typebox is deliberately
+// NOT stubbed: this suite validates the REAL emitted JSON schemas, so it
+// depends on the real typebox devDependency.
+const stubsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-squad-schema-stubs-"));
+const piAiStub = path.join(stubsDir, "pi-ai.mjs");
+const piTuiStub = path.join(stubsDir, "pi-tui.mjs");
+fs.writeFileSync(piAiStub, `
+export async function completeSimple() { throw new Error("not used in schema tests"); }
+`);
+fs.writeFileSync(piTuiStub, `
+export function visibleWidth(value) { return value.replace(/\\x1b\\[[0-9;]*m/g, "").length; }
+export function truncateToWidth(value, width, suffix = "") {
+	return visibleWidth(value) <= width ? value : value.slice(0, Math.max(0, width - suffix.length)) + suffix;
+}
+export function matchesKey() { return false; }
+`);
 
 // Map ./x.js → ./x.ts for src imports (Node type stripping doesn't rewrite).
 registerHooks({
 	resolve(specifier, context, nextResolve) {
+		if (specifier === "@earendil-works/pi-ai" || specifier === "@earendil-works/pi-ai/compat") return { url: pathToFileURL(piAiStub).href, shortCircuit: true };
+		if (specifier === "@earendil-works/pi-tui") return { url: pathToFileURL(piTuiStub).href, shortCircuit: true };
 		if (specifier.startsWith(".") && specifier.endsWith(".js")) {
 			try {
 				return nextResolve(specifier, context);
